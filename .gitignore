@@ -1,0 +1,23 @@
+# PlatformIO
+**/.pio/
+**/.pioenvs/
+**/.piolibdeps/
+
+# Build artifacts
+**/build/
+*.bin
+*.elf
+
+# Python
+**/__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

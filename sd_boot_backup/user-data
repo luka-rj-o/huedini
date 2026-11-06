@@ -1,0 +1,26 @@
+#cloud-config
+manage_resolv_conf: false
+
+hostname: "huedini"
+manage_etc_hosts: true
+timezone: "America/Toronto"
+keyboard:
+  model: pc105
+  layout: "ca"
+user:
+  name: "huedini"
+  shell: /bin/bash
+  lock_passwd: false
+  passwd: "$y$jB5$mAnR6d3OaBKRjQ3QZNa95/$pvcwpIyEc8hbuQ83V0gprNXbUR55sHpQ4xggGcSuYvC"
+  sudo: ALL=(ALL) NOPASSWD:ALL
+ssh_pwauth: true
+bootcmd:
+  - [ modprobe, dwc2 ]
+  - [ sh, -c, "modprobe g_ncm || modprobe g_ether || true" ]
+  - [ sh, -c, "ip link set usb0 up && ip addr add 169.254.100.2/16 dev usb0 2>/dev/null || true" ]
+  - [ sh, -c, "ip addr add 192.168.137.2/24 dev usb0 2>/dev/null || true" ]
+runcmd:
+  - [ systemctl, enable, --now, ssh ]
+  - [ systemctl, enable, --now, avahi-daemon ]
+  - [ sh, -c, "nmcli con delete usb0-static 2>/dev/null || true; nmcli con add type ethernet con-name usb0-static ifname usb0 ipv4.method manual ipv4.addresses '169.254.100.2/16,192.168.137.2/24' ipv4.gateway '192.168.137.1' ipv4.dns '8.8.8.8,1.1.1.1' connection.autoconnect yes connection.autoconnect-priority 100 && nmcli con up usb0-static || true" ]
+  - [ sh, -c, "ip link set usb0 up && ip addr add 169.254.100.2/16 dev usb0 2>/dev/null || true; ip addr add 192.168.137.2/24 dev usb0 2>/dev/null || true" ]

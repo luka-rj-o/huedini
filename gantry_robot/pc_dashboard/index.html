@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HUE-DINI | CAD Skeleton &amp; Gantry Supervisor</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo-dot"></span>
+      <div>
+        <h1>HUE-DINI Gantry Supervisor &amp; CAD Skeleton</h1>
+        <p class="subtitle">284&times;167.4 mm Fiducial Plate &bull; 254&times;152.4 mm Course &bull; 236&times;128&times;76.71 mm Stroke</p>
+      </div>
+    </div>
+
+    <div class="connection-bar">
+      <label for="wsUrlInput">Pi WebSocket:</label>
+      <input id="wsUrlInput" type="text" value="ws://localhost:8765" />
+      <button id="connectBtn" class="btn btn-secondary">Connect</button>
+      <span id="connBadge" class="badge badge-disconnected">DISCONNECTED</span>
+    </div>
+  </header>
+
+  <main class="dashboard-grid">
+    <!-- Left Column: 2D XY + Z Side-Profile CAD Skeleton Map -->
+    <section class="card map-card">
+      <div class="card-header">
+        <h2>CAD Skeleton &amp; Reachability Envelope (XY Top View + Z Elevation)</h2>
+        <div class="pose-readout">
+          <span>STATE: <strong id="stateReadout" class="state-pill">IDLE</strong></span>
+          <span>EE Plate: <strong id="eePlateReadout">(28.0, 6.0, 97.6)</strong> mm</span>
+          <span>Cam Plate: <strong id="camPlateReadout">(27.8, 60.1, 135.3)</strong> mm</span>
+          <span>Drop-Off: <strong>(224.5, 44.5, +12.6)</strong> mm</span>
+          <span>&theta;: <strong id="poseA">0.0</strong>&deg;</span>
+          <span>GRIP: <strong id="poseGrip">CLOSED (NC)</strong></span>
+        </div>
+      </div>
+
+      <div class="canvas-wrap">
+        <canvas id="courseCanvas" width="860" height="580"></canvas>
+      </div>
+
+      <!-- Interactive CAD Skeleton Motor Travel Sliders -->
+      <div class="jog-panel">
+        <div class="jog-header">
+          <strong>Interactive CAD Skeleton Jog (Motor Travel from Homed 0,0,0):</strong>
+          <button class="btn btn-secondary btn-sm" onclick="resetJogHome()">Home (0, 0, 0)</button>
+        </div>
+        <div class="jog-sliders">
+          <label>
+            Motor X (0 &ndash; 236 mm): <strong id="jogXVal">0.0</strong> mm
+            <input id="jogX" type="range" min="0" max="236" step="0.5" value="0" />
+          </label>
+          <label>
+            Motor Y (0 &ndash; 128 mm): <strong id="jogYVal">0.0</strong> mm
+            <input id="jogY" type="range" min="0" max="128" step="0.5" value="0" />
+          </label>
+          <label>
+            Motor Z<sub>down</sub> (0 Top &ndash; 76.71 mm Bottom): <strong id="jogZVal">0.00</strong> mm
+            <input id="jogZ" type="range" min="0" max="76.71" step="0.25" value="0" />
+          </label>
+        </div>
+      </div>
+
+      <div class="calibration-bar">
+        <span>Homed Datum (wrt Plate 0,0,0): <strong>(20.0, -43.5, 127.5) mm</strong></span>
+        <span>EE Homed (wrt Plate): <strong>(28.0, 6.0, 97.6) mm</strong></span>
+        <span>Cam Homed (wrt Plate): <strong>(27.8, 60.1, 135.3) mm</strong></span>
+        <span>K<sub>x</sub>/K<sub>y</sub>: <strong id="calKx">0.2500</strong> / <strong id="calKy">0.2500</strong> mm/px (<span id="calStatus">Default</span>)</span>
+      </div>
+    </section>
+
+    <!-- Right Column: Controls, Camera View, Block Table, Logs -->
+    <div class="right-col">
+      <!-- Control Triggers -->
+      <section class="card controls-card">
+        <h2>Supervisor Controls</h2>
+        <div class="btn-row">
+          <button class="btn btn-primary" onclick="sendCmd('START_SCAN')">&#9654; START SCAN</button>
+          <button class="btn btn-warning" onclick="sendCmd('PAUSE')">&#10074;&#10074; PAUSE</button>
+          <button class="btn btn-secondary" onclick="sendCmd('RESUME')">&#8635; RESUME</button>
+          <button class="btn btn-secondary" onclick="sendCmd('RESET')">RESET</button>
+          <button class="btn btn-danger" onclick="sendCmd('EMERGENCY_STOP')">&#9888; E-STOP</button>
+        </div>
+        <div class="manual-serial-row">
+          <input
+            id="rawSerialInput"
+            type="text"
+            placeholder="Manual ESP32 CLI in IDLE (e.g. setup, s1 500, home s1, servo 90, relay 2, l)"
+          />
+          <button class="btn btn-secondary" onclick="sendRawSerial()">Send TX</button>
+        </div>
+      </section>
+
+      <!-- Stationary OpenCV Frame Preview -->
+      <section class="card vision-card">
+        <div class="card-header">
+          <h2>Stationary Eye-in-Hand Camera Capture</h2>
+          <span class="hint">Stop-and-Capture OpenCV Frame</span>
+        </div>
+        <div class="vision-preview-box">
+          <img id="visionPreviewImg" alt="Waiting for stationary camera capture..." />
+        </div>
+      </section>
+
+      <!-- Detected Block Catalog & Mass Telemetry -->
+      <section class="card table-card">
+        <div class="card-header">
+          <h2>20&times;20 mm Blocks &amp; 4-Class Mass Sorting</h2>
+          <span id="blockCountBadge" class="badge">0 Blocks</span>
+        </div>
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Color</th>
+                <th>Plate (X, Y)</th>
+                <th>&theta; Angle</th>
+                <th>Mass &amp; Class</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="blocksTableBody">
+              <tr>
+                <td colspan="6" class="empty-cell">No blocks cataloged yet. Click START SCAN.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- System Event Logs -->
+      <section class="card log-card">
+        <h2>Orchestrator Telemetry Log</h2>
+        <pre id="logConsole" class="log-console">Waiting for connection to Raspberry Pi Zero W...</pre>
+      </section>
+    </div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
