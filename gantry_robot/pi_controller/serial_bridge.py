@@ -77,7 +77,12 @@ class ESP32SerialBridge:
             baudrate=self.config.serial_baud,
             timeout=self.config.serial_timeout_s,
         )
-        time.sleep(1.5)  # Allow ESP32 USB-UART reset on open
+        # Ensure ESP32 boots into normal SPI Flash run mode (not download boot):
+        self._ser.dtr = False
+        self._ser.rts = True
+        time.sleep(0.15)
+        self._ser.rts = False
+        time.sleep(1.0)
         self._ser.reset_input_buffer()
 
         # Configure steps/mm and enable TMC2209 drivers
@@ -221,6 +226,11 @@ class ESP32SerialBridge:
         tz = self.pose.z_mm if z_mm is None else float(z_mm)
         ta = self.pose.angle_deg if angle_deg is None else float(angle_deg)
         tf = self.config.feedrate_travel_mm_s if feedrate_mm_s is None else float(feedrate_mm_s)
+
+        # Enforce physical mechanical limit clamping to prevent collisions:
+        tx = max(0.0, min(self.config.travel_x_mm, tx))
+        ty = max(0.0, min(self.config.travel_y_mm, ty))
+        tz = max(0.0, min(self.config.travel_z_bottom_mm, tz))
 
         cmd = f"MOVE X{tx:.2f} Y{ty:.2f} Z{tz:.2f} A{ta:.1f} F{tf:.1f}"
         self.send_command(cmd)

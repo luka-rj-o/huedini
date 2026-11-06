@@ -126,9 +126,9 @@ class GantryConfig:
     # --- Calibration Fiducials (15 x 15 mm squares at the 4 corners of the 284 x 167.4 mm outer border) ---
     aruco_marker_id: int = 0
     fiducial_size_mm: float = 15.0
-    # Top-left fiducial (7.5, 159.9) and Top-right (276.5, 159.9) are directly inside the camera's Y reach [60.1..186.1]
+    # Calibration Fiducial search point in motor travel coordinates (within X[0..236], Y[0..128])
     fiducial_base_x_mm: float = 65.0
-    fiducial_base_y_mm: float = 140.0
+    fiducial_base_y_mm: float = 65.0
     corner_fiducials_mm: List[Tuple[float, float]] = field(
         default_factory=lambda: [
             (7.5, 7.5),       # Bottom-Left corner (center of 15x15 mm marker)
@@ -137,16 +137,16 @@ class GantryConfig:
             (7.5, 159.9),     # Top-Left corner
         ]
     )
-    calibration_step_x_mm: float = 20.0
-    calibration_step_y_mm: float = 20.0
+    calibration_step_x_mm: float = 15.0
+    calibration_step_y_mm: float = 15.0
 
-    # --- Global Scan Grid Coordinates (in Plate Coordinates within reachable envelope) ---
+    # --- Global Scan Grid Coordinates (in motor travel coordinates within reachable envelope) ---
     scan_grid_points_mm: List[Tuple[float, float]] = field(
         default_factory=lambda: [
-            (90.0, 85.0),
-            (180.0, 85.0),
-            (180.0, 135.0),
-            (90.0, 135.0),
+            (90.0, 45.0),
+            (180.0, 45.0),
+            (180.0, 95.0),
+            (90.0, 95.0),
         ]
     )
 

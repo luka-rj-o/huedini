@@ -68,7 +68,8 @@ const float R_SENSE = 0.11f;
 const int SETUP_CURRENT_MA_XZ = 300;
 const int SETUP_CURRENT_MA_Y  = 700; // Optimal 700mA for Y-axis carrying X+Z gantry bridge on belt
 const int SETUP_MICROSTEPS    = 2;
-const int SETUP_STALL_SENS    = 0;   // 0 = disable false-stall aborts during normal moves (StallGuard active during homing)
+const int SETUP_STALL_SENS_XZ = 10;  // Normal move stall protection threshold for X and Z lead screws
+const int SETUP_STALL_SENS_Y  = 2;   // Normal move stall protection threshold for Y belt pulley
 
 // Per-axis defaults (speeds in microsteps/s, acceleration in microsteps/s^2)
 const float DEFAULT_MAX_SPEED_XZ  = 1000.0f; // 5.0 mm/s on 2mm lead screw
@@ -161,9 +162,9 @@ struct Axis {
 
 const int NUM_AXES = 3;
 Axis axes[NUM_AXES] = {
-  { "S1", 'X', PIN_DIAG_1, &stepper1, &driver1, false, DEFAULT_MAX_SPEED_XZ, DEFAULT_ACCEL_XZ, DEFAULT_HOME_SPEED_XZ, SETUP_STALL_SENS, DEFAULT_HOME_SENS,   DEFAULT_STEPS_PER_MM_X, LEAD_SCREW_PITCH_MM,  DEFAULT_HOME_DIR_REVERSE_X, INVERT_DIR_X, SETUP_CURRENT_MA_XZ },
-  { "S2", 'Y', PIN_DIAG_2, &stepper2, &driver2, false, DEFAULT_MAX_SPEED_Y,  DEFAULT_ACCEL_Y,  DEFAULT_HOME_SPEED_Y,  SETUP_STALL_SENS, DEFAULT_HOME_SENS_Y, DEFAULT_STEPS_PER_MM_Y, BELT_PULLEY_MM_REV_Y, DEFAULT_HOME_DIR_REVERSE_Y, INVERT_DIR_Y, SETUP_CURRENT_MA_Y },
-  { "S3", 'Z', PIN_DIAG_3, &stepper3, &driver3, false, DEFAULT_MAX_SPEED_XZ, DEFAULT_ACCEL_XZ, DEFAULT_HOME_SPEED_XZ, SETUP_STALL_SENS, DEFAULT_HOME_SENS,   DEFAULT_STEPS_PER_MM_Z, LEAD_SCREW_PITCH_MM,  DEFAULT_HOME_DIR_REVERSE_Z, INVERT_DIR_Z, SETUP_CURRENT_MA_XZ },
+  { "S1", 'X', PIN_DIAG_1, &stepper1, &driver1, false, DEFAULT_MAX_SPEED_XZ, DEFAULT_ACCEL_XZ, DEFAULT_HOME_SPEED_XZ, SETUP_STALL_SENS_XZ, DEFAULT_HOME_SENS,   DEFAULT_STEPS_PER_MM_X, LEAD_SCREW_PITCH_MM,  DEFAULT_HOME_DIR_REVERSE_X, INVERT_DIR_X, SETUP_CURRENT_MA_XZ },
+  { "S2", 'Y', PIN_DIAG_2, &stepper2, &driver2, false, DEFAULT_MAX_SPEED_Y,  DEFAULT_ACCEL_Y,  DEFAULT_HOME_SPEED_Y,  SETUP_STALL_SENS_Y,  DEFAULT_HOME_SENS_Y, DEFAULT_STEPS_PER_MM_Y, BELT_PULLEY_MM_REV_Y, DEFAULT_HOME_DIR_REVERSE_Y, INVERT_DIR_Y, SETUP_CURRENT_MA_Y },
+  { "S3", 'Z', PIN_DIAG_3, &stepper3, &driver3, false, DEFAULT_MAX_SPEED_XZ, DEFAULT_ACCEL_XZ, DEFAULT_HOME_SPEED_XZ, SETUP_STALL_SENS_XZ, DEFAULT_HOME_SENS,   DEFAULT_STEPS_PER_MM_Z, LEAD_SCREW_PITCH_MM,  DEFAULT_HOME_DIR_REVERSE_Z, INVERT_DIR_Z, SETUP_CURRENT_MA_XZ },
 };
 
 float currentAngleDeg = 0.0f;
@@ -411,10 +412,12 @@ void handleMoveGcode(String params) {
     writeServoLogicalAngle(targetAngle);
   }
 
-  // Set target positions for X (S1), Y (S2), Z (S3)
+  // Set target positions for X (S1), Y (S2), Z (S3) with soft-limit safety clamping
   for (int i = 0; i < NUM_AXES; i++) {
     float targetMm = 0.0f;
     if (parseCoordToken(params, axes[i].coordCode, targetMm)) {
+      float maxTravel = (axes[i].coordCode == 'X') ? 236.0f : ((axes[i].coordCode == 'Y') ? 128.0f : 84.0f);
+      targetMm = constrain(targetMm, 0.0f, maxTravel);
       long targetSteps = lroundf(targetMm * axes[i].stepsPerMm);
       axes[i].stepper->moveTo(targetSteps);
     } else {
@@ -422,10 +425,25 @@ void handleMoveGcode(String params) {
     }
   }
 
-  // Coordinated multi-axis step loop with StallGuard monitoring
+  // Coordinated multi-axis step loop with StallGuard monitoring and responsive ESTOP
   while (axes[0].stepper->distanceToGo() != 0 ||
          axes[1].stepper->distanceToGo() != 0 ||
          axes[2].stepper->distanceToGo() != 0) {
+    if (Serial.available() > 0) {
+      String inCmd = Serial.readStringUntil('\n');
+      inCmd.trim();
+      inCmd.toUpperCase();
+      if (inCmd == "ESTOP" || inCmd == "X" || inCmd == "SLEEP") {
+        for (int j = 0; j < NUM_AXES; j++) {
+          axes[j].stepper->setCurrentPosition(axes[j].stepper->currentPosition());
+        }
+        sleepAll();
+        digitalWrite(PIN_RELAY, LOW);
+        Serial.println("ERR:ESTOP");
+        return;
+      }
+    }
+
     for (int i = 0; i < NUM_AXES; i++) {
       if (axes[i].stepper->distanceToGo() != 0) {
         axes[i].stepper->run();
@@ -433,6 +451,8 @@ void handleMoveGcode(String params) {
           for (int j = 0; j < NUM_AXES; j++) {
             axes[j].stepper->setCurrentPosition(axes[j].stepper->currentPosition());
           }
+          // Immediately cut power to steppers so motor does not sustain power against the stop!
+          sleepAll();
           Serial.print("ERR:STALL_");
           Serial.println(axes[i].coordCode);
           return;
@@ -725,7 +745,6 @@ bool setupAxis(Axis& axis) {
   // User-facing defaults
   axis.driver->rms_current(axis.currentMa);
   axis.driver->microsteps(SETUP_MICROSTEPS);
-  axis.moveSensitivity = SETUP_STALL_SENS;
   axis.driver->SGTHRS(axis.moveSensitivity);
 
   axis.ready = true;
@@ -816,9 +835,10 @@ bool moveAxis(Axis& axis, long steps) {
 
     if (isStalled(axis)) {
       stepper->setCurrentPosition(stepper->currentPosition());
+      sleepAll(); // Cut power immediately!
       Serial.print("[ALERT] "); Serial.print(axis.name);
       Serial.print(" stall detected (SG_RESULT="); Serial.print(axis.driver->SG_RESULT());
-      Serial.println("). Move aborted. Position may be inaccurate.");
+      Serial.println("). Steppers disabled (asleep). Position may be inaccurate.");
       return false;
     }
   }
@@ -829,8 +849,9 @@ bool moveAxis(Axis& axis, long steps) {
 
 bool isStalled(Axis& axis) {
   if (axis.moveSensitivity <= 0) return false;
-  bool atCruiseSpeed = fabs(axis.stepper->speed()) >= (axis.maxSpeed * STALL_CHECK_SPEED_RATIO);
-  return atCruiseSpeed && digitalRead(axis.diagPin) == HIGH;
+  // StallGuard on TMC2209 requires back-EMF, active once speed is above ~25% max speed
+  bool moving = fabs(axis.stepper->speed()) >= (axis.maxSpeed * 0.25f);
+  return moving && (digitalRead(axis.diagPin) == HIGH);
 }
 
 bool homeAxis(Axis& axis, bool reverse) {
