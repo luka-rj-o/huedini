@@ -221,3 +221,27 @@ gantry_robot/
   * `INVERT_DIR_Y = true`
   * `HOMING_RAMP_MS = 350`
   * `HOMING_BLANKING_MS = 800`
+
+### Issue #2: Axis 1 (X-Axis) and Axis 3 (Z-Axis) Lead Screw Sensorless StallGuard Lag & Failure to Trip
+* **Date:** November 2026
+* **Component:** Axis 1 (`S1`, X-Axis) and Axis 3 (`S3`, Z-Axis), NEMA 11 + TMC2209 over UART, 2.0 mm/rev lead screw drives ($200.0\text{ microsteps/mm}$ at $2\times$ microstepping).
+* **Symptoms:**
+  * When homing X or Z, the carriages reached the mechanical end stops but failed to trip StallGuard, continuing to power and grind against the stops for the full 20–30s timeout window.
+  * Homing travel speed was excessively slow ($2.5\text{ mm/s}$ at $500\text{ steps/s}$), causing travel across normal offsets to approach or exceed the timeout.
+* **Root Cause Analysis:**
+  1. **Lead Screw Kinematics vs. Belt:** A 2.0 mm pitch lead screw delivers a $20\times$ higher mechanical advantage than the 40 mm/rev GT2 belt. Motor rotational velocity per linear mm is 20 times higher ($200\text{ steps/mm}$ vs $10\text{ steps/mm}$).
+  2. **Stalled SG_RESULT Floor:** Due to high mechanical reduction and residual elastic deflection, the motor's back-EMF does not collapse to zero upon striking the stop. Telemetry showed stalled values of $\text{SG\_RESULT} = 56$ on X and $\text{SG\_RESULT} = 104$ on Z (lifting the end-effector against gravity).
+  3. **Baseline Sensitivity Deficit:** The original default `DEFAULT_HOME_SENS = 20` set the stall threshold to $\text{SG\_RESULT} \le 40$ ($2 \times 20$). Because X stalled at 56 and Z stalled at 104, neither axis could ever drop below 40, rendering stall detection physically impossible!
+  4. **Low Speed Back-EMF:** Operating at 500 steps/s ($1.25\text{ rev/s} = 75\text{ RPM}$) at 300 mA produced marginal back-EMF. Increasing homing speed to 800 steps/s ($4.0\text{ mm/s} = 2.0\text{ rev/s} = 120\text{ RPM}$) and current to 350 mA elevated back-EMF and provided a wide dynamic range.
+* **Verification & Testing Results:**
+  * Setting `DEFAULT_HOME_SENS = 60` establishes a stall threshold of $\text{SG\_RESULT} \le 120$ ($2 \times 60$).
+  * **Axis 1 (X) Test:** Jogged $+10.0\text{ mm}$ ($+2000\text{ steps}$) in $2.47\text{ s}$, homed backward in $2.72\text{ s}$ (ideal theoretical $2.66\text{ s}$). Zero premature trip; instant trip upon impact ($\text{SG\_RESULT} = 56$, lag $< 60\text{ ms}$).
+  * **Axis 3 (Z) Test:** Jogged $+10.0\text{ mm}$ down in $2.47\text{ s}$, homed backward up in $2.92\text{ s}$. Zero premature trip; instant trip upon top bumper impact ($\text{SG\_RESULT} = 104$, lag $< 100\text{ ms}$).
+* **Locked Production Configuration (Axes 1 & 3 / X & Z Lead Screws):**
+  * `SETUP_CURRENT_MA_XZ = 350` (350 mA RMS)
+  * `SETUP_MICROSTEPS = 2` (200.0 steps/mm on 2.0 mm pitch lead screws)
+  * `DEFAULT_HOME_SPEED_XZ = 800.0f` (4.0 mm/s)
+  * `DEFAULT_HOME_SENS = 60` (`SGTHRS = 60`, stall asserted when $\text{SG\_RESULT} \le 120$)
+  * `DEFAULT_HOME_DIR_REVERSE_X = true`, `DEFAULT_HOME_DIR_REVERSE_Z = true`
+  * `HOMING_RAMP_MS = 350`, `HOMING_BLANKING_MS = 800`
+

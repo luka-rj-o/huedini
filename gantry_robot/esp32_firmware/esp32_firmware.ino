@@ -65,7 +65,7 @@ const int PIN_START_BTN = -1;
 const float R_SENSE = 0.11f;
 
 // Values applied to steppers by the "setup" command
-const int SETUP_CURRENT_MA_XZ = 300;
+const int SETUP_CURRENT_MA_XZ = 350; // Calibrated 350mA for X and Z lead screws
 const int SETUP_CURRENT_MA_Y  = 700; // Optimal 700mA for Y-axis carrying X+Z gantry bridge on belt
 const int SETUP_MICROSTEPS    = 2;
 const int SETUP_STALL_SENS_XZ = 10;  // Normal move stall protection threshold for X and Z lead screws
@@ -74,13 +74,13 @@ const int SETUP_STALL_SENS_Y  = 2;   // Normal move stall protection threshold f
 // Per-axis defaults (speeds in microsteps/s, acceleration in microsteps/s^2)
 const float DEFAULT_MAX_SPEED_XZ  = 1000.0f; // 5.0 mm/s on 2mm lead screw
 const float DEFAULT_ACCEL_XZ      = 2000.0f; // 10.0 mm/s^2 on 2mm lead screw
-const float DEFAULT_HOME_SPEED_XZ = 500.0f;  // 2.5 mm/s on 2mm lead screw
+const float DEFAULT_HOME_SPEED_XZ = 800.0f;  // 4.0 mm/s on 2mm lead screw (calibrated for healthy back-EMF)
 
 const float DEFAULT_MAX_SPEED_Y   = 700.0f;  // 70.0 mm/s on 40mm/rev GT2 20T belt
 const float DEFAULT_ACCEL_Y       = 1000.0f; // 100.0 mm/s^2 on 40mm/rev GT2 20T belt
 const float DEFAULT_HOME_SPEED_Y  = 700.0f;  // 70.0 mm/s (1.75 rev/s for healthy back-EMF)
 
-const int   DEFAULT_HOME_SENS     = 20;
+const int   DEFAULT_HOME_SENS     = 60;      // Homing sensitivity threshold for X and Z lead screws (SGTHRS=60)
 const int   DEFAULT_HOME_SENS_Y   = 3;       // Homing sensitivity threshold for Y belt pulley (SGTHRS=3)
 
 // X & Z: Lead screw pitch = 2.0 mm/rev, NEMA 11 = 200 full steps/rev -> 200.0 microsteps/mm @ 2x microsteps.
