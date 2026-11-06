@@ -68,8 +68,8 @@ const float R_SENSE = 0.11f;
 const int SETUP_CURRENT_MA_XZ = 350; // Calibrated 350mA for X and Z lead screws
 const int SETUP_CURRENT_MA_Y  = 700; // Optimal 700mA for Y-axis carrying X+Z gantry bridge on belt
 const int SETUP_MICROSTEPS    = 2;
-const int SETUP_STALL_SENS_XZ = 10;  // Normal move stall protection threshold for X and Z lead screws
-const int SETUP_STALL_SENS_Y  = 2;   // Normal move stall protection threshold for Y belt pulley
+const int SETUP_STALL_SENS_XZ = 0;   // 0 = disable false-stall aborts during normal moves (StallGuard active during homing)
+const int SETUP_STALL_SENS_Y  = 0;   // 0 = disable false-stall aborts during normal moves (StallGuard active during homing)
 
 // Per-axis defaults (speeds in microsteps/s, acceleration in microsteps/s^2)
 const float DEFAULT_MAX_SPEED_XZ  = 1000.0f; // 5.0 mm/s on 2mm lead screw
