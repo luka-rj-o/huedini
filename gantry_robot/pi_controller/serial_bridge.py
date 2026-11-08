@@ -51,12 +51,14 @@ class ESP32SerialBridge:
         mock_hardware: bool = False,
         pose_update_callback: Optional[Callable[[GantryPose], None]] = None,
         event_callback: Optional[Callable[[str], None]] = None,
+        command_log_callback: Optional[Callable[[str, list[str], float], None]] = None,
     ):
         self.config = config
         self.mock_hardware = mock_hardware
         self.pose = GantryPose(z_mm=config.z_scan_mm)
         self.pose_update_callback = pose_update_callback
         self.event_callback = event_callback
+        self.command_log_callback = command_log_callback
         self._ser: Optional["serial.Serial"] = None
         self._lock = threading.Lock()
         self._abort_flag = False
@@ -229,16 +231,27 @@ class ESP32SerialBridge:
         if self._abort_flag and cmd_clean.upper() != "ESTOP":
             raise RuntimeError("ERR:EMERGENCY_STOP_ACTIVE")
 
+        t_start = time.monotonic()
+
+        def _log_and_return(results: list[str]) -> list[str]:
+            dur_ms = (time.monotonic() - t_start) * 1000.0
+            if self.command_log_callback:
+                try:
+                    self.command_log_callback(cmd_clean, list(results), dur_ms)
+                except Exception:
+                    pass
+            return results
+
         if self.mock_hardware:
-            return self._simulate_command(cmd_clean)
+            return _log_and_return(self._simulate_command(cmd_clean))
 
         with self._lock:
             if not self._ser or not self._ser.is_open:
                 if not self._reconnect():
                     if cmd_clean.upper() == "STATUS":
-                        return ["STATUS: ESP32 OFFLINE", "OK"]
+                        return _log_and_return(["STATUS: ESP32 OFFLINE", "OK"])
                     logger.warning("Command '%s' dropped: ESP32 is offline.", cmd_clean)
-                    return ["ERR: ESP32 OFFLINE"]
+                    return _log_and_return(["ERR: ESP32 OFFLINE"])
 
             # Flush any unread trailing bytes from previous commands to prevent desync
             try:
@@ -315,7 +328,7 @@ class ESP32SerialBridge:
                     raise RuntimeError(f"CRASH_DETECTED: {line}")
 
                 if line == "OK":
-                    return lines
+                    return _log_and_return(lines)
 
                 if line.startswith("ERR:") or line.startswith("[ERROR]"):
                     if "use hv<speed> or hs<sensitivity>" in line.lower():
@@ -337,14 +350,14 @@ class ESP32SerialBridge:
                             if extra:
                                 lines.append(extra)
                                 if extra == "OK":
-                                    return lines
-                        return lines
+                                    return _log_and_return(lines)
+                        return _log_and_return(lines)
 
                 elif is_manual_setting:
                     if line.startswith("-> ") or line.startswith("---") or line.startswith("["):
                         time.sleep(0.06)
                         if self._ser.in_waiting == 0:
-                            return lines
+                            return _log_and_return(lines)
 
             raise TimeoutError(f"ESP32 timed out ({effective_timeout:.1f}s) waiting for completion of command: {cmd_clean}")
 

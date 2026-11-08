@@ -115,6 +115,7 @@
         <span>EE Homed: <strong id="eeHomedOriginReadout">(28.0, 6.0, 97.6) mm</strong></span>
         <span>Scale: <strong id="calKx">0.2500</strong> / <strong id="calKy">0.2500</strong> mm/px (<span id="calStatus">Default</span>)</span>
         <span>Coord System: <span id="calOriginStatus" class="badge badge-dim">CAD Nominal</span></span>
+        <span>Cam Skew: <strong id="calCamSkew">0.0&deg;</strong> (<span id="calSkewStatus" class="badge badge-dim">Nominal</span>)</span>
       </div>
     </section>
 
@@ -262,6 +263,26 @@
         </div>
       </section>
 
+      <!-- Diagnostic Run Reports (Cached History & Detailed Execution Logs) -->
+      <section class="card report-card">
+        <div class="card-header">
+          <div class="report-title-group">
+            <h2>Diagnostic Run Reports</h2>
+            <span class="badge badge-dim">Cached Run History</span>
+          </div>
+          <div class="report-header-actions">
+            <button class="btn btn-sm btn-secondary" onclick="fetchRecentReports()" title="Refresh recent reports list">&#8635; Refresh</button>
+            <button class="btn btn-sm btn-primary" onclick="viewLatestReport()" title="View latest run diagnostics in detail">&#128221; View Last Report</button>
+            <button class="btn btn-sm btn-secondary" onclick="downloadLatestReport()" title="Download full diagnostic JSON file">&#128190; Download JSON</button>
+          </div>
+        </div>
+        <div id="latestReportSummary" class="latest-report-summary">
+          <span class="report-status-badge badge badge-dim" id="reportStatusBadge">NO RUNS CACHED</span>
+          <span id="reportSummaryText" class="report-summary-text">Run reports cache automatically upon each scan cycle.</span>
+        </div>
+        <div class="recent-reports-list" id="recentReportsList"></div>
+      </section>
+
       <!-- System Event Logs -->
       <section class="card log-card">
         <div class="card-header">
@@ -273,6 +294,21 @@
     </div>
   </main>
 
-  <script src="app.js?v=6"></script>
+  <!-- Full Diagnostic Report Modal Dialog -->
+  <div id="reportModal" class="report-modal" style="display: none;">
+    <div class="report-modal-content">
+      <div class="report-modal-header">
+        <h3 id="modalReportTitle">Run Report Diagnostics</h3>
+        <button class="modal-close-btn" onclick="closeReportModal()">&times;</button>
+      </div>
+      <div class="report-modal-body" id="modalReportBody"></div>
+      <div class="report-modal-footer">
+        <button class="btn btn-secondary" onclick="closeReportModal()">Close</button>
+        <a id="modalDownloadBtn" class="btn btn-primary" href="#" target="_blank">&#128190; Download Full JSON</a>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js?v=7"></script>
 </body>
 </html>

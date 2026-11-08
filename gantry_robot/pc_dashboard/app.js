@@ -342,6 +342,11 @@ function clearLogs() {
 }
 
 function updateUI(data) {
+  const prevState = latestState ? latestState.state : "IDLE";
+  if (prevState !== data.state && (data.state === "COMPLETE" || data.state === "ERROR")) {
+    setTimeout(fetchRecentReports, 800);
+  }
+
   const stateEl = document.getElementById("stateReadout");
   if (stateEl) stateEl.textContent = data.state || "IDLE";
 
@@ -422,6 +427,23 @@ function updateUI(data) {
 
   const calKyEl = document.getElementById("calKy");
   if (calKyEl) calKyEl.textContent = (cal.ky_mm_per_px ?? 0.25).toFixed(4);
+
+  const calCamSkewEl = document.getElementById("calCamSkew");
+  if (calCamSkewEl) {
+    const skew = Number(cal.cam_skew_deg) || 0.0;
+    calCamSkewEl.textContent = `${skew >= 0 ? "+" : ""}${skew.toFixed(1)}°`;
+  }
+
+  const calSkewStatusEl = document.getElementById("calSkewStatus");
+  if (calSkewStatusEl) {
+    if (Math.abs(cal.cam_skew_deg || 0) > 0.05) {
+      calSkewStatusEl.textContent = "Compensated";
+      calSkewStatusEl.className = "badge badge-connected";
+    } else {
+      calSkewStatusEl.textContent = "Nominal";
+      calSkewStatusEl.className = "badge badge-dim";
+    }
+  }
 
   // Update active steps/mm tag if received
   if (data.steps_per_mm) {
@@ -870,7 +892,249 @@ function renderCourseCanvas() {
   ctx.fillText(`EE Top=${curEeZ.toFixed(1)}`, zColX + 14, eeZY + 8);
 }
 
+// ============================================================================
+//  DIAGNOSTIC RUN REPORTS CLIENT
+// ============================================================================
+let cachedReportsList = [];
+let activeReportId = null;
+
+function getApiBaseUrl() {
+  const wsVal = wsUrlInput.value.trim();
+  try {
+    const u = new URL(wsVal);
+    const proto = u.protocol === "wss:" ? "https:" : "http:";
+    return `${proto}//${u.host}`;
+  } catch (_) {
+    return window.location.origin || "http://localhost:8765";
+  }
+}
+
+async function fetchRecentReports() {
+  const base = getApiBaseUrl();
+  try {
+    const res = await fetch(`${base}/api/reports`);
+    if (!res.ok) return;
+    const reports = await res.json();
+    cachedReportsList = reports;
+    renderRecentReportsList(reports);
+  } catch (err) {
+    console.debug("fetchRecentReports error:", err);
+  }
+}
+
+function renderRecentReportsList(reports) {
+  const listEl = document.getElementById("recentReportsList");
+  const badgeEl = document.getElementById("reportStatusBadge");
+  const summaryEl = document.getElementById("reportSummaryText");
+
+  if (!reports || reports.length === 0) {
+    if (badgeEl) {
+      badgeEl.textContent = "NO RUNS CACHED";
+      badgeEl.className = "report-status-badge badge badge-dim";
+    }
+    if (summaryEl) summaryEl.textContent = "Run reports cache automatically upon each scan cycle.";
+    if (listEl) listEl.innerHTML = "<span style='color:var(--text-muted);font-size:0.75rem'>No reports found on Pi.</span>";
+    return;
+  }
+
+  const latest = reports[0];
+  if (badgeEl) {
+    badgeEl.textContent = latest.status || "COMPLETED";
+    badgeEl.className = `report-status-badge badge ${latest.status === "COMPLETED" ? "badge-connected" : latest.status === "RUNNING" ? "badge-accent" : "badge-disconnected"}`;
+  }
+  if (summaryEl) {
+    const skewStr = (latest.cam_skew_deg !== undefined) ? ` • Cam Skew: ${Number(latest.cam_skew_deg).toFixed(1)}°` : "";
+    summaryEl.textContent = `Latest: ${latest.run_id} (${latest.start_time.split("T")[1]?.slice(0, 8) || ""}) • ${latest.blocks_cataloged || 0} blocks cataloged • ${latest.duration_s || 0}s${skewStr}`;
+  }
+
+  if (listEl) {
+    listEl.innerHTML = reports
+      .slice(0, 15)
+      .map(
+        (r) => `
+      <button class="recent-report-pill ${r.run_id === activeReportId ? "active" : ""}" onclick="viewReport('${r.run_id}')" title="${r.status} (${r.duration_s}s) - ${r.start_time}">
+        <span>${r.status === "COMPLETED" ? "✓" : "•"}</span>
+        <strong>${r.run_id.replace("run_", "")}</strong>
+        <span style="opacity:0.65">(${r.blocks_picked || r.blocks_cataloged || 0} blks)</span>
+      </button>`
+      )
+      .join("");
+  }
+}
+
+async function viewLatestReport() {
+  const base = getApiBaseUrl();
+  try {
+    const res = await fetch(`${base}/api/reports/latest`);
+    if (!res.ok) {
+      alert("No report available yet. Run a scan cycle first.");
+      return;
+    }
+    const data = await res.json();
+    if (!data || !data.run_id) {
+      alert("No report available yet. Run a scan cycle first.");
+      return;
+    }
+    showReportModal(data);
+  } catch (err) {
+    alert(`Could not fetch latest report: ${err.message}`);
+  }
+}
+
+async function viewReport(runId) {
+  activeReportId = runId;
+  renderRecentReportsList(cachedReportsList);
+  const base = getApiBaseUrl();
+  try {
+    const res = await fetch(`${base}/api/reports/${encodeURIComponent(runId)}`);
+    if (!res.ok) {
+      alert(`Report ${runId} not found.`);
+      return;
+    }
+    const data = await res.json();
+    showReportModal(data);
+  } catch (err) {
+    alert(`Error loading report: ${err.message}`);
+  }
+}
+
+function downloadLatestReport() {
+  const base = getApiBaseUrl();
+  window.open(`${base}/api/reports/latest/download`, "_blank");
+}
+
+function closeReportModal() {
+  const modal = document.getElementById("reportModal");
+  if (modal) modal.style.display = "none";
+}
+
+function showReportModal(report) {
+  const modal = document.getElementById("reportModal");
+  const title = document.getElementById("modalReportTitle");
+  const body = document.getElementById("modalReportBody");
+  const dlBtn = document.getElementById("modalDownloadBtn");
+
+  if (!modal || !body) return;
+
+  activeReportId = report.run_id;
+  if (title) title.textContent = `Diagnostic Report: ${report.run_id} [${report.status}]`;
+
+  const base = getApiBaseUrl();
+  if (dlBtn) dlBtn.href = `${base}/api/reports/${encodeURIComponent(report.run_id)}/download`;
+
+  const cal = report.calibration || {};
+  const waypoints = report.scan_waypoints || [];
+  const blocks = report.cataloged_blocks || [];
+  const picks = report.pick_actions || [];
+  const cmds = report.motor_commands || [];
+
+  body.innerHTML = `
+    <!-- Summary Header -->
+    <div class="report-section">
+      <h4>Run Overview</h4>
+      <div class="report-grid-kv">
+        <div><span class="kv-label">Run ID</span><span class="kv-val">${report.run_id}</span></div>
+        <div><span class="kv-label">Status</span><span class="kv-val" style="color:${report.status === "COMPLETED" ? "#16a34a" : "#ef4444"}">${report.status}</span></div>
+        <div><span class="kv-label">Start Time</span><span class="kv-val">${report.start_time || "N/A"}</span></div>
+        <div><span class="kv-label">Duration</span><span class="kv-val">${report.duration_s || 0} seconds</span></div>
+        <div><span class="kv-label">Mode</span><span class="kv-val">${report.mock_hardware ? "MOCK SIMULATED" : "PHYSICAL ESP32"}</span></div>
+        <div><span class="kv-label">Serial Commands</span><span class="kv-val">${cmds.length} executed</span></div>
+      </div>
+    </div>
+
+    <!-- Fiducial & Skew Calibration -->
+    <div class="report-section">
+      <h4>1. Homing, Fiducial Calibration & Camera Housing Skew</h4>
+      <div class="report-grid-kv">
+        <div><span class="kv-label">ArUco Marker ID</span><span class="kv-val">#${cal.marker_id !== null ? cal.marker_id : "N/A"}</span></div>
+        <div><span class="kv-label">Detected Pixel Center</span><span class="kv-val">(${cal.u_px ?? "—"}, ${cal.v_px ?? "—"}) px</span></div>
+        <div><span class="kv-label">Marker Orientation</span><span class="kv-val">${cal.marker_angle_deg !== null ? cal.marker_angle_deg + "°" : "N/A"}</span></div>
+        <div><span class="kv-label">Camera Skew (Physical Tilt)</span><span class="kv-val" style="color:${Math.abs(cal.cam_skew_deg || 0) > 0.05 ? "#0284c7" : "#0f172a"}">${cal.cam_skew_deg !== undefined ? cal.cam_skew_deg + "° (Compensated)" : "0.0°"}</span></div>
+        <div><span class="kv-label">Auto-Scale Kx / Ky</span><span class="kv-val">${cal.kx_mm_per_px || 0.25} / ${cal.ky_mm_per_px || 0.25} mm/px</span></div>
+        <div><span class="kv-label">Calibrated Cam Origin</span><span class="kv-val">(${cal.cam_origin_x_mm ?? 27.8}, ${cal.cam_origin_y_mm ?? 60.1}) mm</span></div>
+        <div><span class="kv-label">Camera-to-Gripper Offset</span><span class="kv-val">(${cal.offset_x_mm ?? 0.2}, ${cal.offset_y_mm ?? -54.1}) mm</span></div>
+        <div><span class="kv-label">Course Floor Elevation</span><span class="kv-val">+6.35 mm (1/4" Elevated)</span></div>
+      </div>
+    </div>
+
+    <!-- Cataloged Blocks -->
+    <div class="report-section">
+      <h4>2. Cataloged Blocks (${blocks.length})</h4>
+      ${blocks.length === 0 ? "<p style='color:var(--text-muted);font-size:0.8rem'>No blocks cataloged during scan.</p>" : `
+      <table class="modal-table">
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Color</th>
+            <th>Plate (X, Y) mm</th>
+            <th>Angle</th>
+            <th>Confidence Views</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${blocks.map(b => `
+            <tr>
+              <td><strong>#${b.id}</strong></td>
+              <td><span style="font-weight:700;color:${COLOR_HEX[b.color] || "#0f172a"}">${b.color.toUpperCase()}</span></td>
+              <td>(${Number(b.x_mm).toFixed(1)}, ${Number(b.y_mm).toFixed(1)})</td>
+              <td>${Number(b.angle_deg).toFixed(1)}°</td>
+              <td>${b.confidence_views || 1} views</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+      `}
+    </div>
+
+    <!-- Pick, Fine Alignment & Weighing Actions -->
+    <div class="report-section">
+      <h4>3. Pick Actions, Fine Alignment &amp; Weighing Verification (${picks.length})</h4>
+      ${picks.length === 0 ? "<p style='color:var(--text-muted);font-size:0.8rem'>No pick actions executed.</p>" : `
+      <table class="modal-table">
+        <thead>
+          <tr>
+            <th>Block</th>
+            <th>Fine Align</th>
+            <th>Contour Area</th>
+            <th>Fine Residual Err</th>
+            <th>Grip Motor (X, Y, θ)</th>
+            <th>Tare / Mass (g)</th>
+            <th>Class</th>
+            <th>Drop Zone &amp; Status</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${picks.map(p => `
+            <tr>
+              <td><strong>#${p.block_id}</strong> ${p.color.toUpperCase()}</td>
+              <td>${p.fine_align_found ? "<span style='color:#16a34a;font-weight:700'>FOUND</span>" : "<span style='color:#d97706'>COARSE FALLBACK</span>"}</td>
+              <td>${p.fine_contour_area_px ? p.fine_contour_area_px.toFixed(0) + " px" : "—"}</td>
+              <td>${p.fine_residual_err_mm !== null && p.fine_residual_err_mm !== undefined ? p.fine_residual_err_mm.toFixed(2) + " mm" : "—"}</td>
+              <td>(${p.gripper_motor_x.toFixed(1)}, ${p.gripper_motor_y.toFixed(1)}, ${p.servo_angle_deg.toFixed(1)}°)</td>
+              <td>${p.tare_success ? "✓" : "—"} / <strong>${p.measured_mass_g !== null && p.measured_mass_g !== undefined ? p.measured_mass_g.toFixed(2) + "g" : "—"}</strong></td>
+              <td><span class="badge badge-${(p.mass_class || "").toLowerCase()}">${p.mass_class || "—"}</span></td>
+              <td><strong>${p.status}</strong> (${p.stack_zone})</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+      `}
+    </div>
+
+    <!-- Motor Commands Sample -->
+    <div class="report-section">
+      <h4>4. Motor Command Sequence (${cmds.length} commands)</h4>
+      <div style="max-height: 140px; overflow-y: auto; background: var(--bg-subtle); padding: 8px; border-radius: var(--radius-sm); font-family: monospace; font-size: 0.73rem;">
+        ${cmds.map(c => `<div>[${c.timestamp}] <strong>TX:</strong> ${c.command} &rarr; <em>${(c.replies || []).join(", ") || "OK"}</em> (${c.duration_ms}ms)</div>`).join("")}
+      </div>
+    </div>
+  `;
+
+  modal.style.display = "flex";
+}
+
 // Initial draw and connection
 updateReadoutsFromMotor();
 renderCourseCanvas();
 connectWebSocket();
+fetchRecentReports();

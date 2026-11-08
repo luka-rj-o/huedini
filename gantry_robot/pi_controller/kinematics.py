@@ -45,6 +45,7 @@ class EyeInHandKinematics:
         frame_height: int = 480,
         kx_mm_per_px: float = 0.25,
         ky_mm_per_px: float = 0.25,
+        cam_skew_deg: float = 0.0,
         offset_x_mm: float = 0.2,
         offset_y_mm: float = -54.1,
         cam_homed_z_above_plate_mm: float = 135.4,
@@ -58,6 +59,7 @@ class EyeInHandKinematics:
         self.cy_px = frame_height / 2.0
         self.kx_mm_per_px = kx_mm_per_px
         self.ky_mm_per_px = ky_mm_per_px
+        self.cam_skew_deg = cam_skew_deg
         self.offset_x_mm = offset_x_mm
         self.offset_y_mm = offset_y_mm
         self.cam_homed_z_above_plate_mm = cam_homed_z_above_plate_mm
@@ -112,24 +114,36 @@ class EyeInHandKinematics:
         v_px: float,
         motor_x_mm: float,
         motor_y_mm: float,
+        fid_angle_deg: Optional[float] = None,
     ) -> Tuple[float, float]:
         """
         Calibrates the true camera plate origin using the detected fiducial marker.
-        Marker position in Plate Coordinates = (fx, fy).
-        Camera optical center in Plate Coordinates = (X_cam_origin + motor_x, Y_cam_origin + motor_y).
-        Marker relative to camera:
-          dx = -(u_px - cx_px) * kx
-          dy = -(v_px - cy_px) * ky
-        Therefore:
-          fx = X_cam_origin + motor_x + dx  =>  X_cam_origin = fx - (motor_x + dx)
-          fy = Y_cam_origin + motor_y + dy  =>  Y_cam_origin = fy - (motor_y + dy)
+        Also calculates physical camera housing skew from the marker's orientation angle
+        (nominal is 180.0 deg for Marker #1 top-edge vector pointing in world +X direction).
         """
         if marker_id not in self.corner_fiducials:
             raise ValueError(f"Unknown ArUco marker ID {marker_id} for origin calibration.")
 
+        if fid_angle_deg is not None:
+            # Marker #1 top-edge in image points along world +X (nominal 180.0 deg)
+            skew = (fid_angle_deg - 180.0 + 180.0) % 360.0 - 180.0
+            self.cam_skew_deg = round(skew, 2)
+
         fx, fy = self.corner_fiducials[marker_id]
-        dx_mm = -(u_px - self.cx_px) * self.kx_mm_per_px
-        dy_mm = -(v_px - self.cy_px) * self.ky_mm_per_px
+
+        # Rotate camera sensor displacement by camera skew angle
+        u_prime = -(u_px - self.cx_px) * self.kx_mm_per_px
+        v_prime = -(v_px - self.cy_px) * self.ky_mm_per_px
+
+        if abs(self.cam_skew_deg) > 1e-4:
+            rad = math.radians(self.cam_skew_deg)
+            cos_a = math.cos(rad)
+            sin_a = math.sin(rad)
+            dx_mm = u_prime * cos_a - v_prime * sin_a
+            dy_mm = u_prime * sin_a + v_prime * cos_a
+        else:
+            dx_mm = u_prime
+            dy_mm = v_prime
 
         self.cam_origin_x_mm = round(fx - (motor_x_mm + dx_mm), 2)
         self.cam_origin_y_mm = round(fy - (motor_y_mm + dy_mm), 2)
@@ -148,14 +162,26 @@ class EyeInHandKinematics:
         """
         Converts pixel coordinates (u, v) captured at motor position (motor_x, motor_y)
         into true Plate Coordinates (mm wrt fiducial plate origin 0,0).
+        Applies height-scaling and 2D rotation compensation for physical camera housing skew.
         """
         height_ratio = self._height_ratio(z_current_mm, z_scan_mm)
         kx = self.kx_mm_per_px * height_ratio
         ky = self.ky_mm_per_px * height_ratio
 
-        # Inverted image X axis: u > cx is to the physical -X direction
-        dx_mm = -(u_px - self.cx_px) * kx
-        dy_mm = -(v_px - self.cy_px) * ky
+        # Inverted image X axis: u > cx is to physical -X direction
+        u_prime = -(u_px - self.cx_px) * kx
+        v_prime = -(v_px - self.cy_px) * ky
+
+        # 2D rotation matrix: rotates camera sensor frame into world plate frame
+        if abs(self.cam_skew_deg) > 1e-4:
+            rad = math.radians(self.cam_skew_deg)
+            cos_a = math.cos(rad)
+            sin_a = math.sin(rad)
+            dx_mm = u_prime * cos_a - v_prime * sin_a
+            dy_mm = u_prime * sin_a + v_prime * cos_a
+        else:
+            dx_mm = u_prime
+            dy_mm = v_prime
 
         plate_x = self.cam_origin_x_mm + motor_x_mm + dx_mm
         plate_y = self.cam_origin_y_mm + motor_y_mm + dy_mm
@@ -172,7 +198,7 @@ class EyeInHandKinematics:
     ) -> Tuple[float, float]:
         """
         Projects Plate Coordinates (mm) back to pixel coordinates (u, v)
-        for a given motor carriage position.
+        for a given motor carriage position, inverting the camera skew rotation.
         """
         height_ratio = self._height_ratio(z_current_mm, z_scan_mm)
         kx = self.kx_mm_per_px * height_ratio
@@ -184,9 +210,26 @@ class EyeInHandKinematics:
         dx_mm = plate_x_mm - cam_x
         dy_mm = plate_y_mm - cam_y
 
-        u_px = self.cx_px - dx_mm / kx
-        v_px = self.cy_px - dy_mm / ky
+        if abs(self.cam_skew_deg) > 1e-4:
+            rad = math.radians(self.cam_skew_deg)
+            cos_a = math.cos(rad)
+            sin_a = math.sin(rad)
+            u_prime = dx_mm * cos_a + dy_mm * sin_a
+            v_prime = -dx_mm * sin_a + dy_mm * cos_a
+        else:
+            u_prime = dx_mm
+            v_prime = dy_mm
+
+        u_px = self.cx_px - u_prime / kx
+        v_px = self.cy_px - v_prime / ky
         return u_px, v_px
+
+    def compensate_block_angle(self, raw_angle_deg: float) -> float:
+        """
+        Compensates raw vision detection angle for physical camera housing skew,
+        mapping to physical plate coordinate orientation (0-180 deg).
+        """
+        return round((raw_angle_deg - self.cam_skew_deg) % 180.0, 1)
 
     def plate_to_camera_motor(self, plate_x_mm: float, plate_y_mm: float) -> Tuple[float, float]:
         """Calculates motor coordinates to position camera optical center directly over a plate location."""

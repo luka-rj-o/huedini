@@ -129,6 +129,7 @@ class GantryConfig:
 
     default_kx_mm_per_px: float = 0.25
     default_ky_mm_per_px: float = 0.25
+    default_cam_skew_deg: float = 0.0
 
     # Camera is offset from gripper in CAD:
     # Camera homed = (27.8, 60.1), Gripper homed = (28.0, 6.0)
@@ -192,9 +193,9 @@ class GantryConfig:
     min_valid_mass_g: float = 2.0
     max_valid_mass_g: float = 35.0
 
-    # --- Block Contour Filtering (pixels^2 at z_scan_mm) ---
+    # --- Block Contour Filtering (pixels^2 at z_scan_mm and hover z_hover_mm) ---
     min_contour_area_px: float = 2200.0
-    max_contour_area_px: float = 18000.0
+    max_contour_area_px: float = 35000.0
     deduplication_radius_mm: float = 18.0
 
     # --- Classical Computer Vision HSV Color Ranges ---

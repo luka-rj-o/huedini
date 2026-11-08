@@ -29,10 +29,12 @@ class TelemetryServer:
         host: str = "0.0.0.0",
         port: int = 8765,
         command_callback: Optional[Callable[[str, dict], None]] = None,
+        report_recorder: Optional[Any] = None,
     ):
         self.host = host
         self.port = port
         self.command_callback = command_callback
+        self.report_recorder = report_recorder
 
         self._clients: Set[asyncio.StreamWriter] = set()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -177,6 +179,74 @@ class TelemetryServer:
             resp = (
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii") + body
+            writer.write(resp)
+            await writer.drain()
+            writer.close()
+            return
+        elif clean_path == "/api/reports":
+            reports = self.report_recorder.get_recent_reports() if self.report_recorder else []
+            body = json.dumps(reports).encode("utf-8")
+            resp = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii") + body
+            writer.write(resp)
+            await writer.drain()
+            writer.close()
+            return
+        elif clean_path == "/api/reports/latest":
+            latest = self.report_recorder.get_latest_report() if self.report_recorder else {}
+            body = json.dumps(latest or {}).encode("utf-8")
+            resp = (
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                f"Content-Length: {len(body)}\r\n"
+                "Connection: close\r\n\r\n"
+            ).encode("ascii") + body
+            writer.write(resp)
+            await writer.drain()
+            writer.close()
+            return
+        elif clean_path.startswith("/api/reports/"):
+            sub = clean_path[len("/api/reports/"):]
+            is_download = sub.endswith("/download")
+            is_md = sub.endswith("/md")
+            run_id = sub.replace("/download", "").replace("/md", "")
+
+            report = self.report_recorder.get_report(run_id) if self.report_recorder else None
+            if report is None:
+                writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 16\r\nConnection: close\r\n\r\nReport Not Found")
+                await writer.drain()
+                writer.close()
+                return
+
+            if is_md:
+                # Render markdown file if present
+                md_path = getattr(self.report_recorder, "reports_dir", Path("reports")) / f"{run_id}.md"
+                body = md_path.read_bytes() if md_path.exists() else json.dumps(report, indent=2).encode("utf-8")
+                ctype = "text/markdown; charset=utf-8"
+                headers_extra = ""
+            elif is_download:
+                body = json.dumps(report, indent=2).encode("utf-8")
+                ctype = "application/json"
+                headers_extra = f"Content-Disposition: attachment; filename=\"{run_id}.json\"\r\n"
+            else:
+                body = json.dumps(report).encode("utf-8")
+                ctype = "application/json"
+                headers_extra = "Access-Control-Allow-Origin: *\r\n"
+
+            resp = (
+                f"HTTP/1.1 200 OK\r\n"
+                f"Content-Type: {ctype}\r\n"
+                f"{headers_extra}"
                 f"Content-Length: {len(body)}\r\n"
                 "Connection: close\r\n\r\n"
             ).encode("ascii") + body
