@@ -41,11 +41,18 @@ class TelemetryServer:
             "timestamp": time.time(),
             "state": "IDLE",
             "gantry_pose": {
-                "x_mm": 49.1,
-                "y_mm": 60.1,
+                "x_mm": 0.0,
+                "y_mm": 0.0,
                 "z_mm": 0.0,
                 "angle_deg": 0.0,
                 "grip_closed": True,
+            },
+            "current_mass_g": None,
+            "mass_class": None,
+            "steps_per_mm": {
+                "x": 50.0,
+                "y": 10.0,
+                "z": 50.0,
             },
             "calibration": {
                 "calibrated": False,

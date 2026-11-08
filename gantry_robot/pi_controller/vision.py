@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import base64
 import logging
 import math
+import threading
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -31,6 +32,15 @@ class DetectedBlock:
     angle_deg: float
     area_px: float
     box_pts: np.ndarray
+
+    def to_dict(self) -> dict:
+        return {
+            "color": self.color,
+            "u_px": round(self.u_px, 1),
+            "v_px": round(self.v_px, 1),
+            "angle_deg": round(self.angle_deg, 1),
+            "area_px": round(self.area_px, 1),
+        }
 
 
 @dataclass
@@ -59,6 +69,7 @@ class VisionPipeline:
         self.kinematics = kinematics
         self.mock_hardware = mock_hardware
         self._cap: Optional[cv2.VideoCapture] = None
+        self._cam_lock = threading.Lock()
         self.last_annotated_jpeg_b64: Optional[str] = None
 
         # Setup ArUco DICT_4X4_50 detector (compatible across OpenCV 4.5 - 4.10+)
@@ -91,16 +102,41 @@ class VisionPipeline:
             logger.info("VisionPipeline initialized in --mock-hardware mode (synthetic OpenCV renderer).")
             return
 
-        logger.info("Opening UVC USB camera index %d...", self.config.camera_index)
-        self._cap = cv2.VideoCapture(self.config.camera_index, cv2.CAP_V4L2)
-        if not self._cap.isOpened():
-            self._cap = cv2.VideoCapture(self.config.camera_index)
-        if not self._cap.isOpened():
-            raise RuntimeError(f"Could not open UVC camera index {self.config.camera_index}")
+        indices = [self.config.camera_index]
+        for alt in (0, 1, 2, 4):
+            if alt not in indices:
+                indices.append(alt)
+
+        for idx in indices:
+            logger.info("Attempting to open UVC camera index %d...", idx)
+            cap = cv2.VideoCapture(idx, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(idx)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                if ret and frame is not None:
+                    self._cap = cap
+                    logger.info("Successfully opened UVC camera at index %d", idx)
+                    break
+                cap.release()
+
+        if self._cap is None or not self._cap.isOpened():
+            raise RuntimeError(f"Could not open any UVC camera (tried indices {indices})")
 
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.config.frame_width)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.config.frame_height)
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Disable backlight compensation to prevent dynamic exposure pumping on stationary metal
+        try:
+            import subprocess
+            subprocess.run(
+                ["v4l2-ctl", "-d", f"/dev/video{idx}", "-c", "backlight_compensation=0"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1.0,
+            )
+        except Exception:
+            pass
 
     def close_camera(self) -> None:
         if self._cap is not None:
@@ -121,17 +157,231 @@ class VisionPipeline:
         if self.mock_hardware:
             return self._render_synthetic_frame(camera_x_mm, camera_y_mm, camera_z_mm)
 
-        if self._cap is None or not self._cap.isOpened():
-            self.open_camera()
+        with self._cam_lock:
+            if self._cap is None or not self._cap.isOpened():
+                self.open_camera()
 
-        assert self._cap is not None
-        # Flush 3 stale frames from V4L2 ring buffer
-        for _ in range(3):
+            assert self._cap is not None
+            # Flush 3 stale frames from V4L2 ring buffer
+            for _ in range(3):
+                self._cap.grab()
+            ok, frame = self._cap.read()
+            if not ok or frame is None:
+                raise RuntimeError("Failed to capture stationary frame from UVC camera.")
+            return frame
+
+    def capture_live_frame(
+        self,
+        camera_x_mm: Optional[float] = None,
+        camera_y_mm: Optional[float] = None,
+        camera_z_mm: Optional[float] = None,
+    ) -> Optional[np.ndarray]:
+        """
+        Fast non-blocking grab for semi-live streaming.
+        Flushes stale buffer so the preview is fresh without lag.
+        """
+        if self.mock_hardware:
+            cx = camera_x_mm if camera_x_mm is not None else self.config.cam_homed_plate_xyz[0]
+            cy = camera_y_mm if camera_y_mm is not None else self.config.cam_homed_plate_xyz[1]
+            cz = camera_z_mm if camera_z_mm is not None else self.config.cam_homed_plate_xyz[2]
+            return self._render_synthetic_frame(cx, cy, cz)
+
+        with self._cam_lock:
+            if self._cap is None or not self._cap.isOpened():
+                try:
+                    self.open_camera()
+                except Exception:
+                    return None
+
+            if self._cap is None or not self._cap.isOpened():
+                return None
+
+            # Fast grab to discard any stale buffer frame
             self._cap.grab()
-        ok, frame = self._cap.read()
-        if not ok or frame is None:
-            raise RuntimeError("Failed to capture stationary frame from UVC camera.")
-        return frame
+            ok, frame = self._cap.read()
+            if not ok or frame is None:
+                return None
+            return frame
+
+    def encode_fast_preview(self, frame: np.ndarray) -> None:
+        """
+        Lightweight fast preview encoding for live streaming in IDLE/manual mode.
+        Draws the optical center crosshair and compresses to JPEG without running
+        the heavy 5-color HSV morphology and ArUco matrix detector loops, saving ~70% CPU on Pi Zero.
+        """
+        annotated = frame.copy()
+        h, w = frame.shape[:2]
+        cx_img, cy_img = w // 2, h // 2
+        cv2.line(annotated, (cx_img - 20, cy_img), (cx_img + 20, cy_img), (200, 200, 200), 1)
+        cv2.line(annotated, (cx_img, cy_img - 20), (cx_img, cy_img + 20), (200, 200, 200), 1)
+        cv2.circle(annotated, (cx_img, cy_img), 3, (255, 255, 255), -1)
+
+        ok, buf = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+        if ok:
+            self.last_annotated_jpeg_b64 = base64.b64encode(buf).decode("ascii")
+
+    def process_live_frame(
+        self, frame: np.ndarray
+    ) -> Tuple[List[dict], List[DetectedBlock]]:
+        """
+        Processes a live video frame by simultaneously detecting all ArUco fiducials
+        and HSV color blocks, rendering high-visibility angle vectors, centroids,
+        and HUD overlays, and encoding the preview for the dashboard.
+        """
+        annotated = frame.copy()
+        h, w = frame.shape[:2]
+
+        # 1. Optical center crosshair with tick marks at center (w//2, h//2)
+        cx_img, cy_img = w // 2, h // 2
+        cv2.line(annotated, (cx_img - 20, cy_img), (cx_img + 20, cy_img), (200, 200, 200), 1)
+        cv2.line(annotated, (cx_img, cy_img - 20), (cx_img, cy_img + 20), (200, 200, 200), 1)
+        cv2.circle(annotated, (cx_img, cy_img), 3, (255, 255, 255), -1)
+
+        # 2. Detect all standard ArUco Fiducials (DICT_4X4_50)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        detected_fiducials: List[dict] = []
+
+        if hasattr(cv2.aruco, "ArucoDetector"):
+            detector = cv2.aruco.ArucoDetector(self._aruco_dict, self._aruco_params)
+            corners, ids, _ = detector.detectMarkers(gray)
+        else:
+            corners, ids, _ = cv2.aruco.detectMarkers(
+                gray, self._aruco_dict, parameters=self._aruco_params
+            )
+
+        if ids is not None and len(ids) > 0:
+            cv2.aruco.drawDetectedMarkers(annotated, corners, ids)
+            for marker_corners, marker_id in zip(corners, ids.flatten()):
+                m_id = int(marker_id)
+                pts = marker_corners[0]
+                u_px = float(np.mean(pts[:, 0]))
+                v_px = float(np.mean(pts[:, 1]))
+                dx = float(pts[1, 0] - pts[0, 0])
+                dy = float(pts[1, 1] - pts[0, 1])
+                angle_deg = round(math.degrees(math.atan2(dy, dx)), 1)
+                detected_fiducials.append({
+                    "id": m_id,
+                    "u_px": round(u_px, 1),
+                    "v_px": round(v_px, 1),
+                    "angle_deg": angle_deg,
+                })
+                # Draw angle orientation arrow (from center along marker forward axis)
+                rad = math.radians(angle_deg)
+                arrow_len = 35
+                ax = int(u_px + arrow_len * math.cos(rad))
+                ay = int(v_px + arrow_len * math.sin(rad))
+                cv2.arrowedLine(annotated, (int(u_px), int(v_px)), (ax, ay), (255, 128, 0), 2, tipLength=0.25)
+                cv2.circle(annotated, (int(u_px), int(v_px)), 5, (0, 255, 0), -1)
+
+                # ArUco label with dark background box for high contrast
+                lbl = f"ARUCO #{m_id} {angle_deg:+.1f}deg"
+                (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                lx, ly = max(5, int(u_px) - lw // 2), max(lh + 5, int(v_px) - 20)
+                cv2.rectangle(annotated, (lx - 2, ly - lh - 2), (lx + lw + 2, ly + 4), (0, 0, 0), -1)
+                cv2.putText(annotated, lbl, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+
+        # 3. Detect all HSV Color Blocks
+        blurred = cv2.GaussianBlur(frame, (5, 5), 0)
+        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+
+        color_bgr_map = {
+            "red": (0, 0, 255),
+            "green": (0, 255, 0),
+            "blue": (255, 120, 0),
+            "yellow": (0, 230, 255),
+            "aluminum": (200, 200, 200),
+            "white": (255, 255, 255),
+        }
+
+        detected_blocks: List[DetectedBlock] = []
+        for color_name, hsv_cfg in self.config.hsv_ranges.items():
+            mask = cv2.inRange(
+                hsv,
+                np.array(hsv_cfg.lower1, dtype=np.uint8),
+                np.array(hsv_cfg.upper1, dtype=np.uint8),
+            )
+            if hsv_cfg.lower2 is not None and hsv_cfg.upper2 is not None:
+                mask2 = cv2.inRange(
+                    hsv,
+                    np.array(hsv_cfg.lower2, dtype=np.uint8),
+                    np.array(hsv_cfg.upper2, dtype=np.uint8),
+                )
+                mask = cv2.bitwise_or(mask, mask2)
+
+            k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open)
+
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for cnt in contours:
+                area = float(cv2.contourArea(cnt))
+                if not (self.config.min_contour_area_px <= area <= self.config.max_contour_area_px):
+                    continue
+
+                # Filter out contours touching camera frame boundaries
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                if bx <= 8 or by <= 8 or bx + bw >= w - 8 or by + bh >= h - 8:
+                    continue
+
+                rect = cv2.minAreaRect(cnt)
+                (u_px, v_px), (rw, rh), raw_angle = rect
+                aspect = max(rw, rh) / max(1e-3, min(rw, rh))
+                if aspect > 1.30:
+                    continue
+
+                solidity = area / max(1e-3, (rw * rh))
+                if solidity < 0.72:
+                    continue
+
+                if rw < rh:
+                    raw_angle = raw_angle + 90.0
+                angle_deg = round(float(raw_angle % 180.0), 1)
+
+                box = cv2.boxPoints(rect)
+                box_int = np.int32(box)
+
+                det = DetectedBlock(
+                    color=color_name,
+                    u_px=float(u_px),
+                    v_px=float(v_px),
+                    angle_deg=angle_deg,
+                    area_px=area,
+                    box_pts=box_int,
+                )
+                detected_blocks.append(det)
+
+                # Draw rotated box in block color
+                bgr = color_bgr_map.get(color_name, (255, 255, 255))
+                cv2.drawContours(annotated, [box_int], 0, bgr, 2)
+                cv2.circle(annotated, (int(u_px), int(v_px)), 4, (255, 255, 255), -1)
+
+                # Draw orientation axis arrow
+                rad = math.radians(angle_deg)
+                arrow_len = 30
+                ax = int(u_px + arrow_len * math.cos(rad))
+                ay = int(v_px + arrow_len * math.sin(rad))
+                cv2.arrowedLine(annotated, (int(u_px), int(v_px)), (ax, ay), (0, 255, 0), 2, tipLength=0.3)
+
+                # Text label with background
+                lbl = f"{color_name.upper()} {angle_deg:.1f}deg"
+                (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                lx, ly = max(5, int(u_px) - lw // 2), max(lh + 5, int(v_px) - 14)
+                cv2.rectangle(annotated, (lx - 2, ly - lh - 2), (lx + lw + 2, ly + 4), (0, 0, 0), -1)
+                cv2.putText(annotated, lbl, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # 4. Top HUD Header Banner
+        hud_text = f"LIVE CAM (~3 FPS) | Fiducials: {len(detected_fiducials)} | Blocks: {len(detected_blocks)}"
+        cv2.rectangle(annotated, (0, 0), (w, 24), (20, 25, 35), -1)
+        cv2.circle(annotated, (12, 12), 5, (0, 255, 0), -1)
+        cv2.putText(annotated, hud_text, (26, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (240, 240, 240), 1, cv2.LINE_AA)
+
+        # 5. JPEG encode at quality 70 for responsive network transmission
+        ok, buf = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+        if ok:
+            self.last_annotated_jpeg_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+
+        return detected_fiducials, detected_blocks
 
     def detect_aruco_fiducial(
         self, frame: np.ndarray, target_id: Optional[int] = None
@@ -177,10 +427,17 @@ class VisionPipeline:
         """
         blurred = cv2.GaussianBlur(frame, (5, 5), 0)
         hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-
         detections: List[DetectedBlock] = []
         annotated = frame.copy()
+
+        color_bgr_map = {
+            "red": (0, 0, 255),
+            "green": (0, 255, 0),
+            "blue": (255, 120, 0),
+            "yellow": (0, 230, 255),
+            "aluminum": (200, 200, 200),
+            "white": (255, 255, 255),
+        }
 
         # Draw optical crosshair
         h, w = frame.shape[:2]
@@ -202,8 +459,10 @@ class VisionPipeline:
                 )
                 mask = cv2.bitwise_or(mask, mask2)
 
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+            k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open)
 
             contours, _ = cv2.findContours(
                 mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
@@ -214,8 +473,21 @@ class VisionPipeline:
                 if not (self.config.min_contour_area_px <= area <= self.config.max_contour_area_px):
                     continue
 
+                # Filter out contours touching camera frame boundaries
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                if bx <= 8 or by <= 8 or bx + bw >= w - 8 or by + bh >= h - 8:
+                    continue
+
                 rect = cv2.minAreaRect(cnt)
                 (u_px, v_px), (rw, rh), angle = rect
+                aspect = max(rw, rh) / max(1e-3, min(rw, rh))
+                if aspect > 1.30:
+                    continue
+
+                solidity = area / max(1e-3, (rw * rh))
+                if solidity < 0.72:
+                    continue
+
                 if rw < rh:
                     angle = angle + 90.0
                 angle_deg = float(angle % 180.0)
@@ -233,12 +505,18 @@ class VisionPipeline:
                 )
                 detections.append(det)
 
-                cv2.drawContours(annotated, [box_int], 0, (0, 255, 0), 2)
+                bgr = color_bgr_map.get(color_name, (255, 255, 255))
+                cv2.drawContours(annotated, [box_int], 0, bgr, 2)
                 cv2.circle(annotated, (int(u_px), int(v_px)), 4, (255, 255, 255), -1)
+
+                lbl = f"{color_name.upper()} {angle_deg:.0f}deg"
+                (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                lx, ly = max(5, int(u_px) - lw // 2), max(lh + 5, int(v_px) - 14)
+                cv2.rectangle(annotated, (lx - 2, ly - lh - 2), (lx + lw + 2, ly + 4), (0, 0, 0), -1)
                 cv2.putText(
                     annotated,
-                    f"{color_name.upper()} {angle_deg:.0f}deg",
-                    (int(u_px) - 35, int(v_px) - 12),
+                    lbl,
+                    (lx, ly),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.45,
                     (255, 255, 255),
@@ -326,6 +604,8 @@ class VisionPipeline:
             "green": (50, 205, 50),
             "blue": (230, 110, 25),
             "yellow": (20, 215, 235),
+            "aluminum": (160, 160, 160),
+            "white": (245, 245, 245),
         }
 
         height_ratio = self.kinematics._height_ratio(camera_z_mm, self.config.z_scan_mm)

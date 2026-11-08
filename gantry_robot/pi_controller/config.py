@@ -34,14 +34,19 @@ class GantryConfig:
     serial_timeout_s: float = 35.0
 
     # --- Stepper Calibration ---
-    # X & Z: 2.0 mm/rev lead screw, 200 steps/rev, 2x microstepping = 200.0 steps/mm
-    # Y: 20-tooth GT2 belt pulley (40.0 mm/rev), 200 steps/rev, 2x microstepping = 10.0 steps/mm
+    # Lead screw pitch vs. lead:
+    # Most standard T8 lead screws (T8x8, 4 starts) advance 8.0 mm per rev:
+    # 400 microsteps / 8.0 mm = 50.0 steps/mm.
+    # If 2-start (T8x4, 4.0 mm lead): 100.0 steps/mm.
+    # If 1-start (T8x2, 2.0 mm lead): 200.0 steps/mm.
+    # Y axis: 20-tooth GT2 belt pulley (40.0 mm/rev), 200 steps/rev, 2x microstepping = 10.0 steps/mm.
     lead_screw_pitch_mm: float = 2.0
+    lead_screw_lead_mm: float = 8.0
     y_belt_pulley_mm_rev: float = 40.0
     microsteps: int = 2
-    steps_per_mm_x: float = 200.0
+    steps_per_mm_x: float = 50.0
     steps_per_mm_y: float = 10.0
-    steps_per_mm_z: float = 200.0
+    steps_per_mm_z: float = 50.0
 
     # --- Physical Motor Travel Strokes from Homed (0, 0, 0) (mm) ---
     # Z=0 is at the TOP when homed; positive Z travel moves DOWNWARD up to 76.71 mm (84 mm mechanical stroke).
@@ -157,6 +162,7 @@ class GantryConfig:
             "high_infill": (224.5, 44.5),
             "med_infill": (224.5, 44.5),
             "low_infill": (224.5, 44.5),
+            "white": (224.5, 44.5),
             "red": (224.5, 44.5),
             "green": (224.5, 44.5),
             "blue": (224.5, 44.5),
@@ -170,13 +176,19 @@ class GantryConfig:
     max_valid_mass_g: float = 35.0
 
     # --- Block Contour Filtering (pixels^2 at z_scan_mm) ---
-    min_contour_area_px: float = 300.0
-    max_contour_area_px: float = 30000.0
+    min_contour_area_px: float = 2200.0
+    max_contour_area_px: float = 18000.0
     deduplication_radius_mm: float = 18.0
 
     # --- Classical Computer Vision HSV Color Ranges ---
     hsv_ranges: Dict[str, HSVRange] = field(
         default_factory=lambda: {
+            "white": HSVRange(
+                name="white",
+                lower1=(0, 0, 175),
+                upper1=(179, 50, 255),
+                display_hex="#f8fafc",
+            ),
             "red": HSVRange(
                 name="red",
                 lower1=(0, 110, 80),
@@ -202,6 +214,12 @@ class GantryConfig:
                 lower1=(20, 110, 90),
                 upper1=(34, 255, 255),
                 display_hex="#eab308",
+            ),
+            "aluminum": HSVRange(
+                name="aluminum",
+                lower1=(0, 0, 100),
+                upper1=(179, 30, 174),
+                display_hex="#94a3b8",
             ),
         }
     )

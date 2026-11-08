@@ -239,9 +239,26 @@ gantry_robot/
   * **Axis 3 (Z) Test:** Jogged $+10.0\text{ mm}$ down in $2.47\text{ s}$, homed backward up in $2.92\text{ s}$. Zero premature trip; instant trip upon top bumper impact ($\text{SG\_RESULT} = 104$, lag $< 100\text{ ms}$).
 * **Locked Production Configuration (Axes 1 & 3 / X & Z Lead Screws):**
   * `SETUP_CURRENT_MA_XZ = 350` (350 mA RMS)
-  * `SETUP_MICROSTEPS = 2` (200.0 steps/mm on 2.0 mm pitch lead screws)
-  * `DEFAULT_HOME_SPEED_XZ = 800.0f` (4.0 mm/s)
+  * `SETUP_MICROSTEPS = 2`
+  * `DEFAULT_STEPS_PER_MM_X = 50.0f`, `DEFAULT_STEPS_PER_MM_Z = 50.0f` (Standard 4-start T8×8 screw with 8.0 mm lead)
+  * `DEFAULT_HOME_SPEED_XZ = 800.0f`
   * `DEFAULT_HOME_SENS = 60` (`SGTHRS = 60`, stall asserted when $\text{SG\_RESULT} \le 120$)
   * `DEFAULT_HOME_DIR_REVERSE_X = true`, `DEFAULT_HOME_DIR_REVERSE_Z = true`
   * `HOMING_RAMP_MS = 350`, `HOMING_BLANKING_MS = 800`
+
+### Issue #3: Lead Screw Pitch vs. Lead Calibration & Jog Distance Discrepancy
+* **Date:** November 2026
+* **Component:** Axis 1 (`S1`, X-Axis) and Axis 3 (`S3`, Z-Axis) Lead Screws.
+* **Symptoms:**
+  * Jogging $10.0\text{ mm}$ on X or Z moved significantly more than $10.0\text{ mm}$ physically (moving $\sim 40\text{ mm}$, a $4\times$ overshoot).
+* **Root Cause Analysis:**
+  * The initial configuration conflated lead screw **thread pitch** ($2.0\text{ mm}$) with **lead** (travel per full revolution, $\text{Lead} = \text{Pitch} \times \text{Starts}$).
+  * Standard T8 lead screws have 4 starts ($\text{Lead} = 2.0\text{ mm} \times 4 = 8.0\text{ mm/rev}$).
+  * With NEMA 11 steppers ($200\text{ steps/rev}$) and $2\times$ microstepping ($400\text{ microsteps/rev}$):
+    $$\text{steps\_per\_mm} = \frac{400\text{ microsteps}}{8.0\text{ mm}} = 50.0\text{ steps/mm}$$
+  * The prior setting of $200.0\text{ steps/mm}$ caused the controller to issue $2000\text{ steps}$ for a $10\text{ mm}$ jog, turning the lead screw 5 full revolutions ($5 \times 8.0\text{ mm} = 40.0\text{ mm}$), resulting in a $4\times$ distance error.
+* **Resolution:**
+  * Updated default $X$ and $Z$ steps per mm to $50.0\text{ steps/mm}$ (for standard 4-start T8×8 lead screws).
+  * Added dynamic lead screw preset controls to the GUI dashboard (`T8×8 50 spm`, `T8×4 100 spm`, `T8×2 200 spm`, `Custom`) and backend protocol handler (`SET_STEPS_CALIBRATION`) so users can calibrate lead screws on the fly without re-flashing firmware.
+
 

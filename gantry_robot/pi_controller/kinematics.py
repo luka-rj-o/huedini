@@ -124,9 +124,14 @@ class EyeInHandKinematics:
         return u_px, v_px
 
     def gripper_target_for_block(self, block_x_mm: float, block_y_mm: float) -> Tuple[float, float]:
+        """
+        Translates camera-aligned motor coordinates to gripper-aligned motor coordinates.
+        Since the camera is offset forwards (+Y) from the gripper, moving the gripper to the block
+        requires advancing the carriage forward (+offset_y).
+        """
         return (
-            block_x_mm - self.offset_x_mm,
-            block_y_mm - self.offset_y_mm,
+            block_x_mm + self.offset_x_mm,
+            block_y_mm + self.offset_y_mm,
         )
 
 
@@ -154,7 +159,9 @@ class WorldCatalogAndPlanner:
                 n = b.confidence_views
                 b.x_mm = (b.x_mm * n + x_mm) / (n + 1)
                 b.y_mm = (b.y_mm * n + y_mm) / (n + 1)
-                b.angle_deg = (b.angle_deg * n + angle_deg) / (n + 1)
+                # Angle wrap-around handling for 180-degree periodic orientation
+                angle_diff = (angle_deg - b.angle_deg + 90.0) % 180.0 - 90.0
+                b.angle_deg = (b.angle_deg + angle_diff / (n + 1)) % 180.0
                 b.confidence_views = n + 1
                 return b
 

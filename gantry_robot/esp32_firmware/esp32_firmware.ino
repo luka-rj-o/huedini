@@ -38,6 +38,8 @@
 #include <ESP32Servo.h>
 #include <TMCStepper.h>
 #include <HX711.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 
 // ============================================================
 //  PIN DEFINITIONS
@@ -68,8 +70,12 @@ const float R_SENSE = 0.11f;
 const int SETUP_CURRENT_MA_XZ = 350; // Calibrated 350mA for X and Z lead screws
 const int SETUP_CURRENT_MA_Y  = 700; // Optimal 700mA for Y-axis carrying X+Z gantry bridge on belt
 const int SETUP_MICROSTEPS    = 2;
-const int SETUP_STALL_SENS_XZ = 0;   // 0 = disable false-stall aborts during normal moves (StallGuard active during homing)
-const int SETUP_STALL_SENS_Y  = 0;   // 0 = disable false-stall aborts during normal moves (StallGuard active during homing)
+// Crash (stall) detection SGTHRS used during MOVE / manual jogs.
+// Defaults reuse the homing thresholds because MOVE speeds are capped near the calibrated homing speed
+// (see MAX_FEED_SPEED_*), and the check is gated to cruise speed + settle time + debounce (see isStalled()).
+// Set to 0 with "s1 s0" (etc.) to disable crash detection on an axis.
+const int SETUP_STALL_SENS_XZ = 60;  // == DEFAULT_HOME_SENS
+const int SETUP_STALL_SENS_Y  = 3;   // == DEFAULT_HOME_SENS_Y
 
 // Per-axis defaults (speeds in microsteps/s, acceleration in microsteps/s^2)
 const float DEFAULT_MAX_SPEED_XZ  = 1000.0f; // 5.0 mm/s on 2mm lead screw
@@ -83,14 +89,15 @@ const float DEFAULT_HOME_SPEED_Y  = 700.0f;  // 70.0 mm/s (1.75 rev/s for health
 const int   DEFAULT_HOME_SENS     = 60;      // Homing sensitivity threshold for X and Z lead screws (SGTHRS=60)
 const int   DEFAULT_HOME_SENS_Y   = 3;       // Homing sensitivity threshold for Y belt pulley (SGTHRS=3)
 
-// X & Z: Lead screw pitch = 2.0 mm/rev, NEMA 11 = 200 full steps/rev -> 200.0 microsteps/mm @ 2x microsteps.
+// X & Z: Lead screw lead = 8.0 mm/rev (standard 4-start T8x8), NEMA 11 = 200 full steps/rev -> 50.0 microsteps/mm @ 2x microsteps.
+// (Configurable dynamically via protocol STEPS command: 50.0 for T8x8, 100.0 for T8x4, 200.0 for T8x2).
 // Y: GT2 belt (2.0 mm pitch) x 20-tooth pulley = 40.0 mm/rev -> 10.0 microsteps/mm @ 2x microsteps.
-const float LEAD_SCREW_PITCH_MM    = 2.0f;
+const float LEAD_SCREW_LEAD_MM     = 8.0f;
 const float BELT_PULLEY_MM_REV_Y   = 40.0f; // 20 teeth * 2.0 mm GT2 pitch
 const float MOTOR_FULL_STEPS_REV   = 200.0f;
-const float DEFAULT_STEPS_PER_MM_X = (MOTOR_FULL_STEPS_REV * SETUP_MICROSTEPS) / LEAD_SCREW_PITCH_MM;  // 200.0f
+const float DEFAULT_STEPS_PER_MM_X = (MOTOR_FULL_STEPS_REV * SETUP_MICROSTEPS) / LEAD_SCREW_LEAD_MM;   // 50.0f
 const float DEFAULT_STEPS_PER_MM_Y = (MOTOR_FULL_STEPS_REV * SETUP_MICROSTEPS) / BELT_PULLEY_MM_REV_Y; // 10.0f
-const float DEFAULT_STEPS_PER_MM_Z = (MOTOR_FULL_STEPS_REV * SETUP_MICROSTEPS) / LEAD_SCREW_PITCH_MM;  // 200.0f
+const float DEFAULT_STEPS_PER_MM_Z = (MOTOR_FULL_STEPS_REV * SETUP_MICROSTEPS) / LEAD_SCREW_LEAD_MM;   // 50.0f
 
 // Homing direction per axis (true = reverse/negative towards 0, false = forward)
 const bool DEFAULT_HOME_DIR_REVERSE_X = true;
@@ -115,12 +122,40 @@ float hx711ScaleFactor = 420.0f;
 // If your mechanical linkage works in the opposite sense, toggle `gripOpenRelayHigh`.
 bool gripOpenRelayHigh = true;
 
-const unsigned long HOMING_RAMP_MS     = 350;    // smooth linear acceleration ramp during homing
-const unsigned long HOMING_BLANKING_MS = 800;    // ignore DIAG during ramp & initial belt settling (800ms)
-const unsigned long HOMING_TIMEOUT_MS  = 30000;  // give up if no stall within 30 s
+const unsigned long HOMING_RAMP_MS     = 250;    // Smooth linear acceleration ramp (250ms)
+const unsigned long HOMING_BLANKING_MS = 350;    // Ignore DIAG during ramp & initial settle (350ms)
+const unsigned long HOMING_TIMEOUT_MS  = 30000;  // minimum homing timeout; the real per-axis timeout scales with
+                                                 // stroke/homeSpeed (X needs ~60 s for a full 236 mm stroke at 4 mm/s)
 
-// Stall detection during moves only runs near full speed
+// Physical strokes from the homed origin (mm). Used for MOVE soft limits and forward-homing position.
+const float TRAVEL_X_MM = 236.0f;
+const float TRAVEL_Y_MM = 128.0f;
+const float TRAVEL_Z_MM = 84.0f;
+
+// Safe pull-away distances before homing so axes against bumpers have runway to accelerate
+const float HOME_BACKOFF_MM_XZ = 5.0f;
+const float HOME_BACKOFF_MM_Y  = 15.0f;
+const unsigned long HOME_PRE_SETTLE_MS = 50;
+
+// Per-axis cap applied to MOVE feedrates (microsteps/s). StallGuard thresholds are only valid near the speed they
+// were calibrated at; the old firmware let F15 drive X/Z at 3000 steps/s (3.75x the calibrated 800 steps/s).
+const float MAX_FEED_SPEED_XZ = DEFAULT_MAX_SPEED_XZ; // 1000 steps/s = 5 mm/s
+const float MAX_FEED_SPEED_Y  = DEFAULT_MAX_SPEED_Y;  // 700 steps/s = 70 mm/s
+
+// Stall detection during moves only runs near full (cruise) speed
 const float STALL_CHECK_SPEED_RATIO = 0.9f;
+// ...and only when cruise speed is close to the calibrated homing speed (back-EMF too weak below this)
+const float STALL_MIN_SPEED_RATIO_OF_HOME = 0.85f;
+// ...and only after cruising for this long (Y belt settling transient after the accel ramp)
+const unsigned long STALL_SETTLE_MS_XZ = 100;
+const unsigned long STALL_SETTLE_MS_Y  = 450;
+// ...and DIAG must be seen HIGH at least twice within this window (rejects single-sample glitches; DIAG may
+// pulse once per full step while stalled, so we do not require it to be continuously HIGH)
+const unsigned long STALL_CONFIRM_WINDOW_MS = 15;
+
+// Allow the TMC2209 StealthChop automatic tuning (AT#1, standstill at run current) to settle after the
+// drivers are (re-)enabled, before any motion that relies on StallGuard.
+const unsigned long DRIVER_ENABLE_SETTLE_MS = 200;
 
 // Wrist servo mechanical zero trim (degrees added to logical 0..180 commands)
 float servoZeroOffsetDeg = 12.0f;
@@ -158,14 +193,27 @@ struct Axis {
   bool            homeReverse;      // Direction for automated HOME sequence
   bool            invertDir;        // Invert motor direction via TMC2209 shaft()
   int             currentMa;        // RMS current limit in mA
+  float           maxTravelMm;      // Soft-limit stroke from homed origin
+  float           homeBackoffMm;    // Pull-away distance before protocol HOME
+  float           maxFeedSpeed;     // Cap for MOVE feedrates (microsteps/s)
+  unsigned long   stallSettleMs;    // Cruise time before crash detection is armed
+  int             microsteps;       // Microstep setting re-applied by setupAxis()
+
+  // Runtime state (not part of the initializer lists below)
+  bool            homed = false;           // Position is referenced to the homed origin
+  unsigned long   cruiseSinceMs = 0;       // When the axis reached cruise speed (0 = not cruising)
+  unsigned long   diagFirstHighMs = 0;     // First DIAG HIGH sample in the current confirm window (0 = none)
 };
 
 const int NUM_AXES = 3;
 Axis axes[NUM_AXES] = {
-  { "S1", 'X', PIN_DIAG_1, &stepper1, &driver1, false, DEFAULT_MAX_SPEED_XZ, DEFAULT_ACCEL_XZ, DEFAULT_HOME_SPEED_XZ, SETUP_STALL_SENS_XZ, DEFAULT_HOME_SENS,   DEFAULT_STEPS_PER_MM_X, LEAD_SCREW_PITCH_MM,  DEFAULT_HOME_DIR_REVERSE_X, INVERT_DIR_X, SETUP_CURRENT_MA_XZ },
-  { "S2", 'Y', PIN_DIAG_2, &stepper2, &driver2, false, DEFAULT_MAX_SPEED_Y,  DEFAULT_ACCEL_Y,  DEFAULT_HOME_SPEED_Y,  SETUP_STALL_SENS_Y,  DEFAULT_HOME_SENS_Y, DEFAULT_STEPS_PER_MM_Y, BELT_PULLEY_MM_REV_Y, DEFAULT_HOME_DIR_REVERSE_Y, INVERT_DIR_Y, SETUP_CURRENT_MA_Y },
-  { "S3", 'Z', PIN_DIAG_3, &stepper3, &driver3, false, DEFAULT_MAX_SPEED_XZ, DEFAULT_ACCEL_XZ, DEFAULT_HOME_SPEED_XZ, SETUP_STALL_SENS_XZ, DEFAULT_HOME_SENS,   DEFAULT_STEPS_PER_MM_Z, LEAD_SCREW_PITCH_MM,  DEFAULT_HOME_DIR_REVERSE_Z, INVERT_DIR_Z, SETUP_CURRENT_MA_XZ },
+  { "S1", 'X', PIN_DIAG_1, &stepper1, &driver1, false, DEFAULT_MAX_SPEED_XZ, DEFAULT_ACCEL_XZ, DEFAULT_HOME_SPEED_XZ, SETUP_STALL_SENS_XZ, DEFAULT_HOME_SENS,   DEFAULT_STEPS_PER_MM_X, LEAD_SCREW_LEAD_MM,  DEFAULT_HOME_DIR_REVERSE_X, INVERT_DIR_X, SETUP_CURRENT_MA_XZ, TRAVEL_X_MM, HOME_BACKOFF_MM_XZ, MAX_FEED_SPEED_XZ, STALL_SETTLE_MS_XZ, SETUP_MICROSTEPS },
+  { "S2", 'Y', PIN_DIAG_2, &stepper2, &driver2, false, DEFAULT_MAX_SPEED_Y,  DEFAULT_ACCEL_Y,  DEFAULT_HOME_SPEED_Y,  SETUP_STALL_SENS_Y,  DEFAULT_HOME_SENS_Y, DEFAULT_STEPS_PER_MM_Y, BELT_PULLEY_MM_REV_Y, DEFAULT_HOME_DIR_REVERSE_Y, INVERT_DIR_Y, SETUP_CURRENT_MA_Y,  TRAVEL_Y_MM, HOME_BACKOFF_MM_Y,  MAX_FEED_SPEED_Y,  STALL_SETTLE_MS_Y,  SETUP_MICROSTEPS },
+  { "S3", 'Z', PIN_DIAG_3, &stepper3, &driver3, false, DEFAULT_MAX_SPEED_XZ, DEFAULT_ACCEL_XZ, DEFAULT_HOME_SPEED_XZ, SETUP_STALL_SENS_XZ, DEFAULT_HOME_SENS,   DEFAULT_STEPS_PER_MM_Z, LEAD_SCREW_LEAD_MM,  DEFAULT_HOME_DIR_REVERSE_Z, INVERT_DIR_Z, SETUP_CURRENT_MA_XZ, TRAVEL_Z_MM, HOME_BACKOFF_MM_XZ, MAX_FEED_SPEED_XZ, STALL_SETTLE_MS_XZ, SETUP_MICROSTEPS },
 };
+
+// Set when an ESTOP line is received while a blocking motion/homing loop is running
+bool estopLatched = false;
 
 float currentAngleDeg = 0.0f;
 int   currentGripState = 1; // 1 = gripping (NC default), 0 = open
@@ -177,15 +225,21 @@ void writeServoLogicalAngle(float logicalDeg) {
   servo.write(physDeg);
 }
 
+enum MotionResult { MOTION_DONE, MOTION_STALLED, MOTION_CANCELLED };
+
 // Forward declarations
 void printHelp();
 void handleCommand(String command);
 bool setupAll(bool quietProtocol = false);
 bool setupAxis(Axis& axis);
 void sleepAll();
-bool homeAxis(Axis& axis, bool reverse);
+bool homeAxis(Axis& axis, bool reverse, bool withBackoff = true);
 bool moveAxis(Axis& axis, long steps);
 bool isStalled(Axis& axis);
+void resetStallMonitor(Axis& axis);
+bool pollCancelInput();
+unsigned long homingTimeoutMs(Axis& axis, bool knownDistance);
+MotionResult runAxisTo(Axis& axis, long target);
 void handleMoveGcode(String params);
 void handleHomeAllGcode();
 void handleGripGcode(String params);
@@ -206,10 +260,21 @@ void setMaxSpeed(Axis& axis, float speed);
 void setAcceleration(Axis& axis, float accel);
 void readStallGuard(Axis& axis);
 
+// Stepper step loops run jitter-free; loop task watchdog is disabled via disableLoopWDT().
+// yieldWdt is kept as an empty inline stub to preserve zero overhead and seamless compilation.
+inline void yieldWdt(unsigned long& /*lastYieldMs*/, unsigned long /*intervalMs*/ = 30) {}
+
 // ============================================================
 //  ARDUINO ENTRY POINTS
 // ============================================================
 void setup() {
+  // Disable ESP32 hardware brownout detector to prevent nuisance reboots
+  // caused by transient voltage dips during stepper motor current surges
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  // Disable loop task watchdog timer so long homing strokes never panic reset
+  disableLoopWDT();
+
   Serial.begin(115200);
   delay(500);
 
@@ -271,8 +336,25 @@ Axis* getAxis(char id) {
 }
 
 void handleCommand(String rawCommand) {
+  rawCommand.trim();
+  if (rawCommand.length() == 0) return;
+
+  // Silently ignore echoed replies, firmware debug output, comments, or stray OKs
+  if (rawCommand.startsWith("->") || rawCommand.startsWith("[") ||
+      rawCommand.startsWith("#") || rawCommand.startsWith("//") ||
+      rawCommand.equalsIgnoreCase("OK")) {
+    return;
+  }
+
+  // Also ignore echoed homing/status text if the "-> " prefix was stripped
+  String lowerCheck = rawCommand;
+  lowerCheck.toLowerCase();
+  if (lowerCheck.indexOf(" homed") >= 0 || lowerCheck.indexOf(" pulling away") >= 0 ||
+      lowerCheck.indexOf(" ready (") >= 0 || lowerCheck.indexOf(" position set to") >= 0) {
+    return;
+  }
+
   String upper = rawCommand;
-  upper.trim();
   upper.toUpperCase();
 
   // --- Tier 2 (Raspberry Pi Zero W) Deterministic Protocol Commands ---
@@ -332,7 +414,7 @@ void handleCommand(String rawCommand) {
   }
   else if (command == "help")            { printHelp(); Serial.println("OK"); }
   else if (command == "l")               { handleLoadCellCommand(); Serial.println("OK"); }
-  else if (command.startsWith("home "))  { handleHomeCommand(command.substring(5)); Serial.println("OK"); }
+  else if (command.startsWith("home ") || command == "home")  { handleHomeCommand(command.length() > 5 ? command.substring(5) : ""); Serial.println("OK"); }
   else if (command.startsWith("servo ")) { handleServoCommand(command.substring(6)); Serial.println("OK"); }
   else if (command.startsWith("relay ")) { handleRelayCommand(command.substring(6)); Serial.println("OK"); }
   else if (command.length() > 3 && command.charAt(0) == 's' &&
@@ -365,10 +447,15 @@ void handleHomeAllGcode() {
   }
 
   // Home Z (S3) first so the end-effector is clear of obstacles, then X (S1) and Y (S2)
+  estopLatched = false;
   int homeOrder[3] = { 2, 0, 1 };
   for (int k = 0; k < 3; k++) {
     Axis& ax = axes[homeOrder[k]];
-    if (!homeAxis(ax, ax.homeReverse)) {
+    if (!homeAxis(ax, ax.homeReverse, true)) {
+      if (estopLatched) {
+        Serial.println("ERR:ESTOP");
+        return;
+      }
       Serial.print("ERR:HOME_FAILED_");
       Serial.println(ax.coordCode);
       return;
@@ -400,7 +487,10 @@ void handleMoveGcode(String params) {
   float feedrateMmPerSec = 0.0f;
   if (parseCoordToken(params, 'F', feedrateMmPerSec) && feedrateMmPerSec > 0.0f) {
     for (int i = 0; i < NUM_AXES; i++) {
-      float spdSteps = constrain(feedrateMmPerSec * axes[i].stepsPerMm, 10.0f, 20000.0f);
+      // Per-axis cap: F is in mm/s for every axis, but X/Z (200 steps/mm) and Y (10 steps/mm) differ 20x, so an
+      // uncapped F15 asked for 3000 steps/s on X/Z (step loss risk, StallGuard uncalibrated) and 150 steps/s on Y
+      // (too slow for StallGuard to work at all).
+      float spdSteps = constrain(feedrateMmPerSec * axes[i].stepsPerMm, 10.0f, axes[i].maxFeedSpeed);
       axes[i].maxSpeed = spdSteps;
       axes[i].stepper->setMaxSpeed(spdSteps);
     }
@@ -416,19 +506,21 @@ void handleMoveGcode(String params) {
   for (int i = 0; i < NUM_AXES; i++) {
     float targetMm = 0.0f;
     if (parseCoordToken(params, axes[i].coordCode, targetMm)) {
-      float maxTravel = (axes[i].coordCode == 'X') ? 236.0f : ((axes[i].coordCode == 'Y') ? 128.0f : 84.0f);
-      targetMm = constrain(targetMm, 0.0f, maxTravel);
+      targetMm = constrain(targetMm, 0.0f, axes[i].maxTravelMm);
       long targetSteps = lroundf(targetMm * axes[i].stepsPerMm);
       axes[i].stepper->moveTo(targetSteps);
     } else {
       axes[i].stepper->moveTo(axes[i].stepper->currentPosition());
     }
+    resetStallMonitor(axes[i]);
   }
 
   // Coordinated multi-axis step loop with StallGuard monitoring and responsive ESTOP
+  unsigned long lastWdtYieldMs = millis();
   while (axes[0].stepper->distanceToGo() != 0 ||
          axes[1].stepper->distanceToGo() != 0 ||
          axes[2].stepper->distanceToGo() != 0) {
+    yieldWdt(lastWdtYieldMs);
     if (Serial.available() > 0) {
       String inCmd = Serial.readStringUntil('\n');
       inCmd.trim();
@@ -452,6 +544,7 @@ void handleMoveGcode(String params) {
             axes[j].stepper->setCurrentPosition(axes[j].stepper->currentPosition());
           }
           // Immediately cut power to steppers so motor does not sustain power against the stop!
+          // (sleepAll() also invalidates the homed reference: the axis has lost steps.)
           sleepAll();
           Serial.print("ERR:STALL_");
           Serial.println(axes[i].coordCode);
@@ -518,7 +611,10 @@ void handleStatusGcode() {
   Serial.print(" A:");
   Serial.print(currentAngleDeg, 1);
   Serial.print(" GRIP:");
-  Serial.println(currentGripState);
+  Serial.print(currentGripState);
+  Serial.print(" HOMED:");
+  for (int i = 0; i < NUM_AXES; i++) Serial.print(axes[i].homed ? axes[i].coordCode : '-');
+  Serial.println();
   Serial.println("OK");
 }
 
@@ -566,6 +662,17 @@ void handleStepperCommand(Axis& axis, String param) {
   param.trim();
   if (param.length() == 0) return;
 
+  // Support "s1 home" and "s1 home -" as intuitive aliases for "home s1" / "home s1 -"
+  if (param.startsWith("home")) {
+    bool reverse = (param.indexOf('-') >= 0);
+    homeAxis(axis, reverse);
+    return;
+  }
+  // Ignore echoed status line if "s1 homed..." is parsed
+  if (param.startsWith("homed")) {
+    return;
+  }
+
   char sub = param.charAt(0);
   String valueStr = param.substring(1);
 
@@ -583,7 +690,12 @@ void handleStepperCommand(Axis& axis, String param) {
 
 void handleHomeSettings(Axis& axis, String param) {
   param.trim();
-  if (param.length() == 0) return;
+  if (param.length() == 0) {
+    Serial.print("-> "); Serial.print(axis.name);
+    Serial.print(" homing speed: "); Serial.print(axis.homeSpeed);
+    Serial.print(" steps/s, homing sensitivity: "); Serial.println(axis.homeSensitivity);
+    return;
+  }
 
   char sub = param.charAt(0);
   String valueStr = param.substring(1);
@@ -597,14 +709,25 @@ void handleHomeSettings(Axis& axis, String param) {
     axis.homeSensitivity = constrain((int)valueStr.toInt(), 0, 255);
     Serial.print("-> "); Serial.print(axis.name);
     Serial.print(" homing sensitivity: "); Serial.println(axis.homeSensitivity);
+  } else if (param.startsWith("ome")) {
+    // If called via "s1 home" or "s1 home -"
+    bool reverse = (param.indexOf('-') >= 0);
+    homeAxis(axis, reverse);
   } else {
-    Serial.println("[ERROR] Use hv<speed> or hs<sensitivity>.");
+    // Non-fatal informative readout instead of fatal [ERROR]
+    Serial.print("-> "); Serial.print(axis.name);
+    Serial.print(" homing speed: "); Serial.print(axis.homeSpeed);
+    Serial.print(" steps/s, homing sensitivity: "); Serial.println(axis.homeSensitivity);
   }
 }
 
 void handleHomeCommand(String param) {
   param.trim();
-  if (param.length() < 2 || param.charAt(0) != 's') {
+  if (param.length() == 0 || param.equalsIgnoreCase("all")) {
+    handleHomeAllGcode();
+    return;
+  }
+  if (param.length() < 2 || (param.charAt(0) != 's' && param.charAt(0) != 'S')) {
     Serial.println("[ERROR] Use 'home s1' or 'home s1 -'.");
     return;
   }
@@ -709,6 +832,11 @@ bool setupAll(bool quietProtocol) {
     return false;
   }
 
+  // Let StealthChop AT#1 (standstill current regulation) settle before StallGuard-dependent motion.
+  // Without this, a HOME right after re-enabling (e.g. after a stall/ESTOP put the drivers to sleep)
+  // started homing on an untuned driver.
+  delay(DRIVER_ENABLE_SETTLE_MS);
+
   if (!quietProtocol) {
     Serial.print("-> Setup done: ");
     Serial.print(readyCount);
@@ -740,18 +868,19 @@ bool setupAxis(Axis& axis) {
   axis.driver->toff(5);
   axis.driver->en_spreadCycle(false);  // StealthChop on (needed for StallGuard)
   axis.driver->pwm_autoscale(true);
+  axis.driver->intpol(true);           // Enable TMC2209 internal 256x microstep interpolation for silent, smooth motion
   axis.driver->TCOOLTHRS(0xFFFFF);     // Enable StallGuard/DIAG at all speeds above ~0
 
   // User-facing defaults
   axis.driver->rms_current(axis.currentMa);
-  axis.driver->microsteps(SETUP_MICROSTEPS);
+  axis.driver->microsteps(axis.microsteps);   // was SETUP_MICROSTEPS: silently undid "s1 m<n>" while stepsPerMm kept the new value
   axis.driver->SGTHRS(axis.moveSensitivity);
 
   axis.ready = true;
   Serial.print("-> "); Serial.print(axis.name);
   Serial.print(" ready (");
   Serial.print(axis.currentMa); Serial.print(" mA, microsteps ");
-  Serial.print(SETUP_MICROSTEPS); Serial.print(", steps/mm ");
+  Serial.print(axis.microsteps); Serial.print(", steps/mm ");
   Serial.print(axis.stepsPerMm, 1); Serial.println(")");
   return true;
 }
@@ -761,6 +890,7 @@ void sleepAll() {
     AccelStepper* s = axes[i].stepper;
     s->setCurrentPosition(s->currentPosition());
     axes[i].ready = false;
+    axes[i].homed = false;   // unpowered axes can be back-driven / may have lost steps
   }
   digitalWrite(PIN_EN, HIGH);
   Serial.println("-> All steppers asleep (disabled). Run 'setup' to wake them.");
@@ -778,13 +908,18 @@ void setCurrent(Axis& axis, int mA) {
 }
 
 void setMicrosteps(Axis& axis, int microsteps) {
-  axis.driver->microsteps(microsteps);
-  if (microsteps > 0) {
-    axis.stepsPerMm = (MOTOR_FULL_STEPS_REV * (float)microsteps) / axis.mmPerRev;
+  bool valid = microsteps >= 1 && microsteps <= 256 && (microsteps & (microsteps - 1)) == 0;
+  if (!valid) {
+    Serial.println("[ERROR] Microsteps must be 1, 2, 4, 8, 16, 32, 64, 128 or 256.");
+    return;
   }
+  axis.microsteps = microsteps;
+  axis.driver->microsteps(microsteps);
+  axis.stepsPerMm = (MOTOR_FULL_STEPS_REV * (float)microsteps) / axis.mmPerRev;
   Serial.print("-> "); Serial.print(axis.name);
   Serial.print(" microstepping: "); Serial.print(microsteps);
-  Serial.print(" (steps/mm: "); Serial.print(axis.stepsPerMm, 1); Serial.println(")");
+  Serial.print(" (steps/mm: "); Serial.print(axis.stepsPerMm, 1);
+  Serial.println("). NOTE: speeds/StallGuard thresholds are in microsteps and were calibrated at 2x.");
 }
 
 void setSensitivity(Axis& axis, int sensitivity) {
@@ -829,8 +964,11 @@ bool moveAxis(Axis& axis, long steps) {
 
   AccelStepper* stepper = axis.stepper;
   stepper->move(steps);
+  resetStallMonitor(axis);
 
+  unsigned long lastWdtYieldMs = millis();
   while (stepper->distanceToGo() != 0) {
+    yieldWdt(lastWdtYieldMs);
     stepper->run();
 
     if (isStalled(axis)) {
@@ -847,29 +985,139 @@ bool moveAxis(Axis& axis, long steps) {
   return true;
 }
 
-bool isStalled(Axis& axis) {
-  if (axis.moveSensitivity <= 0) return false;
-  // StallGuard on TMC2209 requires back-EMF, active once speed is above ~25% max speed
-  bool moving = fabs(axis.stepper->speed()) >= (axis.maxSpeed * 0.25f);
-  return moving && (digitalRead(axis.diagPin) == HIGH);
+void resetStallMonitor(Axis& axis) {
+  axis.cruiseSinceMs = 0;
+  axis.diagFirstHighMs = 0;
 }
 
-bool homeAxis(Axis& axis, bool reverse) {
+// Crash detection during MOVE / manual jogs. The old version (a) was disabled outright because
+// moveSensitivity was 0, and (b) trusted DIAG from 25% of max speed (STALL_CHECK_SPEED_RATIO was declared
+// but never used), where back-EMF is too weak and StallGuard false-trips — the reason it had been disabled.
+bool isStalled(Axis& axis) {
+  if (axis.moveSensitivity <= 0) return false;
+
+  unsigned long nowMs = millis();
+  bool cruising = fabs(axis.stepper->speed()) >= axis.maxSpeed * STALL_CHECK_SPEED_RATIO &&
+                  axis.maxSpeed >= axis.homeSpeed * STALL_MIN_SPEED_RATIO_OF_HOME;
+  if (!cruising) {
+    resetStallMonitor(axis);
+    return false;
+  }
+  if (axis.cruiseSinceMs == 0) {
+    axis.cruiseSinceMs = nowMs | 1UL;   // never store 0 (sentinel)
+    return false;
+  }
+  if (nowMs - axis.cruiseSinceMs < axis.stallSettleMs) return false;
+
+  if (digitalRead(axis.diagPin) != HIGH) return false;
+
+  // Require a second DIAG HIGH sample >= 1 ms after the first one, within STALL_CONFIRM_WINDOW_MS
+  if (axis.diagFirstHighMs == 0 || nowMs - axis.diagFirstHighMs > STALL_CONFIRM_WINDOW_MS) {
+    axis.diagFirstHighMs = nowMs | 1UL;
+    return false;
+  }
+  return (nowMs - axis.diagFirstHighMs) >= 1;
+}
+
+// Polls the host link inside blocking loops. Any input cancels (original behaviour); ESTOP/X/SLEEP also latch
+// an emergency stop so the caller powers the drivers down instead of leaving them energized.
+bool pollCancelInput() {
+  if (Serial.available() <= 0) return false;
+  String in = Serial.readStringUntil('\n');
+  in.trim();
+  in.toUpperCase();
+  if (in == "ESTOP" || in == "X" || in == "SLEEP") estopLatched = true;
+  return true;
+}
+
+// Worst-case time to reach the stop. The fixed 30 s timeout was shorter than a full X stroke at the homing
+// speed (236 mm / 4 mm/s = 59 s), so homing X from the far half of the axis always failed.
+unsigned long homingTimeoutMs(Axis& axis, bool knownDistance) {
+  float travelSteps = knownDistance
+      ? fabs((float)axis.stepper->currentPosition()) + 10.0f * axis.stepsPerMm
+      : (axis.maxTravelMm + axis.homeBackoffMm) * axis.stepsPerMm;
+  unsigned long ms = (unsigned long)(1500.0f * travelSteps / axis.homeSpeed) + HOMING_RAMP_MS + HOMING_BLANKING_MS;
+  unsigned long minMs = knownDistance ? 3000UL : HOMING_TIMEOUT_MS;
+  return ms > minMs ? ms : minMs;
+}
+
+// Single-axis move used for the pre-home pull-away. Does NOT sleep the drivers on a stall.
+MotionResult runAxisTo(Axis& axis, long target) {
+  AccelStepper* s = axis.stepper;
+  s->moveTo(target);
+  resetStallMonitor(axis);
+  unsigned long lastWdtYieldMs = millis();
+  while (s->distanceToGo() != 0) {
+    yieldWdt(lastWdtYieldMs);
+    s->run();
+    if (isStalled(axis)) {
+      s->setCurrentPosition(s->currentPosition());
+      return MOTION_STALLED;
+    }
+    if (pollCancelInput()) {
+      s->setCurrentPosition(s->currentPosition());
+      return MOTION_CANCELLED;
+    }
+  }
+  return MOTION_DONE;
+}
+
+bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
   if (!axis.ready) {
     Serial.print("[ERROR] "); Serial.print(axis.name);
     Serial.println(" not ready. Run 'setup' first.");
     return false;
   }
 
+  AccelStepper* stepper = axis.stepper;
+  bool towardOrigin = (reverse == axis.homeReverse);
+
+  // --- Safe Pre-Homing Pull-Away ---
+  // Only pull away if unhomed, or if homed but sitting right against the bumper (< backoff distance).
+  // If already homed and positioned out on the axis, skip pull-away so it never drives toward the far end!
+  bool needsBackoff = !axis.homed ||
+                      (towardOrigin && stepper->currentPosition() < (long)(axis.homeBackoffMm * axis.stepsPerMm));
+  if (withBackoff && axis.homeBackoffMm > 0.0f && needsBackoff) {
+    long backoffSteps = lroundf(axis.homeBackoffMm * axis.stepsPerMm);
+    long awaySign = reverse ? 1 : -1;     // opposite to the homing direction
+    long cur = stepper->currentPosition();
+    long target = cur + awaySign * backoffSteps;
+
+    Serial.print("-> "); Serial.print(axis.name);
+    Serial.print(" pulling away "); Serial.print(axis.homeBackoffMm, 1);
+    Serial.println(" mm before homing.");
+
+    float savedMax = axis.maxSpeed;
+    axis.maxSpeed = axis.homeSpeed;
+    stepper->setMaxSpeed(axis.maxSpeed);
+    MotionResult r = runAxisTo(axis, target);
+    axis.maxSpeed = savedMax;
+    stepper->setMaxSpeed(savedMax);
+
+    if (r == MOTION_CANCELLED) {
+      if (estopLatched) { sleepAll(); digitalWrite(PIN_RELAY, LOW); }
+      Serial.print("-> "); Serial.print(axis.name); Serial.println(" homing cancelled.");
+      return false;
+    }
+    delay(20);
+  }
+
+  unsigned long timeoutMs = homingTimeoutMs(axis, false);
+  axis.homed = false;
+
   Serial.print("-> Homing "); Serial.print(axis.name);
   Serial.print(reverse ? " backward" : " forward");
   Serial.print(" at "); Serial.print(axis.homeSpeed);
-  Serial.print(" steps/s, sensitivity "); Serial.println(axis.homeSensitivity);
-
-  AccelStepper* stepper = axis.stepper;
+  Serial.print(" steps/s, sensitivity "); Serial.print(axis.homeSensitivity);
+  Serial.print(", timeout "); Serial.print(timeoutMs / 1000.0f, 1); Serial.println(" s");
 
   axis.driver->SGTHRS(axis.homeSensitivity);
   stepper->setMaxSpeed(axis.homeSpeed);
+
+  // Clear any residual stall / load readings from driver registers
+  axis.driver->SG_RESULT();
+
+  // Start gently at 80 steps/s to eliminate inrush torque spike
   float startSpeed = min(80.0f, axis.homeSpeed);
   float dirSign = reverse ? -1.0f : 1.0f;
   stepper->setSpeed(dirSign * startSpeed);
@@ -877,15 +1125,18 @@ bool homeAxis(Axis& axis, bool reverse) {
   enum { RUNNING, HOMED, TIMED_OUT, CANCELLED } outcome = RUNNING;
   unsigned long startMs = millis();
   unsigned long lastRampMs = startMs;
+  unsigned long lastWdtYieldMs = startMs;
+  unsigned long diagFirstHighMs = 0;
 
   while (outcome == RUNNING) {
+    yieldWdt(lastWdtYieldMs);
     stepper->runSpeed();
 
     unsigned long nowMs = millis();
     unsigned long elapsed = nowMs - startMs;
 
-    // Smoothly ramp velocity during HOMING_RAMP_MS so belt axes don't skip steps on startup
-    if (elapsed <= HOMING_RAMP_MS && (nowMs - lastRampMs) >= 10) {
+    // Smooth linear ramp over HOMING_RAMP_MS (250 ms) directly to full homing speed
+    if (elapsed <= HOMING_RAMP_MS && (nowMs - lastRampMs) >= 5) {
       lastRampMs = nowMs;
       float frac = (float)elapsed / (float)HOMING_RAMP_MS;
       float curSpd = startSpeed + frac * (axis.homeSpeed - startSpeed);
@@ -894,12 +1145,24 @@ bool homeAxis(Axis& axis, bool reverse) {
       stepper->setSpeed(dirSign * axis.homeSpeed);
     }
 
-    if (elapsed > HOMING_BLANKING_MS && digitalRead(axis.diagPin) == HIGH) {
-      outcome = HOMED;
-    } else if (elapsed > HOMING_TIMEOUT_MS) {
+    // Check DIAG with debouncing after blanking window (350 ms)
+    if (elapsed > HOMING_BLANKING_MS) {
+      if (digitalRead(axis.diagPin) == HIGH) {
+        if (diagFirstHighMs == 0) {
+          diagFirstHighMs = nowMs | 1UL;
+        } else if ((nowMs - diagFirstHighMs) >= 12) {
+          outcome = HOMED;
+        }
+      } else {
+        if (diagFirstHighMs != 0 && (nowMs - diagFirstHighMs > 25)) {
+          diagFirstHighMs = 0; // noise glitch cleared
+        }
+      }
+    }
+
+    if (elapsed > timeoutMs) {
       outcome = TIMED_OUT;
-    } else if (Serial.available() > 0) {
-      while (Serial.available() > 0) Serial.read();
+    } else if (pollCancelInput()) {
       outcome = CANCELLED;
     }
   }
@@ -911,13 +1174,21 @@ bool homeAxis(Axis& axis, bool reverse) {
   stepper->setMaxSpeed(axis.maxSpeed);
 
   switch (outcome) {
-    case HOMED:
-      stepper->setCurrentPosition(0);
+    case HOMED: {
+      // Homing toward the origin stop defines 0. Homing the other way ("home s1" with homeReverse=true) lands
+      // on the far stop, which is +maxTravel in the MOVE frame — it used to be set to 0 as well, after which
+      // every MOVE drove further into the far stop.
+      long homePos = towardOrigin ? 0 : (long)(dirSign * lroundf(axis.maxTravelMm * axis.stepsPerMm));
+      if (!axis.homeReverse) homePos = -homePos;
+      stepper->setCurrentPosition(homePos);
+      axis.homed = true;
       Serial.print("-> "); Serial.print(axis.name);
       Serial.print(" homed (SG_RESULT="); Serial.print(stallSg);
       Serial.print(", TSTEP="); Serial.print(stallTstep);
-      Serial.println("). Position set to 0.");
+      Serial.print("). Position set to "); Serial.print(homePos);
+      Serial.println(towardOrigin ? "." : " (far end).");
       return true;
+    }
     case TIMED_OUT:
       stepper->setCurrentPosition(stepper->currentPosition());
       Serial.print("[ERROR] "); Serial.print(axis.name);
@@ -925,6 +1196,7 @@ bool homeAxis(Axis& axis, bool reverse) {
       return false;
     default:
       stepper->setCurrentPosition(stepper->currentPosition());
+      if (estopLatched) { sleepAll(); digitalWrite(PIN_RELAY, LOW); }
       Serial.print("-> "); Serial.print(axis.name);
       Serial.println(" homing cancelled.");
       return false;

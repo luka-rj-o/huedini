@@ -157,11 +157,11 @@ def main():
     args = parser.parse_args()
 
     # Direction sanity check based on project spec:
-    # S1 (X): homeReverse = true (-)
-    # S2 (Y): homeReverse = false (+)
-    # S3 (Z): homeReverse = true (-)
-    if args.axis == "s2" and args.dir == "-":
-        print("[NOTE] Default homing direction for S2 (Y) is '+' (forward).")
+    # S1 (X): homeReverse = true (-)  [leftward to X=0]
+    # S2 (Y): homeReverse = true (-)  [backward to Y=0 bumper]
+    # S3 (Z): homeReverse = true (-)  [upward to Z=0 top home]
+    if args.dir == "+":
+        print(f"[NOTE] Automated HOME direction for {args.axis.upper()} is '-' (backward/toward origin).")
 
     sweeper = StallGuardSweeper(port=args.port)
     try:

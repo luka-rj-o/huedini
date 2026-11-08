@@ -4,7 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>HUE-DINI | CAD Skeleton &amp; Gantry Supervisor</title>
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="styles.css?v=4" />
 </head>
 <body>
   <header class="topbar">
@@ -28,14 +28,18 @@
     <!-- Left Column: 2D XY + Z Side-Profile CAD Skeleton Map -->
     <section class="card map-card">
       <div class="card-header">
-        <h2>CAD Skeleton &amp; Reachability Envelope (XY Top View + Z Elevation)</h2>
+        <div class="header-title-group">
+          <h2>CAD Skeleton &amp; Reachability Envelope</h2>
+          <span class="header-desc">XY Top View &bull; Z Elevation Profile</span>
+        </div>
         <div class="pose-readout">
-          <span>STATE: <strong id="stateReadout" class="state-pill">IDLE</strong></span>
-          <span>EE Plate: <strong id="eePlateReadout">(28.0, 6.0, 97.6)</strong> mm</span>
-          <span>Cam Plate: <strong id="camPlateReadout">(27.8, 60.1, 135.3)</strong> mm</span>
-          <span>Drop-Off: <strong>(224.5, 44.5, +12.6)</strong> mm</span>
-          <span>&theta;: <strong id="poseA">0.0</strong>&deg;</span>
-          <span>GRIP: <strong id="poseGrip">CLOSED (NC)</strong></span>
+          <span class="readout-item">STATE: <strong id="stateReadout" class="state-pill">IDLE</strong></span>
+          <span class="readout-item">EE Plate: <strong id="eePlateReadout">(28.0, 6.0, 97.6)</strong> mm</span>
+          <span class="readout-item">Cam Plate: <strong id="camPlateReadout">(27.8, 60.1, 135.3)</strong> mm</span>
+          <span class="readout-item">Drop: <strong>(224.5, 44.5, +12.6)</strong> mm</span>
+          <span class="readout-item">&theta;: <strong id="poseA">0.0</strong>&deg;</span>
+          <span class="readout-item">GRIP: <strong id="poseGrip">CLOSED (NC)</strong></span>
+          <span class="readout-item">MASS: <strong id="poseMass" class="mass-pill">--.- g</strong></span>
         </div>
       </div>
 
@@ -43,32 +47,72 @@
         <canvas id="courseCanvas" width="860" height="580"></canvas>
       </div>
 
-      <!-- Interactive CAD Skeleton Motor Travel Sliders -->
-      <div class="jog-panel">
-        <div class="jog-header">
-          <strong>Interactive CAD Skeleton Jog (Motor Travel from Homed 0,0,0):</strong>
-          <button class="btn btn-secondary btn-sm" onclick="resetJogHome()">Home (0, 0, 0)</button>
+      <!-- Live Motor Telemetry Tracking Bar (replaces manual sliders) -->
+      <div class="motor-telemetry-bar">
+        <div class="motor-telemetry-header">
+          <span class="pulse-indicator"></span>
+          <span class="bar-title">Real-Time Gantry Tracking (Motor Travel from Homed 0,0,0):</span>
+          <span id="trackingStatus" class="tracking-badge">Active Sync</span>
         </div>
-        <div class="jog-sliders">
-          <label>
-            Motor X (0 &ndash; 236 mm): <strong id="jogXVal">0.0</strong> mm
-            <input id="jogX" type="range" min="0" max="236" step="0.5" value="0" />
-          </label>
-          <label>
-            Motor Y (0 &ndash; 128 mm): <strong id="jogYVal">0.0</strong> mm
-            <input id="jogY" type="range" min="0" max="128" step="0.5" value="0" />
-          </label>
-          <label>
-            Motor Z<sub>down</sub> (0 Top &ndash; 76.71 mm Bottom): <strong id="jogZVal">0.00</strong> mm
-            <input id="jogZ" type="range" min="0" max="76.71" step="0.25" value="0" />
-          </label>
+        <div class="motor-coords-grid">
+          <div class="coord-card">
+            <span class="coord-label">Motor X (Left &ndash; Right)</span>
+            <div class="coord-val-wrap">
+              <span class="coord-num" id="motorXReadout">0.0</span>
+              <span class="coord-unit">mm</span>
+            </div>
+            <div class="coord-progress-bg">
+              <div class="coord-progress-fill" id="motorXBar" style="width: 0%"></div>
+            </div>
+            <span class="coord-sub">Range: 0 &ndash; 236 mm</span>
+          </div>
+
+          <div class="coord-card">
+            <span class="coord-label">Motor Y (Back &ndash; Fore)</span>
+            <div class="coord-val-wrap">
+              <span class="coord-num" id="motorYReadout">0.0</span>
+              <span class="coord-unit">mm</span>
+            </div>
+            <div class="coord-progress-bg">
+              <div class="coord-progress-fill" id="motorYBar" style="width: 0%"></div>
+            </div>
+            <span class="coord-sub">Range: 0 &ndash; 128 mm</span>
+          </div>
+
+          <div class="coord-card">
+            <span class="coord-label">Motor Z (Retract &ndash; Descend)</span>
+            <div class="coord-val-wrap">
+              <span class="coord-num" id="motorZReadout">0.00</span>
+              <span class="coord-unit">mm</span>
+            </div>
+            <div class="coord-progress-bg">
+              <div class="coord-progress-fill" id="motorZBar" style="width: 0%"></div>
+            </div>
+            <span class="coord-sub">Range: 0 &ndash; 76.71 mm</span>
+          </div>
+
+          <div class="coord-card mass-coord-card">
+            <div class="coord-header-row">
+              <span class="coord-label">HX711 Load Cell</span>
+              <span id="massClassPill" class="badge badge-dim">STANDBY</span>
+            </div>
+            <div class="coord-val-wrap">
+              <span class="coord-num" id="liveMassReadout">--.--</span>
+              <span class="coord-unit">g</span>
+            </div>
+            <div class="mass-btn-row">
+              <button class="btn btn-xs btn-secondary" onclick="sendTareCmd()" title="Tare (zero) HX711 scale offset">Tare</button>
+              <button class="btn btn-xs btn-primary" onclick="sendWeighCmd()" title="Sample load cell mass reading">Sample</button>
+            </div>
+            <span class="coord-sub" id="massStatusSub">4 Bins: Low, Med, High, Alum</span>
+          </div>
         </div>
       </div>
 
       <div class="calibration-bar">
-        <span>Homed Datum (wrt Plate 0,0,0): <strong>(20.0, -43.5, 127.5) mm</strong></span>
-        <span>EE Homed (wrt Plate): <strong>(28.0, 6.0, 97.6) mm</strong></span>
-        <span>Cam Homed (wrt Plate): <strong>(27.8, 60.1, 135.3) mm</strong></span>
+        <span>Homed Datum: <strong>(20.0, -43.5, 127.5) mm</strong></span>
+        <span>EE Homed: <strong>(28.0, 6.0, 97.6) mm</strong></span>
+        <span>Cam Homed: <strong>(27.8, 60.1, 135.3) mm</strong></span>
         <span>K<sub>x</sub>/K<sub>y</sub>: <strong id="calKx">0.2500</strong> / <strong id="calKy">0.2500</strong> mm/px (<span id="calStatus">Default</span>)</span>
       </div>
     </section>
@@ -80,6 +124,9 @@
         <h2>Supervisor Controls</h2>
         <div class="btn-row">
           <button class="btn btn-primary" onclick="sendCmd('START_SCAN')">&#9654; START SCAN</button>
+          <button class="btn btn-secondary" onclick="sendCmd('HOME_ALL')" title="Execute full 3-axis homing (Z, X, Y) to physical origin">&#8962; HOME GANTRY</button>
+          <button class="btn btn-secondary" onclick="sendTareCmd()" title="Zero HX711 load cell offset">&#9878; Tare Scale</button>
+          <button class="btn btn-secondary" onclick="sendWeighCmd()" title="Sample load cell mass">&#9878; Sample Mass</button>
           <button class="btn btn-warning" onclick="sendCmd('PAUSE')">&#10074;&#10074; PAUSE</button>
           <button class="btn btn-secondary" onclick="sendCmd('RESUME')">&#8635; RESUME</button>
           <button class="btn btn-secondary" onclick="sendCmd('RESET')">RESET</button>
@@ -95,14 +142,95 @@
         </div>
       </section>
 
-      <!-- Stationary OpenCV Frame Preview -->
+      <!-- Manual Hardware Jog & Lead Screw Calibration -->
+      <section class="card jog-controls-card">
+        <div class="card-header">
+          <h2>Manual Hardware Jog</h2>
+          <div class="jog-step-selector">
+            <span class="selector-label">Jog Step:</span>
+            <button class="btn btn-sm btn-secondary jog-step-btn" id="jogStep1" onclick="setJogStep(1.0)">1 mm</button>
+            <button class="btn btn-sm btn-primary jog-step-btn active" id="jogStep10" onclick="setJogStep(10.0)">10 mm</button>
+            <button class="btn btn-sm btn-secondary jog-step-btn" id="jogStep25" onclick="setJogStep(25.0)">25 mm</button>
+          </div>
+        </div>
+
+        <div class="manual-jog-grid">
+          <div class="jog-axis-row">
+            <span class="jog-axis-label">X Axis (Lead Screw)</span>
+            <div class="jog-btn-pair">
+              <button class="btn btn-secondary btn-sm" onclick="jogAxis('X', -1)">&larr; -X (Left)</button>
+              <button class="btn btn-secondary btn-sm" onclick="jogAxis('X', 1)">+X (Right) &rarr;</button>
+            </div>
+          </div>
+          <div class="jog-axis-row">
+            <span class="jog-axis-label">Y Axis (GT2 Belt)</span>
+            <div class="jog-btn-pair">
+              <button class="btn btn-secondary btn-sm" onclick="jogAxis('Y', -1)">&uarr; -Y (Back)</button>
+              <button class="btn btn-secondary btn-sm" onclick="jogAxis('Y', 1)">+Y (Forward) &darr;</button>
+            </div>
+          </div>
+          <div class="jog-axis-row">
+            <span class="jog-axis-label">Z Axis (Lead Screw)</span>
+            <div class="jog-btn-pair">
+              <button class="btn btn-secondary btn-sm" onclick="jogAxis('Z', -1)">&uarr; -Z (Up)</button>
+              <button class="btn btn-secondary btn-sm" onclick="jogAxis('Z', 1)">+Z (Down) &darr;</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Axis Kinematics & Steps/mm Lead Screw Preset Tuning -->
+        <div class="kinematics-calibration-row">
+          <div class="cal-title-wrap">
+            <span class="cal-title">Lead Screw (X &amp; Z) Pitch &amp; Calibration:</span>
+            <span id="currentSpmTag" class="badge badge-accent">X/Z: 50.0 &bull; Y: 10.0 spm</span>
+          </div>
+          <div class="cal-presets">
+            <button class="btn btn-sm btn-secondary preset-btn active" id="presetT8x8" onclick="applyLeadPreset(8.0, 50.0)" title="Standard 4-start T8 screw: 8mm lead = 50 steps/mm (fixes 10mm moving 40mm)">
+              T8&times;8 (8mm Lead: 50 spm)
+            </button>
+            <button class="btn btn-sm btn-secondary preset-btn" id="presetT8x4" onclick="applyLeadPreset(4.0, 100.0)" title="2-start T8 screw: 4mm lead = 100 steps/mm (fixes 10mm moving 20mm)">
+              T8&times;4 (4mm Lead: 100 spm)
+            </button>
+            <button class="btn btn-sm btn-secondary preset-btn" id="presetT8x2" onclick="applyLeadPreset(2.0, 200.0)" title="1-start T8 screw: 2mm lead = 200 steps/mm">
+              T8&times;2 (2mm Lead: 200 spm)
+            </button>
+            <button class="btn btn-sm btn-secondary" onclick="promptCustomSpm()" title="Enter exact calibrated steps/mm">
+              Custom...
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Eye-in-Hand Camera Viewer & Live Stream -->
       <section class="card vision-card">
         <div class="card-header">
-          <h2>Stationary Eye-in-Hand Camera Capture</h2>
-          <span class="hint">Stop-and-Capture OpenCV Frame</span>
+          <div class="vision-title-group">
+            <h2>Eye-in-Hand Camera Viewer</h2>
+            <span class="badge badge-dim">640 &times; 480 px (4:3)</span>
+          </div>
+          <div class="vision-header-controls">
+            <button class="btn btn-warning btn-sm" onclick="sendCmd('FREE_MOTORS')" title="Cut power to steppers to move gantry freely by hand">Free Motors</button>
+            <button class="btn btn-secondary btn-sm" onclick="sendCmd('WAKE_MOTORS')" title="Re-enable and setup steppers">Wake Motors</button>
+            <button id="toggleLiveCvBtn" class="btn btn-secondary btn-sm" onclick="toggleLiveCv()" title="Toggle full live ArUco &amp; HSV block detection vs eco fast stream">CV: Eco (Fast)</button>
+            <button id="toggleLiveBtn" class="btn btn-primary btn-sm" onclick="toggleLiveStream()">Stream: Active</button>
+            <span id="liveCamPill" class="badge badge-connected">&bull; LIVE (~3 FPS)</span>
+          </div>
         </div>
-        <div class="vision-preview-box">
-          <img id="visionPreviewImg" alt="Waiting for stationary camera capture..." />
+
+        <!-- Exact 4:3 Aspect Ratio Container (matches 640x480 frame without letterbox bars) -->
+        <div class="vision-frame-wrapper">
+          <div class="vision-preview-box">
+            <img id="visionPreviewImg" alt="Waiting for 640x480 camera feed..." />
+            <div id="camOverlayEmpty" class="cam-empty-placeholder">
+              <span class="cam-icon">&#128247;</span>
+              <p>Connecting to Pi Camera Stream (640 &times; 480)...</p>
+            </div>
+          </div>
+        </div>
+
+        <div id="liveDetectionHud" class="live-detection-hud">
+          <span class="hud-label">Live Detections:</span>
+          <span id="liveDetectionText" class="hud-value">Searching for fiducials or blocks...</span>
         </div>
       </section>
 
@@ -135,12 +263,15 @@
 
       <!-- System Event Logs -->
       <section class="card log-card">
-        <h2>Orchestrator Telemetry Log</h2>
+        <div class="card-header">
+          <h2>Orchestrator Telemetry Log</h2>
+          <button class="btn btn-sm btn-secondary" onclick="clearLogs()">Clear</button>
+        </div>
         <pre id="logConsole" class="log-console">Waiting for connection to Raspberry Pi Zero W...</pre>
       </section>
     </div>
   </main>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=5"></script>
 </body>
 </html>
