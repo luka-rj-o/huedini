@@ -46,6 +46,9 @@ class GantryStateMachine:
             ky_mm_per_px=config.default_ky_mm_per_px,
             offset_x_mm=config.camera_to_gripper_offset_x_mm,
             offset_y_mm=config.camera_to_gripper_offset_y_mm,
+            cam_origin_x_mm=config.nominal_cam_origin_x_mm,
+            cam_origin_y_mm=config.nominal_cam_origin_y_mm,
+            corner_fiducials=config.corner_fiducials_by_id,
         )
         self.planner = WorldCatalogAndPlanner(
             dedup_radius_mm=config.deduplication_radius_mm,
@@ -135,6 +138,9 @@ class GantryStateMachine:
             },
             "calibration": {
                 "calibrated": self.kinematics.calibrated,
+                "origin_calibrated": self.kinematics.origin_calibrated,
+                "cam_origin_x_mm": round(self.kinematics.cam_origin_x_mm, 2),
+                "cam_origin_y_mm": round(self.kinematics.cam_origin_y_mm, 2),
                 "kx_mm_per_px": round(self.kinematics.kx_mm_per_px, 4),
                 "ky_mm_per_px": round(self.kinematics.ky_mm_per_px, 4),
             },
@@ -443,25 +449,38 @@ class GantryStateMachine:
         frame_b = self.vision.capture_stationary_frame(
             self.serial.pose.x_mm, self.serial.pose.y_mm, self.serial.pose.z_mm
         )
-        fid_b = self.vision.detect_aruco_fiducial(frame_b)
+        fid_b = self.vision.detect_aruco_fiducial(frame_b, target_id=fid_a[0] if fid_a else None)
 
         if fid_a is not None and fid_b is not None:
             try:
+                # fid_a: (marker_id, u_px, v_px, angle_deg)
+                marker_id = fid_a[0]
                 kx, ky = self.kinematics.compute_auto_scale(
-                    fid_a[0], fid_a[1], fid_b[0], fid_b[1], step_x, step_y
+                    fid_a[1], fid_a[2], fid_b[1], fid_b[2], step_x, step_y
                 )
                 self.log_event(
-                    f"Auto-Scale calibrated! Kx={kx:.4f} mm/px, Ky={ky:.4f} mm/px at Z={z_scan:.0f} mm."
+                    f"Auto-Scale calibrated on Marker #{marker_id}! Kx={kx:.4f} mm/px, Ky={ky:.4f} mm/px at Z={z_scan:.0f} mm."
+                )
+                # Calibrate primary coordinate system origin using ground truth fiducial
+                ox, oy = self.kinematics.calibrate_origin(
+                    marker_id=marker_id,
+                    u_px=fid_b[1],
+                    v_px=fid_b[2],
+                    motor_x_mm=fx + step_x,
+                    motor_y_mm=fy + step_y,
+                )
+                self.log_event(
+                    f"Primary Coordinate System Calibrated to Fiducials! Camera origin = ({ox:.1f}, {oy:.1f}) mm wrt plate."
                 )
             except Exception as exc:
                 self.kinematics.calibrated = True
                 self.log_event(
-                    f"Auto-scale calculation failed ({exc}); falling back to default scale Kx={self.kinematics.kx_mm_per_px:.4f} mm/px."
+                    f"Fiducial calibration calculation failed ({exc}); falling back to default scale Kx={self.kinematics.kx_mm_per_px:.4f} mm/px."
                 )
         else:
             self.kinematics.calibrated = True
             self.log_event(
-                f"Fiducial not in view; using default scale Kx={self.kinematics.kx_mm_per_px:.4f} mm/px."
+                f"Fiducial not in view; using default scale Kx={self.kinematics.kx_mm_per_px:.4f} mm/px and nominal CAD origin."
             )
 
         # ==============================================================
@@ -520,13 +539,16 @@ class GantryStateMachine:
         # --- PHASE 5A: Move Camera Above Block & Stop-and-Check Fine Alignment ---
         self.state = "PICKING"
         block.status = "PICKING"
+        cam_mx, cam_my = self.kinematics.plate_to_camera_motor(block.x_mm, block.y_mm)
+        cam_mx = max(0.0, min(self.config.travel_x_mm, cam_mx))
+        cam_my = max(0.0, min(self.config.travel_y_mm, cam_my))
         self.log_event(
             f"Phase 5 [PICKING]: Moving camera above Block #{block.id} ({block.color.upper()}) "
-            f"at ({block.x_mm:.1f}, {block.y_mm:.1f}) mm..."
+            f"at plate ({block.x_mm:.1f}, {block.y_mm:.1f}) mm -> motor ({cam_mx:.1f}, {cam_my:.1f}) mm..."
         )
         self.serial.move_to(
-            x_mm=block.x_mm,
-            y_mm=block.y_mm,
+            x_mm=cam_mx,
+            y_mm=cam_my,
             z_mm=self.config.z_hover_mm,
             angle_deg=0.0,
         )
@@ -541,7 +563,7 @@ class GantryStateMachine:
             # Pick detection closest to image center
             cx, cy = self.config.frame_width / 2.0, self.config.frame_height / 2.0
             best = min(v_dets, key=lambda d: (d.u_px - cx) ** 2 + (d.v_px - cy) ** 2)
-            refined_x, refined_y = self.kinematics.pixel_to_world_mm(
+            refined_plate_x, refined_plate_y = self.kinematics.pixel_to_world_mm(
                 best.u_px,
                 best.v_px,
                 self.serial.pose.x_mm,
@@ -549,18 +571,20 @@ class GantryStateMachine:
                 self.serial.pose.z_mm,
                 self.config.z_scan_mm,
             )
-            err_mm = ((refined_x - block.x_mm) ** 2 + (refined_y - block.y_mm) ** 2) ** 0.5
-            block.x_mm, block.y_mm, block.angle_deg = refined_x, refined_y, best.angle_deg
+            err_mm = ((refined_plate_x - block.x_mm) ** 2 + (refined_plate_y - block.y_mm) ** 2) ** 0.5
+            block.x_mm, block.y_mm, block.angle_deg = refined_plate_x, refined_plate_y, best.angle_deg
             self.log_event(
                 f"Fine alignment check on Block #{block.id}: residual offset {err_mm:.2f} mm, "
                 f"angle {block.angle_deg:.1f} deg."
             )
 
-        # Translate camera coordinate to gripper center target & rotate 9g servo to block angle
-        grip_x, grip_y = self.kinematics.gripper_target_for_block(block.x_mm, block.y_mm)
+        # Translate plate coordinate to gripper center target & rotate 9g servo to block angle
+        grip_mx, grip_my = self.kinematics.plate_to_gripper_motor(block.x_mm, block.y_mm)
+        grip_mx = max(0.0, min(self.config.travel_x_mm, grip_mx))
+        grip_my = max(0.0, min(self.config.travel_y_mm, grip_my))
         self.serial.move_to(
-            x_mm=grip_x,
-            y_mm=grip_y,
+            x_mm=grip_mx,
+            y_mm=grip_my,
             z_mm=self.config.z_hover_mm,
             angle_deg=block.angle_deg,
             feedrate_mm_s=self.config.feedrate_fine_mm_s,
@@ -609,10 +633,10 @@ class GantryStateMachine:
             f"-> class [{block.mass_class.upper()}]."
         )
 
-        # --- PHASE 6: Sort & Stack (Drop-off at X=224.5, Y=44.5, Z=+12.6 mm -> Z_down=64.11 mm) ---
+        # --- PHASE 6: Sort & Stack (Drop-off at X=224.5, Y=44.5, Z=+12.6 mm -> Z_down=57.76 mm) ---
         self.state = "STACKING"
         self._check_pause_or_abort()
-        drop_x, drop_y, drop_z_down, is_rejected = self.planner.get_stack_target(
+        drop_plate_x, drop_plate_y, drop_z_down, is_rejected = self.planner.get_stack_target(
             color=block.color,
             mass_class=block.mass_class,
             stack_zones_mm=self.config.stack_zones_mm,
@@ -623,16 +647,20 @@ class GantryStateMachine:
             if is_rejected
             else f"{block.mass_class.upper()} / {block.color.upper()} STACK"
         )
+        # Convert drop Plate Coordinates to gripper motor coordinates
+        drop_mx, drop_my = self.kinematics.plate_to_gripper_motor(drop_plate_x, drop_plate_y)
+        drop_mx = max(0.0, min(self.config.travel_x_mm, drop_mx))
+        drop_my = max(0.0, min(self.config.travel_y_mm, drop_my))
         self.log_event(
             f"Phase 6 [STACKING]: Routing Block #{block.id} to {zone_label} "
-            f"at ({drop_x:.1f}, {drop_y:.1f}, Z_down={drop_z_down:.1f}) mm..."
+            f"at plate ({drop_plate_x:.1f}, {drop_plate_y:.1f}) -> motor ({drop_mx:.1f}, {drop_my:.1f}, Z_down={drop_z_down:.1f}) mm..."
         )
 
         # Travel at hover height (Z_down = z_hover_mm, closer to 0=top) to target stack coordinate
         travel_z_down = min(self.config.z_hover_mm, max(0.0, drop_z_down - 25.0))
         self.serial.move_to(
-            x_mm=drop_x,
-            y_mm=drop_y,
+            x_mm=drop_mx,
+            y_mm=drop_my,
             z_mm=travel_z_down,
             angle_deg=0.0,
             feedrate_mm_s=self.config.feedrate_travel_mm_s,
@@ -644,8 +672,8 @@ class GantryStateMachine:
         self.serial.set_gripper(closed=True)   # Return NC solenoid to de-energized rest state
         self._current_mass_g = 0.00
 
-        block.x_mm = drop_x
-        block.y_mm = drop_y
+        block.x_mm = drop_plate_x
+        block.y_mm = drop_plate_y
         block.angle_deg = 0.0
         block.status = "REJECTED" if is_rejected else "STACKED"
         self.publish_telemetry()

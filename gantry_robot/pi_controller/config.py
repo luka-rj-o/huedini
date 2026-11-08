@@ -49,11 +49,14 @@ class GantryConfig:
     steps_per_mm_z: float = 50.0
 
     # --- Physical Motor Travel Strokes from Homed (0, 0, 0) (mm) ---
-    # Z=0 is at the TOP when homed; positive Z travel moves DOWNWARD up to 76.71 mm (84 mm mechanical stroke).
+    # Z=0 is at the TOP when homed; positive Z travel moves DOWNWARD up to 70.36 mm.
+    # Note: Course is elevated 1/4" (6.35 mm) above the machine base plate.
+    # Bottom descent is reduced by 6.35 mm (76.71 - 6.35 = 70.36 mm).
+    course_elevation_mm: float = 6.35
     travel_x_mm: float = 236.0
     travel_y_mm: float = 128.0
     travel_z_max_mm: float = 84.0
-    travel_z_bottom_mm: float = 76.71
+    travel_z_bottom_mm: float = 70.36
 
     # --- CAD Homed Datum & Component Positions in Fiducial Plate Coordinates (0, 0, 0) ---
     # 1. Homed datum origin wrt large fiducial plate origin: (20.0, -43.5, 127.5) mm
@@ -73,6 +76,8 @@ class GantryConfig:
     cam_from_datum_x_mm: float = 7.8
     cam_from_datum_y_mm: float = 103.6
     cam_from_datum_z_mm: float = 7.8
+    nominal_cam_origin_x_mm: float = 27.8
+    nominal_cam_origin_y_mm: float = 60.1
     # -> In plate coordinates at motor (0,0,0): Cam = (27.8, 60.1, 135.3) mm -> X[27.8..263.8], Y[60.1..188.1]
 
     # --- Course & Outer Fiducial Border Dimensions (mm) ---
@@ -87,16 +92,17 @@ class GantryConfig:
     course_origin_y_mm: float = 0.0   # Coincident with fiducial back edge Y = 0.0 -> Y in [0.0 .. 152.4]
 
     # --- Motor Z Travel Coordinates (mm down from Z=0 top home) ---
+    # With 1/4" (6.35 mm) floor elevation, pick descent is 70.36 mm down (76.71 - 6.35)
     z_scan_mm: float = 0.0         # Scan at top home height (Z_down = 0.0 mm -> Cam Z = 135.4 mm above plate)
     z_hover_mm: float = 25.0       # Safe travel hover height (Z_down = 25.0 mm)
-    z_pick_mm: float = 76.71       # Full descent to pick block on course floor (Z_plate = 0.0 mm)
+    z_pick_mm: float = 70.36       # Full descent to pick block on elevated course floor (76.71 - 6.35 mm)
 
     # --- Drop-Off Coordinate wrt Fiducial Plate Origin (X=224.5 right, Y=44.5 fore, Z=12.6 up) ---
     dropoff_plate_x_mm: float = 224.5
     dropoff_plate_y_mm: float = 44.5
     dropoff_plate_z_up_mm: float = 12.6
-    # Motor Z_down at drop-off surface = 76.71 - 12.6 = 64.11 mm down from top home
-    z_dropoff_base_down_mm: float = 64.11
+    # Motor Z_down at drop-off surface = 70.36 - 12.6 = 57.76 mm down from top home
+    z_dropoff_base_down_mm: float = 57.76
 
     # --- Block Geometry & 4 Mass Classes (20 x 20 mm cubes) ---
     block_size_mm: float = 20.0
@@ -124,26 +130,37 @@ class GantryConfig:
     default_kx_mm_per_px: float = 0.25
     default_ky_mm_per_px: float = 0.25
 
-    # Camera is vertically aligned with gripper in X (~0.0 mm) and +35.0 mm offset forwards in Y
-    camera_to_gripper_offset_x_mm: float = 0.0
-    camera_to_gripper_offset_y_mm: float = 35.0
+    # Camera is offset from gripper in CAD:
+    # Camera homed = (27.8, 60.1), Gripper homed = (28.0, 6.0)
+    # Gripper relative to Camera: +0.2 mm X, -54.1 mm Y (gripper is behind camera).
+    # To center gripper over block, carriage moves (X - 0.2, Y + 54.1).
+    camera_to_gripper_offset_x_mm: float = 0.2
+    camera_to_gripper_offset_y_mm: float = -54.1
 
     # --- Calibration Fiducials (15 x 15 mm squares at the 4 corners of the 284 x 167.4 mm outer border) ---
-    aruco_marker_id: int = 0
+    aruco_marker_id: int = 1
     fiducial_size_mm: float = 15.0
-    # Calibration Fiducial search point in motor travel coordinates (within X[0..236], Y[0..128])
-    fiducial_base_x_mm: float = 65.0
-    fiducial_base_y_mm: float = 65.0
+    # Calibration Fiducial search point in motor travel coordinates (at X=0.0, Y=100.0, Marker #1 is centered)
+    fiducial_base_x_mm: float = 0.0
+    fiducial_base_y_mm: float = 100.0
     corner_fiducials_mm: List[Tuple[float, float]] = field(
         default_factory=lambda: [
             (7.5, 7.5),       # Bottom-Left corner (center of 15x15 mm marker)
+            (7.5, 159.9),     # Top-Left corner (Marker ID #1 in physical layout)
+            (276.5, 159.9),   # Top-Right corner (Marker ID #2 in physical layout)
             (276.5, 7.5),     # Bottom-Right corner
-            (276.5, 159.9),   # Top-Right corner
-            (7.5, 159.9),     # Top-Left corner
         ]
     )
+    corner_fiducials_by_id: Dict[int, Tuple[float, float]] = field(
+        default_factory=lambda: {
+            0: (7.5, 7.5),       # Marker ID 0: Bottom-Left
+            1: (7.5, 159.9),     # Marker ID 1: Top-Left (detected at motor X=0, Y=100)
+            2: (276.5, 159.9),   # Marker ID 2: Top-Right (detected at motor X=220, Y=100)
+            3: (276.5, 7.5),     # Marker ID 3: Bottom-Right
+        }
+    )
     calibration_step_x_mm: float = 15.0
-    calibration_step_y_mm: float = 15.0
+    calibration_step_y_mm: float = 0.0
 
     # --- Global Scan Grid Coordinates (in motor travel coordinates within reachable envelope) ---
     scan_grid_points_mm: List[Tuple[float, float]] = field(

@@ -110,10 +110,11 @@
       </div>
 
       <div class="calibration-bar">
-        <span>Homed Datum: <strong>(20.0, -43.5, 127.5) mm</strong></span>
-        <span>EE Homed: <strong>(28.0, 6.0, 97.6) mm</strong></span>
-        <span>Cam Homed: <strong>(27.8, 60.1, 135.3) mm</strong></span>
-        <span>K<sub>x</sub>/K<sub>y</sub>: <strong id="calKx">0.2500</strong> / <strong id="calKy">0.2500</strong> mm/px (<span id="calStatus">Default</span>)</span>
+        <span>Course Floor: <strong>+6.35 mm (1/4" Elevated)</strong></span>
+        <span>Cam Homed: <strong id="camHomedOriginReadout">(27.8, 60.1, 135.3) mm</strong></span>
+        <span>EE Homed: <strong id="eeHomedOriginReadout">(28.0, 6.0, 97.6) mm</strong></span>
+        <span>Scale: <strong id="calKx">0.2500</strong> / <strong id="calKy">0.2500</strong> mm/px (<span id="calStatus">Default</span>)</span>
+        <span>Coord System: <span id="calOriginStatus" class="badge badge-dim">CAD Nominal</span></span>
       </div>
     </section>
 
@@ -272,6 +273,6 @@
     </div>
   </main>
 
-  <script src="app.js?v=5"></script>
+  <script src="app.js?v=6"></script>
 </body>
 </html>

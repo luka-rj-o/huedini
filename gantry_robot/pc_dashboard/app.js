@@ -26,22 +26,23 @@ const FIDUCIAL_SIZE = 15.0;
 const BLOCK_SIZE = 20.0;
 
 // 2. Motor Travel Strokes from Homed (0, 0, 0)
+// Course is elevated 1/4" (6.35 mm) off base plate -> STROKE_Z_BOTTOM = 70.36 mm
 const STROKE_X = 236.0;
 const STROKE_Y = 128.0;
 const STROKE_Z_MAX = 84.0;
-const STROKE_Z_BOTTOM = 76.71; // Practical descent from Z=0 (top) to course floor
+const STROKE_Z_BOTTOM = 70.36; // Full descent to elevated course floor (76.71 - 6.35 mm)
 
 // 3. Homed Datum Point in Fiducial Plate Coordinates (0, 0, 0)
 const DATUM_X = 20.0;
 const DATUM_Y = -43.5;
 const DATUM_Z = 127.5;
 
-// 4. Homed End-Effector (top of square EE) in Fiducial Plate Coordinates
+// 4. Nominal Homed End-Effector in Fiducial Plate Coordinates
 const EE_HOMED_X = 28.0;
 const EE_HOMED_Y = 6.0;
 const EE_HOMED_Z = 97.6;
 
-// 5. Homed Camera in Fiducial Plate Coordinates
+// 5. Nominal Homed Camera in Fiducial Plate Coordinates
 const CAM_HOMED_X = 27.8;
 const CAM_HOMED_Y = 60.1;
 const CAM_HOMED_Z = 135.3;
@@ -51,11 +52,12 @@ const DROPOFF_X = 224.5;
 const DROPOFF_Y = 44.5;
 const DROPOFF_Z_UP = 12.6;
 
+// Corner fiducials in Ground-Truth Plate Coordinates
 const CORNER_FIDUCIALS = [
   { id: 0, x: 7.5, y: 7.5 },
-  { id: 1, x: 276.5, y: 7.5 },
+  { id: 1, x: 7.5, y: 159.9 },
   { id: 2, x: 276.5, y: 159.9 },
-  { id: 3, x: 7.5, y: 159.9 },
+  { id: 3, x: 276.5, y: 7.5 },
 ];
 
 const COLOR_HEX = {
@@ -158,20 +160,41 @@ function promptCustomSpm() {
   }
 }
 
+function getCamHomedOrigin() {
+  const cal = latestState.calibration || {};
+  const ox = (cal.cam_origin_x_mm !== undefined && cal.cam_origin_x_mm !== null) ? Number(cal.cam_origin_x_mm) : CAM_HOMED_X;
+  const oy = (cal.cam_origin_y_mm !== undefined && cal.cam_origin_y_mm !== null) ? Number(cal.cam_origin_y_mm) : CAM_HOMED_Y;
+  return {
+    x: ox,
+    y: oy,
+    calibrated: !!cal.origin_calibrated,
+  };
+}
+
 function updateReadoutsFromMotor() {
-  // EE and Cam positions in Fiducial Plate Coordinates
-  const eeX = EE_HOMED_X + motorX;
-  const eeY = EE_HOMED_Y + motorY;
-  const eeZ = EE_HOMED_Z - motorZDown;
-  const camX = CAM_HOMED_X + motorX;
-  const camY = CAM_HOMED_Y + motorY;
+  const camOrigin = getCamHomedOrigin();
+
+  // Camera in Fiducial Plate Coordinates
+  const camX = camOrigin.x + motorX;
+  const camY = camOrigin.y + motorY;
   const camZ = CAM_HOMED_Z - motorZDown;
+
+  // End-Effector in Fiducial Plate Coordinates (offset: +0.2 mm X, -54.1 mm Y from camera)
+  const eeX = camOrigin.x + 0.2 + motorX;
+  const eeY = camOrigin.y - 54.1 + motorY;
+  const eeZ = EE_HOMED_Z - motorZDown;
 
   const eeEl = document.getElementById("eePlateReadout");
   if (eeEl) eeEl.textContent = `(${eeX.toFixed(1)}, ${eeY.toFixed(1)}, ${eeZ.toFixed(1)})`;
 
   const camEl = document.getElementById("camPlateReadout");
   if (camEl) camEl.textContent = `(${camX.toFixed(1)}, ${camY.toFixed(1)}, ${camZ.toFixed(1)})`;
+
+  const camHomedEl = document.getElementById("camHomedOriginReadout");
+  if (camHomedEl) camHomedEl.textContent = `(${camOrigin.x.toFixed(1)}, ${camOrigin.y.toFixed(1)}, ${CAM_HOMED_Z.toFixed(1)}) mm`;
+
+  const eeHomedEl = document.getElementById("eeHomedOriginReadout");
+  if (eeHomedEl) eeHomedEl.textContent = `(${(camOrigin.x + 0.2).toFixed(1)}, ${(camOrigin.y - 54.1).toFixed(1)}, ${EE_HOMED_Z.toFixed(1)}) mm`;
 
   // Live Motor Telemetry Readouts
   const mxEl = document.getElementById("motorXReadout");
@@ -383,6 +406,17 @@ function updateUI(data) {
   const calStatusEl = document.getElementById("calStatus");
   if (calStatusEl) calStatusEl.textContent = cal.calibrated ? "CALIBRATED" : "Default";
 
+  const calOriginStatusEl = document.getElementById("calOriginStatus");
+  if (calOriginStatusEl) {
+    if (cal.origin_calibrated) {
+      calOriginStatusEl.textContent = "Fiducial Calibrated";
+      calOriginStatusEl.className = "badge badge-connected";
+    } else {
+      calOriginStatusEl.textContent = "CAD Nominal";
+      calOriginStatusEl.className = "badge badge-dim";
+    }
+  }
+
   const calKxEl = document.getElementById("calKx");
   if (calKxEl) calKxEl.textContent = (cal.kx_mm_per_px ?? 0.25).toFixed(4);
 
@@ -576,9 +610,12 @@ function renderCourseCanvas() {
     ctx.fillRect(fid.cx - fpx * 0.12, fid.cy - fpx * 0.12, fpx * 0.24, fpx * 0.24);
   }
 
-  // 5. End-Effector Reachable Travel Envelope (236 x 128 mm from (28.0, 6.0))
-  const eeBoxTL = mmToCanvas(EE_HOMED_X, EE_HOMED_Y + STROKE_Y);
-  const eeBoxBR = mmToCanvas(EE_HOMED_X + STROKE_X, EE_HOMED_Y);
+  // 5. End-Effector Reachable Travel Envelope
+  const camOrigin = getCamHomedOrigin();
+  const curEeHomedX = camOrigin.x + 0.2;
+  const curEeHomedY = camOrigin.y - 54.1;
+  const eeBoxTL = mmToCanvas(curEeHomedX, curEeHomedY + STROKE_Y);
+  const eeBoxBR = mmToCanvas(curEeHomedX + STROKE_X, curEeHomedY);
   ctx.fillStyle = "rgba(22, 163, 74, 0.04)";
   ctx.fillRect(eeBoxTL.cx, eeBoxTL.cy, eeBoxBR.cx - eeBoxTL.cx, eeBoxBR.cy - eeBoxTL.cy);
   ctx.strokeStyle = "#16a34a";
@@ -589,14 +626,16 @@ function renderCourseCanvas() {
   ctx.fillStyle = "#15803d";
   ctx.font = "600 9.5px monospace";
   ctx.fillText(
-    `EE Reach Envelope: X[${EE_HOMED_X.toFixed(1)}..${(EE_HOMED_X + STROKE_X).toFixed(1)}] Y[${EE_HOMED_Y.toFixed(1)}..${(EE_HOMED_Y + STROKE_Y).toFixed(1)}]`,
+    `EE Reach Envelope: X[${curEeHomedX.toFixed(1)}..${(curEeHomedX + STROKE_X).toFixed(1)}] Y[${curEeHomedY.toFixed(1)}..${(curEeHomedY + STROKE_Y).toFixed(1)}]`,
     eeBoxTL.cx + 6,
     eeBoxBR.cy - 6
   );
 
-  // 6. Camera Reachable Travel Envelope (236 x 128 mm from (27.8, 60.1))
-  const camBoxTL = mmToCanvas(CAM_HOMED_X, CAM_HOMED_Y + STROKE_Y);
-  const camBoxBR = mmToCanvas(CAM_HOMED_X + STROKE_X, CAM_HOMED_Y);
+  // 6. Camera Reachable Travel Envelope
+  const curCamHomedX = camOrigin.x;
+  const curCamHomedY = camOrigin.y;
+  const camBoxTL = mmToCanvas(curCamHomedX, curCamHomedY + STROKE_Y);
+  const camBoxBR = mmToCanvas(curCamHomedX + STROKE_X, curCamHomedY);
   ctx.fillStyle = "rgba(2, 132, 199, 0.03)";
   ctx.fillRect(camBoxTL.cx, camBoxTL.cy, camBoxBR.cx - camBoxTL.cx, camBoxBR.cy - camBoxTL.cy);
   ctx.strokeStyle = "#0284c7";
@@ -606,7 +645,7 @@ function renderCourseCanvas() {
   ctx.setLineDash([]);
   ctx.fillStyle = "#0369a1";
   ctx.fillText(
-    `Cam Reach Envelope: X[${CAM_HOMED_X.toFixed(1)}..${(CAM_HOMED_X + STROKE_X).toFixed(1)}] Y[${CAM_HOMED_Y.toFixed(1)}..${(CAM_HOMED_Y + STROKE_Y).toFixed(1)}]`,
+    `Cam Reach Envelope: X[${curCamHomedX.toFixed(1)}..${(curCamHomedX + STROKE_X).toFixed(1)}] Y[${curCamHomedY.toFixed(1)}..${(curCamHomedY + STROKE_Y).toFixed(1)}]`,
     camBoxTL.cx + 6,
     camBoxTL.cy - 5
   );
@@ -671,8 +710,8 @@ function renderCourseCanvas() {
 
   // 10. CURRENT CAD SKELETON LINK (The Star Focus of the GUI!)
   // Links: Carriage Datum -> Square End-Effector -> Camera
-  const eePt = mmToCanvas(EE_HOMED_X + motorX, EE_HOMED_Y + motorY);
-  const camPt = mmToCanvas(CAM_HOMED_X + motorX, CAM_HOMED_Y + motorY);
+  const eePt = mmToCanvas(curEeHomedX + motorX, curEeHomedY + motorY);
+  const camPt = mmToCanvas(curCamHomedX + motorX, curCamHomedY + motorY);
 
   // Rigid gantry bridge linkage (gold/amber with dark edge)
   ctx.strokeStyle = "#d97706";

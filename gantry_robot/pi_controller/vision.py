@@ -385,14 +385,13 @@ class VisionPipeline:
 
     def detect_aruco_fiducial(
         self, frame: np.ndarray, target_id: Optional[int] = None
-    ) -> Optional[Tuple[float, float, float]]:
+    ) -> Optional[Tuple[int, float, float, float]]:
         """
-        Detects the calibration ArUco marker (DICT_4X4_50) and returns
-        (center_u_px, center_v_px, angle_deg).
+        Detects an ArUco calibration marker (DICT_4X4_50).
+        If target_id is specified, looks for that specific marker ID.
+        If target_id is None, detects any corner fiducial from config (defaulting to
+        the marker closest to image center) and returns (marker_id, center_u_px, center_v_px, angle_deg).
         """
-        if target_id is None:
-            target_id = self.config.aruco_marker_id
-
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if hasattr(cv2.aruco, "ArucoDetector"):
             detector = cv2.aruco.ArucoDetector(self._aruco_dict, self._aruco_params)
@@ -405,17 +404,27 @@ class VisionPipeline:
         annotated = frame.copy()
         if ids is not None and len(ids) > 0:
             cv2.aruco.drawDetectedMarkers(annotated, corners, ids)
+            cx, cy = self.config.frame_width / 2.0, self.config.frame_height / 2.0
+            candidates = []
             for marker_corners, marker_id in zip(corners, ids.flatten()):
-                if int(marker_id) == int(target_id):
-                    pts = marker_corners[0]  # shape (4, 2)
-                    u_px = float(np.mean(pts[:, 0]))
-                    v_px = float(np.mean(pts[:, 1]))
-                    dx = float(pts[1, 0] - pts[0, 0])
-                    dy = float(pts[1, 1] - pts[0, 1])
-                    angle_deg = math.degrees(math.atan2(dy, dx))
-                    cv2.circle(annotated, (int(u_px), int(v_px)), 6, (0, 255, 0), -1)
-                    self._encode_annotated_preview(annotated, f"ArUco ID {target_id}: ({u_px:.1f}, {v_px:.1f})")
-                    return u_px, v_px, angle_deg
+                m_id = int(marker_id)
+                if target_id is not None and m_id != int(target_id):
+                    continue
+                pts = marker_corners[0]  # shape (4, 2)
+                u_px = float(np.mean(pts[:, 0]))
+                v_px = float(np.mean(pts[:, 1]))
+                dx = float(pts[1, 0] - pts[0, 0])
+                dy = float(pts[1, 1] - pts[0, 1])
+                angle_deg = math.degrees(math.atan2(dy, dx))
+                dist_center = (u_px - cx) ** 2 + (v_px - cy) ** 2
+                candidates.append((dist_center, m_id, u_px, v_px, angle_deg))
+
+            if candidates:
+                candidates.sort(key=lambda c: c[0])
+                _, best_id, u_px, v_px, angle_deg = candidates[0]
+                cv2.circle(annotated, (int(u_px), int(v_px)), 6, (0, 255, 0), -1)
+                self._encode_annotated_preview(annotated, f"ArUco ID {best_id}: ({u_px:.1f}, {v_px:.1f})")
+                return best_id, u_px, v_px, angle_deg
 
         self._encode_annotated_preview(annotated, "ArUco search: no marker in view")
         return None

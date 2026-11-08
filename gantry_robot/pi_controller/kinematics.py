@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 import math
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -34,7 +34,7 @@ class BlockRecord:
 class EyeInHandKinematics:
     """
     Handles conversions between:
-      - Motor travel coordinates (motor_x in [0..211], motor_y in [0..126], motor_z_down in [0..76.71])
+      - Motor travel coordinates (motor_x in [0..236], motor_y in [0..128], motor_z_down in [0..70.36])
       - Fiducial Plate coordinates (plate_x in [0..284], plate_y in [0..167.4], plate_z above bed)
       - Camera pixel coordinates (u_px, v_px)
     """
@@ -45,9 +45,12 @@ class EyeInHandKinematics:
         frame_height: int = 480,
         kx_mm_per_px: float = 0.25,
         ky_mm_per_px: float = 0.25,
-        offset_x_mm: float = 0.0,
-        offset_y_mm: float = 35.0,
+        offset_x_mm: float = 0.2,
+        offset_y_mm: float = -54.1,
         cam_homed_z_above_plate_mm: float = 135.4,
+        cam_origin_x_mm: float = 27.8,
+        cam_origin_y_mm: float = 60.1,
+        corner_fiducials: Optional[Dict[int, Tuple[float, float]]] = None,
     ):
         self.frame_width = frame_width
         self.frame_height = frame_height
@@ -58,7 +61,16 @@ class EyeInHandKinematics:
         self.offset_x_mm = offset_x_mm
         self.offset_y_mm = offset_y_mm
         self.cam_homed_z_above_plate_mm = cam_homed_z_above_plate_mm
+        self.cam_origin_x_mm = cam_origin_x_mm
+        self.cam_origin_y_mm = cam_origin_y_mm
+        self.corner_fiducials = corner_fiducials or {
+            0: (7.5, 7.5),
+            1: (7.5, 159.9),
+            2: (276.5, 159.9),
+            3: (276.5, 7.5),
+        }
         self.calibrated = False
+        self.origin_calibrated = False
 
     def _height_ratio(self, z_down_mm: float, z_scan_down_mm: float = 0.0) -> float:
         """
@@ -80,59 +92,123 @@ class EyeInHandKinematics:
     ) -> Tuple[float, float]:
         du = abs(u2_px - u1_px)
         dv = abs(v2_px - v1_px)
-        if du < 5.0 or dv < 5.0:
+        if du < 5.0 and dv < 5.0:
             raise ValueError(
                 f"Fiducial pixel shift too small for calibration (du={du:.1f}, dv={dv:.1f})."
             )
-        self.kx_mm_per_px = abs(delta_x_mm) / du
-        self.ky_mm_per_px = abs(delta_y_mm) / dv
+        if du >= 5.0 and abs(delta_x_mm) > 0.0:
+            self.kx_mm_per_px = abs(delta_x_mm) / du
+        if dv >= 5.0 and abs(delta_y_mm) > 0.0:
+            self.ky_mm_per_px = abs(delta_y_mm) / dv
+        elif du >= 5.0 and abs(delta_x_mm) > 0.0:
+            self.ky_mm_per_px = self.kx_mm_per_px
         self.calibrated = True
         return self.kx_mm_per_px, self.ky_mm_per_px
+
+    def calibrate_origin(
+        self,
+        marker_id: int,
+        u_px: float,
+        v_px: float,
+        motor_x_mm: float,
+        motor_y_mm: float,
+    ) -> Tuple[float, float]:
+        """
+        Calibrates the true camera plate origin using the detected fiducial marker.
+        Marker position in Plate Coordinates = (fx, fy).
+        Camera optical center in Plate Coordinates = (X_cam_origin + motor_x, Y_cam_origin + motor_y).
+        Marker relative to camera:
+          dx = -(u_px - cx_px) * kx
+          dy = -(v_px - cy_px) * ky
+        Therefore:
+          fx = X_cam_origin + motor_x + dx  =>  X_cam_origin = fx - (motor_x + dx)
+          fy = Y_cam_origin + motor_y + dy  =>  Y_cam_origin = fy - (motor_y + dy)
+        """
+        if marker_id not in self.corner_fiducials:
+            raise ValueError(f"Unknown ArUco marker ID {marker_id} for origin calibration.")
+
+        fx, fy = self.corner_fiducials[marker_id]
+        dx_mm = -(u_px - self.cx_px) * self.kx_mm_per_px
+        dy_mm = -(v_px - self.cy_px) * self.ky_mm_per_px
+
+        self.cam_origin_x_mm = round(fx - (motor_x_mm + dx_mm), 2)
+        self.cam_origin_y_mm = round(fy - (motor_y_mm + dy_mm), 2)
+        self.origin_calibrated = True
+        return self.cam_origin_x_mm, self.cam_origin_y_mm
 
     def pixel_to_world_mm(
         self,
         u_px: float,
         v_px: float,
-        camera_x_mm: float,
-        camera_y_mm: float,
+        motor_x_mm: float,
+        motor_y_mm: float,
         z_current_mm: float = 0.0,
         z_scan_mm: float = 0.0,
     ) -> Tuple[float, float]:
+        """
+        Converts pixel coordinates (u, v) captured at motor position (motor_x, motor_y)
+        into true Plate Coordinates (mm wrt fiducial plate origin 0,0).
+        """
         height_ratio = self._height_ratio(z_current_mm, z_scan_mm)
         kx = self.kx_mm_per_px * height_ratio
         ky = self.ky_mm_per_px * height_ratio
 
-        dx_mm = (u_px - self.cx_px) * kx
+        # Inverted image X axis: u > cx is to the physical -X direction
+        dx_mm = -(u_px - self.cx_px) * kx
         dy_mm = -(v_px - self.cy_px) * ky
-        return camera_x_mm + dx_mm, camera_y_mm + dy_mm
+
+        plate_x = self.cam_origin_x_mm + motor_x_mm + dx_mm
+        plate_y = self.cam_origin_y_mm + motor_y_mm + dy_mm
+        return plate_x, plate_y
 
     def world_to_pixel(
         self,
-        world_x_mm: float,
-        world_y_mm: float,
-        camera_x_mm: float,
-        camera_y_mm: float,
+        plate_x_mm: float,
+        plate_y_mm: float,
+        motor_x_mm: float,
+        motor_y_mm: float,
         z_current_mm: float = 0.0,
         z_scan_mm: float = 0.0,
     ) -> Tuple[float, float]:
+        """
+        Projects Plate Coordinates (mm) back to pixel coordinates (u, v)
+        for a given motor carriage position.
+        """
         height_ratio = self._height_ratio(z_current_mm, z_scan_mm)
         kx = self.kx_mm_per_px * height_ratio
         ky = self.ky_mm_per_px * height_ratio
 
-        u_px = self.cx_px + (world_x_mm - camera_x_mm) / kx
-        v_px = self.cy_px - (world_y_mm - camera_y_mm) / ky
+        cam_x = self.cam_origin_x_mm + motor_x_mm
+        cam_y = self.cam_origin_y_mm + motor_y_mm
+
+        dx_mm = plate_x_mm - cam_x
+        dy_mm = plate_y_mm - cam_y
+
+        u_px = self.cx_px - dx_mm / kx
+        v_px = self.cy_px - dy_mm / ky
         return u_px, v_px
 
-    def gripper_target_for_block(self, block_x_mm: float, block_y_mm: float) -> Tuple[float, float]:
+    def plate_to_camera_motor(self, plate_x_mm: float, plate_y_mm: float) -> Tuple[float, float]:
+        """Calculates motor coordinates to position camera optical center directly over a plate location."""
+        return (
+            plate_x_mm - self.cam_origin_x_mm,
+            plate_y_mm - self.cam_origin_y_mm,
+        )
+
+    def plate_to_gripper_motor(self, plate_x_mm: float, plate_y_mm: float) -> Tuple[float, float]:
         """
-        Translates camera-aligned motor coordinates to gripper-aligned motor coordinates.
-        Since the camera is offset forwards (+Y) from the gripper, moving the gripper to the block
-        requires advancing the carriage forward (+offset_y).
+        Calculates motor coordinates to position gripper jaws directly over a plate location.
+        Since gripper is offset from camera by (offset_x_mm, offset_y_mm),
+        motor = plate - cam_origin - offset.
         """
         return (
-            block_x_mm + self.offset_x_mm,
-            block_y_mm + self.offset_y_mm,
+            plate_x_mm - self.cam_origin_x_mm - self.offset_x_mm,
+            plate_y_mm - self.cam_origin_y_mm - self.offset_y_mm,
         )
+
+    def gripper_target_for_block(self, block_plate_x: float, block_plate_y: float) -> Tuple[float, float]:
+        """Convenience alias for plate_to_gripper_motor."""
+        return self.plate_to_gripper_motor(block_plate_x, block_plate_y)
 
 
 class WorldCatalogAndPlanner:
