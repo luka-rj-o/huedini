@@ -164,12 +164,15 @@ class GantryConfig:
     calibration_step_y_mm: float = 0.0
 
     # --- Global Scan Grid Coordinates (in motor travel coordinates within reachable envelope) ---
+    # Optimized to cover full envelope X in [0, 236], Y in [0, 128] with zero blind spots:
+    # FOV width is 162.5 mm; X=30 covers [-51..111] mm, X=165 covers [84..246] mm.
+    # FOV height is 122 mm; Y=40 covers [-21..101] mm, Y=95 covers [34..156] mm.
     scan_grid_points_mm: List[Tuple[float, float]] = field(
         default_factory=lambda: [
-            (90.0, 45.0),
-            (180.0, 45.0),
-            (180.0, 95.0),
-            (90.0, 95.0),
+            (30.0, 40.0),
+            (165.0, 40.0),
+            (165.0, 95.0),
+            (30.0, 95.0),
         ]
     )
 

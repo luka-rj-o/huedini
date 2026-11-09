@@ -459,6 +459,24 @@ class VisionPipeline:
             annotated, (w // 2, h // 2), (255, 255, 255), cv2.MARKER_CROSS, 20, 1
         )
 
+        # Detect ArUco fiducials to mask them out and prevent fiducial paper borders from being detected as blocks
+        gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+        if hasattr(cv2.aruco, "ArucoDetector"):
+            detector = cv2.aruco.ArucoDetector(self._aruco_dict, self._aruco_params)
+            aruco_corners, aruco_ids, _ = detector.detectMarkers(gray)
+        else:
+            aruco_corners, aruco_ids, _ = cv2.aruco.detectMarkers(
+                gray, self._aruco_dict, parameters=self._aruco_params
+            )
+
+        aruco_exclusion_mask = np.zeros((h, w), dtype=np.uint8)
+        if aruco_ids is not None and len(aruco_ids) > 0:
+            for c in aruco_corners:
+                pts = c[0]
+                center = pts.mean(axis=0)
+                expanded = center + 1.5 * (pts - center)
+                cv2.fillPoly(aruco_exclusion_mask, [np.int32(expanded)], 255)
+
         for color_name, hsv_cfg in self.config.hsv_ranges.items():
             mask = cv2.inRange(
                 hsv,
@@ -478,6 +496,10 @@ class VisionPipeline:
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
             mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open)
 
+            # Exclude regions occupied by ArUco fiducials
+            if aruco_ids is not None and len(aruco_ids) > 0:
+                mask = cv2.bitwise_and(mask, cv2.bitwise_not(aruco_exclusion_mask))
+
             contours, _ = cv2.findContours(
                 mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
             )
@@ -495,11 +517,11 @@ class VisionPipeline:
                 rect = cv2.minAreaRect(cnt)
                 (u_px, v_px), (rw, rh), angle = rect
                 aspect = max(rw, rh) / max(1e-3, min(rw, rh))
-                if aspect > 1.30:
+                if aspect > 1.65:
                     continue
 
                 solidity = area / max(1e-3, (rw * rh))
-                if solidity < 0.72:
+                if solidity < 0.60:
                     continue
 
                 if rw < rh:
