@@ -566,7 +566,7 @@ class GantryStateMachine:
                     "color": det.color,
                     "u_px": round(det.u_px, 1),
                     "v_px": round(det.v_px, 1),
-                    "area_px": round(det.contour_area_px, 1),
+                    "area_px": round(det.area_px, 1),
                     "raw_angle_deg": round(det.angle_deg, 1),
                     "comp_angle_deg": comp_angle,
                     "world_x_mm": round(wx, 2),
@@ -672,7 +672,7 @@ class GantryStateMachine:
                 pick_record.fine_align_found = True
                 pick_record.fine_u_px = round(best.u_px, 1)
                 pick_record.fine_v_px = round(best.v_px, 1)
-                pick_record.fine_contour_area_px = round(best.contour_area_px, 1)
+                pick_record.fine_contour_area_px = round(best.area_px, 1)
                 pick_record.fine_residual_err_mm = round(err_mm, 2)
                 pick_record.refined_plate_x = round(refined_plate_x, 2)
                 pick_record.refined_plate_y = round(refined_plate_y, 2)
@@ -681,7 +681,7 @@ class GantryStateMachine:
                 block.x_mm, block.y_mm, block.angle_deg = refined_plate_x, refined_plate_y, refined_angle
                 self.log_event(
                     f"Fine alignment check on Block #{block.id}: residual offset {err_mm:.2f} mm "
-                    f"(area {best.contour_area_px:.0f} px), angle {block.angle_deg:.1f} deg."
+                    f"(area {best.area_px:.0f} px), angle {block.angle_deg:.1f} deg."
                 )
             else:
                 pick_record.fine_align_checked = True

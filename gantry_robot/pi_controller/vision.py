@@ -33,6 +33,11 @@ class DetectedBlock:
     area_px: float
     box_pts: np.ndarray
 
+    @property
+    def contour_area_px(self) -> float:
+        """Alias for area_px to preserve backwards compatibility."""
+        return self.area_px
+
     def to_dict(self) -> dict:
         return {
             "color": self.color,
