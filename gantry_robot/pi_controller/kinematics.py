@@ -126,8 +126,8 @@ class EyeInHandKinematics:
 
         if fid_angle_deg is not None:
             # Marker #1 top-edge in image points along world +X (nominal 180.0 deg)
-            r = math.radians(fid_angle_deg)
-            self.cam_skew_deg = round(math.degrees(math.atan2(math.sin(r), -math.cos(r))), 2)
+            skew = ((fid_angle_deg - 180.0 + 180.0) % 360.0) - 180.0
+            self.cam_skew_deg = round(skew, 2)
 
         fx, fy = self.corner_fiducials[marker_id]
 
@@ -232,9 +232,7 @@ class EyeInHandKinematics:
         Compensates raw vision detection angle for physical camera housing skew,
         mapping to physical plate coordinate orientation (0-180 deg).
         """
-        r = math.radians(raw_angle_deg)
-        local_deg = math.degrees(math.atan2(math.sin(r), -math.cos(r)))
-        return round((local_deg - self.cam_skew_deg) % 180.0, 1)
+        return round((raw_angle_deg - self.cam_skew_deg) % 180.0, 1)
 
     def plate_to_camera_motor(self, plate_x_mm: float, plate_y_mm: float) -> Tuple[float, float]:
         """Calculates motor coordinates to position camera optical center directly over a plate location."""

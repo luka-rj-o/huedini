@@ -666,6 +666,17 @@ class GantryStateMachine:
                     self.config.z_scan_mm,
                 )
                 refined_angle = self.kinematics.compensate_block_angle(best.angle_deg)
+                # For square blocks (90 deg rotational symmetry), keep refined angle within +/-45 deg of coarse angle
+                # to prevent 1-px minAreaRect aspect swaps from flipping the servo by 90 degrees
+                angle_diff = (refined_angle - block.angle_deg + 180.0) % 180.0
+                if angle_diff > 90.0:
+                    angle_diff -= 180.0
+                if abs(angle_diff) > 45.0:
+                    if angle_diff > 0:
+                        refined_angle = round((refined_angle - 90.0) % 180.0, 1)
+                    else:
+                        refined_angle = round((refined_angle + 90.0) % 180.0, 1)
+
                 err_mm = ((refined_plate_x - block.x_mm) ** 2 + (refined_plate_y - block.y_mm) ** 2) ** 0.5
 
                 pick_record.fine_align_checked = True
