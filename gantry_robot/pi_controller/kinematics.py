@@ -126,14 +126,16 @@ class EyeInHandKinematics:
 
         if fid_angle_deg is not None:
             # Marker #1 top-edge in image points along world +X (nominal 180.0 deg)
-            skew = (fid_angle_deg - 180.0 + 180.0) % 360.0 - 180.0
-            self.cam_skew_deg = round(skew, 2)
+            r = math.radians(fid_angle_deg)
+            self.cam_skew_deg = round(math.degrees(math.atan2(math.sin(r), -math.cos(r))), 2)
 
         fx, fy = self.corner_fiducials[marker_id]
 
         # Rotate camera sensor displacement by camera skew angle
+        # Inverted image X axis: u > cx is to physical -X direction
+        # Image Y axis: v > cy is to physical +Y (forward) direction
         u_prime = -(u_px - self.cx_px) * self.kx_mm_per_px
-        v_prime = -(v_px - self.cy_px) * self.ky_mm_per_px
+        v_prime = (v_px - self.cy_px) * self.ky_mm_per_px
 
         if abs(self.cam_skew_deg) > 1e-4:
             rad = math.radians(self.cam_skew_deg)
@@ -169,8 +171,9 @@ class EyeInHandKinematics:
         ky = self.ky_mm_per_px * height_ratio
 
         # Inverted image X axis: u > cx is to physical -X direction
+        # Image Y axis: v > cy is to physical +Y (forward) direction
         u_prime = -(u_px - self.cx_px) * kx
-        v_prime = -(v_px - self.cy_px) * ky
+        v_prime = (v_px - self.cy_px) * ky
 
         # 2D rotation matrix: rotates camera sensor frame into world plate frame
         if abs(self.cam_skew_deg) > 1e-4:
@@ -221,7 +224,7 @@ class EyeInHandKinematics:
             v_prime = dy_mm
 
         u_px = self.cx_px - u_prime / kx
-        v_px = self.cy_px - v_prime / ky
+        v_px = self.cy_px + v_prime / ky
         return u_px, v_px
 
     def compensate_block_angle(self, raw_angle_deg: float) -> float:
@@ -229,7 +232,9 @@ class EyeInHandKinematics:
         Compensates raw vision detection angle for physical camera housing skew,
         mapping to physical plate coordinate orientation (0-180 deg).
         """
-        return round((raw_angle_deg - self.cam_skew_deg) % 180.0, 1)
+        r = math.radians(raw_angle_deg)
+        local_deg = math.degrees(math.atan2(math.sin(r), -math.cos(r)))
+        return round((local_deg - self.cam_skew_deg) % 180.0, 1)
 
     def plate_to_camera_motor(self, plate_x_mm: float, plate_y_mm: float) -> Tuple[float, float]:
         """Calculates motor coordinates to position camera optical center directly over a plate location."""
