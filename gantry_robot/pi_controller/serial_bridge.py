@@ -385,30 +385,16 @@ class ESP32SerialBridge:
         except Exception as exc:
             logger.warning("ensure_awake failed: %s", exc)
 
-    def _apply_calibrated_axis_profiles(self) -> None:
-        """Restores identical steps/mm, speeds, accelerations, and StallGuard thresholds across cold boots and re-homes."""
-        self.send_command(
-            f"STEPS X{self.config.steps_per_mm_x:.2f} "
-            f"Y{self.config.steps_per_mm_y:.2f} "
-            f"Z{self.config.steps_per_mm_z:.2f}"
-        )
-        for cmd in (
-            "s1 v1000", "s1 a2000", "s1 hv800", "s1 hs60", "s1 s60",
-            "s2 v700", "s2 a1000", "s2 hv700", "s2 hs3", "s2 s3",
-            "s3 v1000", "s3 a2000", "s3 hv800", "s3 hs60", "s3 s60",
-        ):
-            self.send_command(cmd, timeout_s=5.0)
-
     def home_all(self, timeout_s: float = 120.0) -> None:
-        """Commands ESP32 to home Z, X, and Y axes using identical TMC2209 StallGuard4 profiles on every run."""
-        # If currently homed and near the Y=0 or Y=max stop, stage into safe mid-travel runway first
-        # so the firmware pull-away never starts against the bumper or overflows the front stop.
+        """Commands ESP32 to home Z, X, and Y axes using identical firmware TMC2209 StallGuard4 profiles on every run."""
+        # If currently homed near the far end stops, stage back to safe mid-travel first so firmware
+        # pull-away never drives X or Y into the far mechanical stop.
         if self._homed_known and not self.mock_hardware:
             if self.pose.z_mm > 5.0:
                 self.move_to(z_mm=0.0)
-            y_hi = max(35.0, self.config.travel_y_mm - 25.0)
+            y_hi = max(35.0, self.config.travel_y_mm - 35.0)
             x_hi = max(20.0, self.config.travel_x_mm - 15.0)
-            need_y = self.pose.y_mm < 25.0 or self.pose.y_mm > y_hi
+            need_y = self.pose.y_mm > y_hi
             need_x = self.pose.x_mm > x_hi
             if need_y or need_x:
                 self.move_to(
@@ -417,13 +403,15 @@ class ESP32SerialBridge:
                     feedrate_mm_s=self.config.feedrate_travel_mm_s,
                 )
 
-        # Cycle SLEEP -> SETUP before every HOME so firmware clears axis.homed and re-calibrates StealthChop AT#1
+        # Re-run SETUP + STEPS before HOME so firmware pulses PIN_EN, resets speed/accel defaults, and applies
+        # identical StallGuard thresholds without overriding the user-tuned firmware sensitivity settings.
         self._homed_known = False
-        self.send_command("SLEEP", timeout_s=5.0)
-        if not self.mock_hardware:
-            time.sleep(0.08)
         self.send_command("SETUP", timeout_s=10.0)
-        self._apply_calibrated_axis_profiles()
+        self.send_command(
+            f"STEPS X{self.config.steps_per_mm_x:.2f} "
+            f"Y{self.config.steps_per_mm_y:.2f} "
+            f"Z{self.config.steps_per_mm_z:.2f}"
+        )
         self.send_command("HOME", timeout_s=timeout_s)
         self.pose.x_mm = 0.0
         self.pose.y_mm = 0.0

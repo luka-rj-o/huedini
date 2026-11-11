@@ -134,7 +134,7 @@ const float TRAVEL_Z_MM = 76.7f;
 
 // Safe pull-away distances before homing so axes against bumpers have runway to accelerate beyond blanking
 const float HOME_BACKOFF_MM_XZ = 5.0f;
-const float HOME_BACKOFF_MM_Y  = 25.0f;
+const float HOME_BACKOFF_MM_Y  = 30.0f;
 const unsigned long HOME_PRE_SETTLE_MS = 50;
 
 // Per-axis cap applied to MOVE feedrates (microsteps/s). StallGuard thresholds are only valid near the speed they
@@ -1084,10 +1084,11 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
   bool towardOrigin = (reverse == axis.homeReverse);
 
   // --- Safe Pre-Homing Pull-Away ---
-  // Pull away if unhomed, or if homed within 30 mm of the origin stop so Y always clears the 350 ms blanking runway.
-  // If already homed beyond 30 mm, skip pull-away so it never drives toward the far end!
+  // Pull away if unhomed, or on Y if within 35 mm of the origin stop so the 30 mm backoff always clears 350 ms blanking.
+  // If already homed beyond that clearance, skip pull-away so it never drives toward the far end!
+  float minClearMm = (axis.coordCode == 'Y') ? 35.0f : axis.homeBackoffMm;
   bool needsBackoff = !axis.homed ||
-                      (towardOrigin && stepper->currentPosition() < (long)(30.0f * axis.stepsPerMm));
+                      (towardOrigin && stepper->currentPosition() < (long)(minClearMm * axis.stepsPerMm));
   if (withBackoff && axis.homeBackoffMm > 0.0f && needsBackoff) {
     long backoffSteps = lroundf(axis.homeBackoffMm * axis.stepsPerMm);
     long awaySign = reverse ? 1 : -1;     // opposite to the homing direction
