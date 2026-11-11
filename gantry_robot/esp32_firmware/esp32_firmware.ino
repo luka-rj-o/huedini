@@ -128,13 +128,13 @@ const unsigned long HOMING_TIMEOUT_MS  = 30000;  // minimum homing timeout; the 
                                                  // stroke/homeSpeed (X needs ~60 s for a full 236 mm stroke at 4 mm/s)
 
 // Physical strokes from the homed origin (mm). Used for MOVE soft limits and forward-homing position.
-const float TRAVEL_X_MM = 227.0f;
+const float TRAVEL_X_MM = 236.0f;
 const float TRAVEL_Y_MM = 128.0f;
-const float TRAVEL_Z_MM = 76.7f;
+const float TRAVEL_Z_MM = 84.0f;
 
-// Safe pull-away distances before homing so axes against bumpers have runway to accelerate beyond blanking
-const float HOME_BACKOFF_MM_XZ = 8.0f;
-const float HOME_BACKOFF_MM_Y  = 25.0f;
+// Safe pull-away distances before homing so axes against bumpers have runway to accelerate
+const float HOME_BACKOFF_MM_XZ = 5.0f;
+const float HOME_BACKOFF_MM_Y  = 15.0f;
 const unsigned long HOME_PRE_SETTLE_MS = 50;
 
 // Per-axis cap applied to MOVE feedrates (microsteps/s). StallGuard thresholds are only valid near the speed they
@@ -817,8 +817,7 @@ bool setupAll(bool quietProtocol) {
     Serial.println("-> Setting up steppers...");
   }
 
-  bool wasDisabled = (digitalRead(PIN_EN) == HIGH);
-  digitalWrite(PIN_EN, LOW);           // Enable drivers (without dropping hold current if already enabled)
+  digitalWrite(PIN_EN, LOW);           // Enable drivers
 
   int readyCount = 0;
   for (int i = 0; i < NUM_AXES; i++) {
@@ -833,10 +832,10 @@ bool setupAll(bool quietProtocol) {
     return false;
   }
 
-  // Let StealthChop AT#1 (standstill current regulation) settle only when waking from disabled state.
-  if (wasDisabled) {
-    delay(DRIVER_ENABLE_SETTLE_MS);
-  }
+  // Let StealthChop AT#1 (standstill current regulation) settle before StallGuard-dependent motion.
+  // Without this, a HOME right after re-enabling (e.g. after a stall/ESTOP put the drivers to sleep)
+  // started homing on an untuned driver.
+  delay(DRIVER_ENABLE_SETTLE_MS);
 
   if (!quietProtocol) {
     Serial.print("-> Setup done: ");
@@ -871,12 +870,6 @@ bool setupAxis(Axis& axis) {
   axis.driver->pwm_autoscale(true);
   axis.driver->intpol(true);           // Enable TMC2209 internal 256x microstep interpolation for silent, smooth motion
   axis.driver->TCOOLTHRS(0xFFFFF);     // Enable StallGuard/DIAG at all speeds above ~0
-
-  // Restore factory speed, accel, current, microsteps, and StallGuard defaults so prior MOVEs never taint SETUP/HOME
-  axis.maxSpeed     = (axis.coordCode == 'Y') ? DEFAULT_MAX_SPEED_Y : DEFAULT_MAX_SPEED_XZ;
-  axis.acceleration = (axis.coordCode == 'Y') ? DEFAULT_ACCEL_Y     : DEFAULT_ACCEL_XZ;
-  axis.stepper->setMaxSpeed(axis.maxSpeed);
-  axis.stepper->setAcceleration(axis.acceleration);
 
   // User-facing defaults
   axis.driver->rms_current(axis.currentMa);
@@ -1080,11 +1073,10 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
   bool towardOrigin = (reverse == axis.homeReverse);
 
   // --- Safe Pre-Homing Pull-Away ---
-  // Pull away if unhomed, or on Y if within 28 mm of the origin stop so backoff always clears 350 ms blanking.
-  // If already homed beyond that clearance, skip pull-away so it never drives toward the far end!
-  float minClearMm = (axis.coordCode == 'Y') ? 28.0f : axis.homeBackoffMm;
+  // Only pull away if unhomed, or if homed but sitting right against the bumper (< backoff distance).
+  // If already homed and positioned out on the axis, skip pull-away so it never drives toward the far end!
   bool needsBackoff = !axis.homed ||
-                      (towardOrigin && stepper->currentPosition() < (long)(minClearMm * axis.stepsPerMm));
+                      (towardOrigin && stepper->currentPosition() < (long)(axis.homeBackoffMm * axis.stepsPerMm));
   if (withBackoff && axis.homeBackoffMm > 0.0f && needsBackoff) {
     long backoffSteps = lroundf(axis.homeBackoffMm * axis.stepsPerMm);
     long awaySign = reverse ? 1 : -1;     // opposite to the homing direction
@@ -1153,16 +1145,16 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
       stepper->setSpeed(dirSign * axis.homeSpeed);
     }
 
-    // Check DIAG with short debouncing after blanking window (350 ms) to stop promptly with minimal endstop buzz
+    // Check DIAG with debouncing after blanking window (350 ms)
     if (elapsed > HOMING_BLANKING_MS) {
       if (digitalRead(axis.diagPin) == HIGH) {
         if (diagFirstHighMs == 0) {
           diagFirstHighMs = nowMs | 1UL;
-        } else if ((nowMs - diagFirstHighMs) >= 2) {
+        } else if ((nowMs - diagFirstHighMs) >= 12) {
           outcome = HOMED;
         }
       } else {
-        if (diagFirstHighMs != 0 && (nowMs - diagFirstHighMs > 10)) {
+        if (diagFirstHighMs != 0 && (nowMs - diagFirstHighMs > 25)) {
           diagFirstHighMs = 0; // noise glitch cleared
         }
       }

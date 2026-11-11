@@ -62,7 +62,6 @@ class ESP32SerialBridge:
         self._ser: Optional["serial.Serial"] = None
         self._lock = threading.Lock()
         self._abort_flag = False
-        self._homed_known = False
         self._simulated_held_mass_g: Optional[float] = None
 
     def connect(self) -> None:
@@ -176,11 +175,9 @@ class ESP32SerialBridge:
             self._ser.flush()
             time.sleep(0.3)
             self._ser.reset_input_buffer()
-            self._homed_known = False
             logger.info("ESP32SerialBridge successfully reconnected and initialized.")
             return True
         except Exception as exc:
-            self._homed_known = False
             logger.error("ESP32SerialBridge reconnection failed: %s", exc)
             if self._ser:
                 try:
@@ -207,13 +204,11 @@ class ESP32SerialBridge:
         return None
 
     def close(self) -> None:
-        self._homed_known = False
         if self._ser and self._ser.is_open:
             self._ser.close()
 
     def trigger_emergency_stop(self) -> None:
         self._abort_flag = True
-        self._homed_known = False
         if not self.mock_hardware and self._ser and self._ser.is_open:
             try:
                 self._ser.write(b"ESTOP\n")
@@ -233,8 +228,6 @@ class ESP32SerialBridge:
         Raises RuntimeError on explicit errors, E-STOP, or detected axis crashes.
         """
         cmd_clean = cmd.strip()
-        if cmd_clean.upper() in ("SLEEP", "ESTOP"):
-            self._homed_known = False
         if self._abort_flag and cmd_clean.upper() != "ESTOP":
             raise RuntimeError("ERR:EMERGENCY_STOP_ACTIVE")
 
@@ -299,10 +292,7 @@ class ESP32SerialBridge:
                 )
             )
             is_manual_setting = (
-                (
-                    cmd_lower in ("l", "help")
-                    or cmd_lower.startswith(("s1 ", "s2 ", "s3 ", "servo ", "relay ", "help "))
-                )
+                cmd_lower.startswith(("s1 ", "s2 ", "s3 ", "servo ", "relay ", "l", "help"))
                 and not is_motion_cmd
                 and not cmd_clean.upper().startswith(("SETUP", "STATUS", "STEPS"))
             )
@@ -335,7 +325,6 @@ class ESP32SerialBridge:
 
                 # Explicit crash detection from firmware [ALERT] or ERR:STALL
                 if "stall detected" in line.lower() or line.startswith("ERR:STALL") or line.startswith("[ALERT]"):
-                    self._homed_known = False
                     raise RuntimeError(f"CRASH_DETECTED: {line}")
 
                 if line == "OK":
@@ -345,7 +334,6 @@ class ESP32SerialBridge:
                     if "use hv<speed> or hs<sensitivity>" in line.lower():
                         logger.warning("Ignoring non-fatal firmware warning: %s", line)
                         continue
-                    self._homed_known = False
                     raise RuntimeError(line)
 
                 if is_motion_cmd:
@@ -367,9 +355,7 @@ class ESP32SerialBridge:
 
                 elif is_manual_setting:
                     if line.startswith("-> ") or line.startswith("---") or line.startswith("["):
-                        # Consume trailing OK emitted by interactive firmware commands before returning
-                        if self._ser.in_waiting == 0:
-                            time.sleep(0.06)
+                        time.sleep(0.06)
                         if self._ser.in_waiting == 0:
                             return _log_and_return(lines)
 
@@ -386,37 +372,12 @@ class ESP32SerialBridge:
             logger.warning("ensure_awake failed: %s", exc)
 
     def home_all(self, timeout_s: float = 120.0) -> None:
-        """Commands ESP32 to home Z, X, and Y axes using identical firmware TMC2209 StallGuard4 profiles on every run."""
-        # If currently homed near the far end stops, stage back to safe mid-travel first so firmware
-        # pull-away never drives X or Y into the far mechanical stop.
-        if self._homed_known and not self.mock_hardware:
-            if self.pose.z_mm > 5.0:
-                self.move_to(z_mm=0.0)
-            y_hi = max(35.0, self.config.travel_y_mm - 35.0)
-            x_hi = max(20.0, self.config.travel_x_mm - 15.0)
-            need_y = self.pose.y_mm > y_hi
-            need_x = self.pose.x_mm > x_hi
-            if need_y or need_x:
-                self.move_to(
-                    x_mm=min(self.pose.x_mm, x_hi),
-                    y_mm=30.0 if need_y else self.pose.y_mm,
-                    feedrate_mm_s=self.config.feedrate_travel_mm_s,
-                )
-
-        # Re-run SETUP + STEPS before HOME so firmware pulses PIN_EN, resets speed/accel defaults, and applies
-        # identical StallGuard thresholds without overriding the user-tuned firmware sensitivity settings.
-        self._homed_known = False
-        self.send_command("SETUP", timeout_s=10.0)
-        self.send_command(
-            f"STEPS X{self.config.steps_per_mm_x:.2f} "
-            f"Y{self.config.steps_per_mm_y:.2f} "
-            f"Z{self.config.steps_per_mm_z:.2f}"
-        )
+        """Commands ESP32 to home Z, X, and Y axes using TMC2209 StallGuard4 with safe timeout."""
+        self.ensure_awake()
         self.send_command("HOME", timeout_s=timeout_s)
         self.pose.x_mm = 0.0
         self.pose.y_mm = 0.0
         self.pose.z_mm = 0.0
-        self._homed_known = True
         self._notify_pose()
 
     def move_to(
