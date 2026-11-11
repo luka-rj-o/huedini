@@ -27,25 +27,27 @@ const BLOCK_SIZE = 20.0;
 
 // 2. Motor Travel Strokes from Homed (0, 0, 0)
 // Course is elevated 1/4" (6.35 mm) off base plate -> STROKE_Z_BOTTOM = 70.36 mm
-const STROKE_X = 236.0;
+const STROKE_X = 227.0;
 const STROKE_Y = 128.0;
-const STROKE_Z_MAX = 84.0;
+const STROKE_Z_MAX = 76.7;
 const STROKE_Z_BOTTOM = 70.36; // Full descent to elevated course floor (76.71 - 6.35 mm)
 
-// 3. Homed Datum Point in Fiducial Plate Coordinates (0, 0, 0)
-const DATUM_X = 20.0;
+// 3. Homed Datum Point (Tower Origin) in Course Coordinates (0, 0, 0)
+const DATUM_X = 28.5;
 const DATUM_Y = -43.5;
 const DATUM_Z = 127.5;
 
-// 4. Nominal Homed End-Effector in Fiducial Plate Coordinates
-const EE_HOMED_X = 28.0;
-const EE_HOMED_Y = 6.0;
+// 4. Nominal Homed End-Effector in Course Coordinates
+const EE_HOMED_X = 32.5;
+const EE_HOMED_Y = -6.0;
 const EE_HOMED_Z = 97.6;
 
-// 5. Nominal Homed Camera in Fiducial Plate Coordinates
-const CAM_HOMED_X = 27.8;
-const CAM_HOMED_Y = 60.1;
-const CAM_HOMED_Z = 135.3;
+// 5. Nominal Homed Camera in Course Coordinates (54.1 mm ahead, 37.8 mm above EE)
+const CAM_HOMED_X = 32.5;
+const CAM_HOMED_Y = 48.1;
+const CAM_HOMED_Z = 135.4;
+const EE_OFFSET_X = 0.0;
+const EE_OFFSET_Y = -54.1;
 
 // 6. Drop-off Platform wrt Fiducial Plate Origin (0, 0, 0)
 const DROPOFF_X = 224.5;
@@ -110,21 +112,24 @@ function setJogStep(stepMm) {
 }
 
 function jogAxis(axis, dir) {
-  const dist = dir * currentJogStepMm;
+  const uiDelta = dir * currentJogStepMm;
+  // Physical Z motor travel counts downward from top home (0 = top, +Z_down = lower),
+  // while GUI jog buttons use +Z = Up and -Z = Down.
+  const motorDelta = axis === "Z" ? -uiDelta : uiDelta;
   if (socket && socket.readyState === WebSocket.OPEN) {
     // 1. Instantaneous Optimistic UI update (0ms perceived latency on client)
     if (axis === "X") {
-      motorX = Math.max(0, Math.min(STROKE_X, motorX + dist));
+      motorX = Math.max(0, Math.min(STROKE_X, motorX + motorDelta));
     } else if (axis === "Y") {
-      motorY = Math.max(0, Math.min(STROKE_Y, motorY + dist));
+      motorY = Math.max(0, Math.min(STROKE_Y, motorY + motorDelta));
     } else if (axis === "Z") {
-      motorZDown = Math.max(0, Math.min(STROKE_Z_BOTTOM, motorZDown + dist));
+      motorZDown = Math.max(0, Math.min(STROKE_Z_BOTTOM, motorZDown + motorDelta));
     }
     updateReadoutsFromMotor();
     renderCourseCanvas();
 
     // 2. Dispatch non-blocking motion command to Pi controller
-    socket.send(JSON.stringify({ command: "JOG_AXIS", axis, dist_mm: dist }));
+    socket.send(JSON.stringify({ command: "JOG_AXIS", axis, dist_mm: motorDelta }));
   }
 }
 
@@ -179,9 +184,9 @@ function updateReadoutsFromMotor() {
   const camY = camOrigin.y + motorY;
   const camZ = CAM_HOMED_Z - motorZDown;
 
-  // End-Effector in Fiducial Plate Coordinates (offset: +0.2 mm X, -54.1 mm Y from camera)
-  const eeX = camOrigin.x + 0.2 + motorX;
-  const eeY = camOrigin.y - 54.1 + motorY;
+  // End-Effector in Course Coordinates (offset: 0.0 mm X, -54.1 mm Y from camera)
+  const eeX = camOrigin.x + EE_OFFSET_X + motorX;
+  const eeY = camOrigin.y + EE_OFFSET_Y + motorY;
   const eeZ = EE_HOMED_Z - motorZDown;
 
   const eeEl = document.getElementById("eePlateReadout");
@@ -194,9 +199,9 @@ function updateReadoutsFromMotor() {
   if (camHomedEl) camHomedEl.textContent = `(${camOrigin.x.toFixed(1)}, ${camOrigin.y.toFixed(1)}, ${CAM_HOMED_Z.toFixed(1)}) mm`;
 
   const eeHomedEl = document.getElementById("eeHomedOriginReadout");
-  if (eeHomedEl) eeHomedEl.textContent = `(${(camOrigin.x + 0.2).toFixed(1)}, ${(camOrigin.y - 54.1).toFixed(1)}, ${EE_HOMED_Z.toFixed(1)}) mm`;
+  if (eeHomedEl) eeHomedEl.textContent = `(${(camOrigin.x + EE_OFFSET_X).toFixed(1)}, ${(camOrigin.y + EE_OFFSET_Y).toFixed(1)}, ${EE_HOMED_Z.toFixed(1)}) mm`;
 
-  // Live Motor Telemetry Readouts
+  // Live Motor Telemetry Readouts (display Z as negative displacement from top home so +Z is Up)
   const mxEl = document.getElementById("motorXReadout");
   if (mxEl) mxEl.textContent = motorX.toFixed(1);
 
@@ -204,7 +209,8 @@ function updateReadoutsFromMotor() {
   if (myEl) myEl.textContent = motorY.toFixed(1);
 
   const mzEl = document.getElementById("motorZReadout");
-  if (mzEl) mzEl.textContent = motorZDown.toFixed(2);
+  const displayZ = motorZDown > 0.005 ? -motorZDown : 0.0;
+  if (mzEl) mzEl.textContent = displayZ.toFixed(2);
 
   // Progress Bar Visual Fill
   const mxBar = document.getElementById("motorXBar");
@@ -634,8 +640,8 @@ function renderCourseCanvas() {
 
   // 5. End-Effector Reachable Travel Envelope
   const camOrigin = getCamHomedOrigin();
-  const curEeHomedX = camOrigin.x + 0.2;
-  const curEeHomedY = camOrigin.y - 54.1;
+  const curEeHomedX = camOrigin.x + EE_OFFSET_X;
+  const curEeHomedY = camOrigin.y + EE_OFFSET_Y;
   const eeBoxTL = mmToCanvas(curEeHomedX, curEeHomedY + STROKE_Y);
   const eeBoxBR = mmToCanvas(curEeHomedX + STROKE_X, curEeHomedY);
   ctx.fillStyle = "rgba(22, 163, 74, 0.04)";
@@ -672,7 +678,7 @@ function renderCourseCanvas() {
     camBoxTL.cy - 5
   );
 
-  // 7. Homed Datum Origin (20.0, -43.5, 127.5) & Current Carriage Datum
+  // 7. Homed Datum Origin (28.5, -43.5, 127.5) & Current Carriage Datum
   const curDatumX = DATUM_X + motorX;
   const curDatumY = DATUM_Y + motorY;
   const homeDatumPt = mmToCanvas(DATUM_X, DATUM_Y);
@@ -1051,8 +1057,8 @@ function showReportModal(report) {
         <div><span class="kv-label">Marker Orientation</span><span class="kv-val">${cal.marker_angle_deg !== null ? cal.marker_angle_deg + "°" : "N/A"}</span></div>
         <div><span class="kv-label">Camera Skew (Physical Tilt)</span><span class="kv-val" style="color:${Math.abs(cal.cam_skew_deg || 0) > 0.05 ? "#0284c7" : "#0f172a"}">${cal.cam_skew_deg !== undefined ? cal.cam_skew_deg + "° (Compensated)" : "0.0°"}</span></div>
         <div><span class="kv-label">Auto-Scale Kx / Ky</span><span class="kv-val">${cal.kx_mm_per_px || 0.25} / ${cal.ky_mm_per_px || 0.25} mm/px</span></div>
-        <div><span class="kv-label">Calibrated Cam Origin</span><span class="kv-val">(${cal.cam_origin_x_mm ?? 27.8}, ${cal.cam_origin_y_mm ?? 60.1}) mm</span></div>
-        <div><span class="kv-label">Camera-to-Gripper Offset</span><span class="kv-val">(${cal.offset_x_mm ?? 0.2}, ${cal.offset_y_mm ?? -54.1}) mm</span></div>
+        <div><span class="kv-label">Calibrated Cam Origin</span><span class="kv-val">(${cal.cam_origin_x_mm ?? 32.5}, ${cal.cam_origin_y_mm ?? 48.1}) mm</span></div>
+        <div><span class="kv-label">Camera-to-Gripper Offset</span><span class="kv-val">(${cal.offset_x_mm ?? 0.0}, ${cal.offset_y_mm ?? -54.1}) mm</span></div>
         <div><span class="kv-label">Course Floor Elevation</span><span class="kv-val">+6.35 mm (1/4" Elevated)</span></div>
       </div>
     </div>

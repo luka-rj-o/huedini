@@ -12,7 +12,7 @@
       <span class="logo-dot"></span>
       <div>
         <h1>HUE-DINI Gantry Supervisor &amp; CAD Skeleton</h1>
-        <p class="subtitle">284&times;167.4 mm Fiducial Plate &bull; 254&times;152.4 mm Course &bull; 236&times;128&times;76.71 mm Stroke</p>
+        <p class="subtitle">284&times;167.4 mm Fiducial Plate &bull; 254&times;152.4 mm Course &bull; 227&times;128&times;76.7 mm Stroke</p>
       </div>
     </div>
 
@@ -34,8 +34,8 @@
         </div>
         <div class="pose-readout">
           <span class="readout-item">STATE: <strong id="stateReadout" class="state-pill">IDLE</strong></span>
-          <span class="readout-item">EE Plate: <strong id="eePlateReadout">(28.0, 6.0, 97.6)</strong> mm</span>
-          <span class="readout-item">Cam Plate: <strong id="camPlateReadout">(27.8, 60.1, 135.3)</strong> mm</span>
+          <span class="readout-item">EE Plate: <strong id="eePlateReadout">(32.5, -6.0, 97.6)</strong> mm</span>
+          <span class="readout-item">Cam Plate: <strong id="camPlateReadout">(32.5, 48.1, 135.4)</strong> mm</span>
           <span class="readout-item">Drop: <strong>(224.5, 44.5, +12.6)</strong> mm</span>
           <span class="readout-item">&theta;: <strong id="poseA">0.0</strong>&deg;</span>
           <span class="readout-item">GRIP: <strong id="poseGrip">CLOSED (NC)</strong></span>
@@ -64,7 +64,7 @@
             <div class="coord-progress-bg">
               <div class="coord-progress-fill" id="motorXBar" style="width: 0%"></div>
             </div>
-            <span class="coord-sub">Range: 0 &ndash; 236 mm</span>
+            <span class="coord-sub">Range: 0 &ndash; 227 mm</span>
           </div>
 
           <div class="coord-card">
@@ -80,7 +80,7 @@
           </div>
 
           <div class="coord-card">
-            <span class="coord-label">Motor Z (Retract &ndash; Descend)</span>
+            <span class="coord-label">Motor Z (Descend -Z &ndash; Up +Z)</span>
             <div class="coord-val-wrap">
               <span class="coord-num" id="motorZReadout">0.00</span>
               <span class="coord-unit">mm</span>
@@ -88,7 +88,7 @@
             <div class="coord-progress-bg">
               <div class="coord-progress-fill" id="motorZBar" style="width: 0%"></div>
             </div>
-            <span class="coord-sub">Range: 0 &ndash; 76.71 mm</span>
+            <span class="coord-sub">Range: -76.7 &ndash; 0 mm (Floor -70.36)</span>
           </div>
 
           <div class="coord-card mass-coord-card">
@@ -111,8 +111,8 @@
 
       <div class="calibration-bar">
         <span>Course Floor: <strong>+6.35 mm (1/4" Elevated)</strong></span>
-        <span>Cam Homed: <strong id="camHomedOriginReadout">(27.8, 60.1, 135.3) mm</strong></span>
-        <span>EE Homed: <strong id="eeHomedOriginReadout">(28.0, 6.0, 97.6) mm</strong></span>
+        <span>Cam Homed: <strong id="camHomedOriginReadout">(32.5, 48.1, 135.4) mm</strong></span>
+        <span>EE Homed: <strong id="eeHomedOriginReadout">(32.5, -6.0, 97.6) mm</strong></span>
         <span>Scale: <strong id="calKx">0.2500</strong> / <strong id="calKy">0.2500</strong> mm/px (<span id="calStatus">Default</span>)</span>
         <span>Coord System: <span id="calOriginStatus" class="badge badge-dim">CAD Nominal</span></span>
         <span>Cam Skew: <strong id="calCamSkew">0.0&deg;</strong> (<span id="calSkewStatus" class="badge badge-dim">Nominal</span>)</span>
@@ -174,8 +174,8 @@
           <div class="jog-axis-row">
             <span class="jog-axis-label">Z Axis (Lead Screw)</span>
             <div class="jog-btn-pair">
-              <button class="btn btn-secondary btn-sm" onclick="jogAxis('Z', -1)">&uarr; -Z (Up)</button>
-              <button class="btn btn-secondary btn-sm" onclick="jogAxis('Z', 1)">+Z (Down) &darr;</button>
+              <button class="btn btn-secondary btn-sm" onclick="jogAxis('Z', 1)">&uarr; +Z (Up)</button>
+              <button class="btn btn-secondary btn-sm" onclick="jogAxis('Z', -1)">-Z (Down) &darr;</button>
             </div>
           </div>
         </div>
@@ -309,6 +309,6 @@
     </div>
   </div>
 
-  <script src="app.js?v=7"></script>
+  <script src="app.js?v=8"></script>
 </body>
 </html>

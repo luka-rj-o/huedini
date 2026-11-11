@@ -49,6 +49,8 @@ class GantryStateMachine:
             cam_skew_deg=config.default_cam_skew_deg,
             offset_x_mm=config.camera_to_gripper_offset_x_mm,
             offset_y_mm=config.camera_to_gripper_offset_y_mm,
+            cam_homed_z_above_plate_mm=config.cam_homed_z_above_plate_mm,
+            course_elevation_mm=config.course_elevation_mm,
             cam_origin_x_mm=config.nominal_cam_origin_x_mm,
             cam_origin_y_mm=config.nominal_cam_origin_y_mm,
             corner_fiducials=config.corner_fiducials_by_id,
@@ -558,7 +560,13 @@ class GantryStateMachine:
             det_records = []
             for det in detections:
                 wx, wy = self.kinematics.pixel_to_world_mm(
-                    det.u_px, det.v_px, gx, gy, z_scan, z_scan
+                    det.u_px,
+                    det.v_px,
+                    gx,
+                    gy,
+                    z_scan,
+                    z_scan,
+                    target_height_above_surface_mm=self.config.block_height_mm,
                 )
                 comp_angle = self.kinematics.compensate_block_angle(det.angle_deg)
                 self.planner.merge_detection(det.color, wx, wy, comp_angle)
@@ -609,9 +617,9 @@ class GantryStateMachine:
             self._check_pause_or_abort()
             self._execute_pick_weigh_and_stack(block)
 
-        # Return to home park position: retract Z first to avoid collisions
+        # Return to home park position: retract Z first to avoid collisions, park clear of Y blanking stop
         self.serial.move_to(z_mm=self.config.z_scan_mm, feedrate_mm_s=self.config.feedrate_z_mm_s)
-        self.serial.move_to(x_mm=20.0, y_mm=20.0, angle_deg=0.0)
+        self.serial.move_to(x_mm=20.0, y_mm=30.0, angle_deg=0.0)
         self.state = "COMPLETE"
         self.log_event(
             f"All {len(pick_queue)} blocks processed and sorted! Returning to IDLE/COMPLETE."
@@ -652,10 +660,18 @@ class GantryStateMachine:
             v_frame = self.vision.capture_stationary_frame(
                 self.serial.pose.x_mm, self.serial.pose.y_mm, self.serial.pose.z_mm
             )
-            v_dets = [d for d in self.vision.detect_blocks_hsv(v_frame) if d.color == block.color]
+            all_v_dets = self.vision.detect_blocks_hsv(v_frame)
+            v_dets = [d for d in all_v_dets if d.color == block.color]
+            cx, cy = self.config.frame_width / 2.0, self.config.frame_height / 2.0
+            # Under hover-height toolhead shadow, white blocks can briefly classify as aluminum
+            if not v_dets and block.color in ("white", "aluminum"):
+                v_dets = [
+                    d for d in all_v_dets
+                    if d.color in ("white", "aluminum")
+                    and ((d.u_px - cx) ** 2 + (d.v_px - cy) ** 2) <= (180.0 ** 2)
+                ]
             if v_dets:
                 # Pick detection closest to image center
-                cx, cy = self.config.frame_width / 2.0, self.config.frame_height / 2.0
                 best = min(v_dets, key=lambda d: (d.u_px - cx) ** 2 + (d.v_px - cy) ** 2)
                 refined_plate_x, refined_plate_y = self.kinematics.pixel_to_world_mm(
                     best.u_px,
@@ -664,6 +680,7 @@ class GantryStateMachine:
                     self.serial.pose.y_mm,
                     self.serial.pose.z_mm,
                     self.config.z_scan_mm,
+                    target_height_above_surface_mm=self.config.block_height_mm,
                 )
                 refined_angle = self.kinematics.compensate_block_angle(best.angle_deg)
                 # For square blocks (90 deg rotational symmetry), keep refined angle within +/-45 deg of coarse angle

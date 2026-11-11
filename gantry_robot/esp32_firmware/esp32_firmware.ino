@@ -128,13 +128,13 @@ const unsigned long HOMING_TIMEOUT_MS  = 30000;  // minimum homing timeout; the 
                                                  // stroke/homeSpeed (X needs ~60 s for a full 236 mm stroke at 4 mm/s)
 
 // Physical strokes from the homed origin (mm). Used for MOVE soft limits and forward-homing position.
-const float TRAVEL_X_MM = 236.0f;
+const float TRAVEL_X_MM = 227.0f;
 const float TRAVEL_Y_MM = 128.0f;
-const float TRAVEL_Z_MM = 84.0f;
+const float TRAVEL_Z_MM = 76.7f;
 
-// Safe pull-away distances before homing so axes against bumpers have runway to accelerate
+// Safe pull-away distances before homing so axes against bumpers have runway to accelerate beyond blanking
 const float HOME_BACKOFF_MM_XZ = 5.0f;
-const float HOME_BACKOFF_MM_Y  = 15.0f;
+const float HOME_BACKOFF_MM_Y  = 25.0f;
 const unsigned long HOME_PRE_SETTLE_MS = 50;
 
 // Per-axis cap applied to MOVE feedrates (microsteps/s). StallGuard thresholds are only valid near the speed they
@@ -817,6 +817,11 @@ bool setupAll(bool quietProtocol) {
     Serial.println("-> Setting up steppers...");
   }
 
+  // Pulse PIN_EN HIGH briefly when re-enabling so TMC2209 drivers reset StallGuard/StealthChop tuning cleanly.
+  if (digitalRead(PIN_EN) == LOW) {
+    digitalWrite(PIN_EN, HIGH);
+    delay(20);
+  }
   digitalWrite(PIN_EN, LOW);           // Enable drivers
 
   int readyCount = 0;
@@ -870,6 +875,12 @@ bool setupAxis(Axis& axis) {
   axis.driver->pwm_autoscale(true);
   axis.driver->intpol(true);           // Enable TMC2209 internal 256x microstep interpolation for silent, smooth motion
   axis.driver->TCOOLTHRS(0xFFFFF);     // Enable StallGuard/DIAG at all speeds above ~0
+
+  // Restore factory speed, accel, current, microsteps, and StallGuard defaults so prior MOVEs never taint SETUP/HOME
+  axis.maxSpeed     = (axis.coordCode == 'Y') ? DEFAULT_MAX_SPEED_Y : DEFAULT_MAX_SPEED_XZ;
+  axis.acceleration = (axis.coordCode == 'Y') ? DEFAULT_ACCEL_Y     : DEFAULT_ACCEL_XZ;
+  axis.stepper->setMaxSpeed(axis.maxSpeed);
+  axis.stepper->setAcceleration(axis.acceleration);
 
   // User-facing defaults
   axis.driver->rms_current(axis.currentMa);
@@ -1073,10 +1084,10 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
   bool towardOrigin = (reverse == axis.homeReverse);
 
   // --- Safe Pre-Homing Pull-Away ---
-  // Only pull away if unhomed, or if homed but sitting right against the bumper (< backoff distance).
-  // If already homed and positioned out on the axis, skip pull-away so it never drives toward the far end!
+  // Pull away if unhomed, or if homed within 30 mm of the origin stop so Y always clears the 350 ms blanking runway.
+  // If already homed beyond 30 mm, skip pull-away so it never drives toward the far end!
   bool needsBackoff = !axis.homed ||
-                      (towardOrigin && stepper->currentPosition() < (long)(axis.homeBackoffMm * axis.stepsPerMm));
+                      (towardOrigin && stepper->currentPosition() < (long)(30.0f * axis.stepsPerMm));
   if (withBackoff && axis.homeBackoffMm > 0.0f && needsBackoff) {
     long backoffSteps = lroundf(axis.homeBackoffMm * axis.stepsPerMm);
     long awaySign = reverse ? 1 : -1;     // opposite to the homing direction

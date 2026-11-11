@@ -34,9 +34,9 @@ class CalibrationRecord:
     cam_skew_deg: float = 0.0
     kx_mm_per_px: float = 0.25
     ky_mm_per_px: float = 0.25
-    cam_origin_x_mm: float = 27.8
-    cam_origin_y_mm: float = 60.1
-    offset_x_mm: float = 0.2
+    cam_origin_x_mm: float = 32.5
+    cam_origin_y_mm: float = 48.1
+    offset_x_mm: float = 0.0
     offset_y_mm: float = -54.1
 
 

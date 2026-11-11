@@ -49,36 +49,38 @@ class GantryConfig:
     steps_per_mm_z: float = 50.0
 
     # --- Physical Motor Travel Strokes from Homed (0, 0, 0) (mm) ---
-    # Z=0 is at the TOP when homed; positive Z travel moves DOWNWARD up to 70.36 mm.
+    # Z=0 is at the TOP when homed; positive motor Z_down moves DOWNWARD up to 70.36 mm.
+    # Full mechanical strokes: (227.0, 128.0, 76.7) mm.
     # Note: Course is elevated 1/4" (6.35 mm) above the machine base plate.
-    # Bottom descent is reduced by 6.35 mm (76.71 - 6.35 = 70.36 mm).
+    # Bottom descent is preserved at 70.36 mm (76.71 - 6.35 = 70.36 mm).
     course_elevation_mm: float = 6.35
-    travel_x_mm: float = 236.0
+    travel_x_mm: float = 227.0
     travel_y_mm: float = 128.0
-    travel_z_max_mm: float = 84.0
+    travel_z_max_mm: float = 76.7
     travel_z_bottom_mm: float = 70.36
 
-    # --- CAD Homed Datum & Component Positions in Fiducial Plate Coordinates (0, 0, 0) ---
-    # 1. Homed datum origin wrt large fiducial plate origin: (20.0, -43.5, 127.5) mm
-    homed_datum_plate_x_mm: float = 20.0
+    # --- CAD Homed Datum & Component Positions in Course/Plate Coordinates (0, 0, 0) ---
+    # 1. Tower datum origin wrt course origin: 28.5 mm right, 43.5 mm behind, 127.5 mm above
+    homed_datum_plate_x_mm: float = 28.5
     homed_datum_plate_y_mm: float = -43.5
     homed_datum_plate_z_mm: float = 127.5
 
-    # 2. Homed End-Effector top in plate coordinates: (28.0, +6.0, 97.6) mm
-    #    (Relative to datum: +8.0 mm X, +49.5 mm Y, -29.9 mm Z)
-    ee_from_datum_x_mm: float = 8.0
-    ee_from_datum_y_mm: float = 49.5
+    # 2. Homed End-Effector top wrt course origin: 32.5 mm right, 6.0 mm behind, 97.6 mm above
+    #    (Relative to tower datum: +4.0 mm X, +37.5 mm Y, -29.9 mm Z)
+    ee_from_datum_x_mm: float = 4.0
+    ee_from_datum_y_mm: float = 37.5
     ee_from_datum_z_mm: float = -29.9
-    # -> In plate coordinates at motor (0,0,0): EE = (28.0, +6.0, 97.6) mm -> X[28.0..264.0], Y[6.0..134.0]
+    # -> In plate coordinates at motor (0,0,0): EE = (32.5, -6.0, 97.6) mm -> X[32.5..259.5], Y[-6.0..122.0]
 
-    # 3. Homed Camera optical center in plate coordinates: (27.8, 60.1, 135.3) mm
-    #    (Relative to datum: +7.8 mm X, +103.6 mm Y, +7.8 mm Z)
-    cam_from_datum_x_mm: float = 7.8
-    cam_from_datum_y_mm: float = 103.6
-    cam_from_datum_z_mm: float = 7.8
-    nominal_cam_origin_x_mm: float = 27.8
-    nominal_cam_origin_y_mm: float = 60.1
-    # -> In plate coordinates at motor (0,0,0): Cam = (27.8, 60.1, 135.3) mm -> X[27.8..263.8], Y[60.1..188.1]
+    # 3. Homed Camera optical center: 54.1 mm ahead (+Y) and 37.8 mm above (+Z) EE origin
+    #    -> Cam = (32.5, +48.1, 135.4) mm -> X[32.5..259.5], Y[48.1..176.1]
+    #    (Relative to tower datum: +4.0 mm X, +91.6 mm Y, +7.9 mm Z)
+    cam_from_datum_x_mm: float = 4.0
+    cam_from_datum_y_mm: float = 91.6
+    cam_from_datum_z_mm: float = 7.9
+    nominal_cam_origin_x_mm: float = 32.5
+    nominal_cam_origin_y_mm: float = 48.1
+    cam_homed_z_above_plate_mm: float = 135.4
 
     # --- Course & Outer Fiducial Border Dimensions (mm) ---
     workspace_x_mm: float = 284.0
@@ -132,10 +134,10 @@ class GantryConfig:
     default_cam_skew_deg: float = 0.0
 
     # Camera is offset from gripper in CAD:
-    # Camera homed = (27.8, 60.1), Gripper homed = (28.0, 6.0)
-    # Gripper relative to Camera: +0.2 mm X, -54.1 mm Y (gripper is behind camera).
-    # To center gripper over block, carriage moves (X - 0.2, Y + 54.1).
-    camera_to_gripper_offset_x_mm: float = 0.2
+    # Camera homed = (32.5, +48.1, 135.4), EE homed = (32.5, -6.0, 97.6)
+    # Camera is 54.1 mm ahead (+Y) and 37.8 mm above (+Z) EE.
+    # Therefore Gripper relative to Camera is (0.0 mm X, -54.1 mm Y).
+    camera_to_gripper_offset_x_mm: float = 0.0
     camera_to_gripper_offset_y_mm: float = -54.1
 
     # --- Calibration Fiducials (15 x 15 mm squares at the 4 corners of the 284 x 167.4 mm outer border) ---
@@ -163,16 +165,18 @@ class GantryConfig:
     calibration_step_x_mm: float = 15.0
     calibration_step_y_mm: float = 0.0
 
-    # --- Global Scan Grid Coordinates (in motor travel coordinates within reachable envelope) ---
-    # Optimized to cover full envelope X in [0, 236], Y in [0, 128] with zero blind spots:
-    # FOV width is 162.5 mm; X=30 covers [-51..111] mm, X=165 covers [84..246] mm.
-    # FOV height is 122 mm; Y=40 covers [-21..101] mm, Y=95 covers [34..156] mm.
+    # --- Global Scan Grid Coordinates (in motor travel coordinates within 227 x 128 mm envelope) ---
+    # 6-point (3x2) overlapping grid designed around the 20 mm cube top-face FOV (~139 x 104 mm at Z=0):
+    # Effective unclipped cube half-FOV (~52 mm X, ~38 mm Y) overlaps across the entire course,
+    # ensuring blocks anywhere on the course (center, right, rear, or skewed) are cleanly detected.
     scan_grid_points_mm: List[Tuple[float, float]] = field(
         default_factory=lambda: [
-            (30.0, 40.0),
-            (165.0, 40.0),
-            (165.0, 95.0),
-            (30.0, 95.0),
+            (30.0, 35.0),
+            (114.0, 35.0),
+            (197.0, 35.0),
+            (197.0, 93.0),
+            (114.0, 93.0),
+            (30.0, 93.0),
         ]
     )
 

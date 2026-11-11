@@ -225,6 +225,100 @@ class VisionPipeline:
         if ok:
             self.last_annotated_jpeg_b64 = base64.b64encode(buf).decode("ascii")
 
+    def _detect_aruco_markers_and_mask(
+        self, frame: np.ndarray
+    ) -> Tuple[tuple, Optional[np.ndarray], np.ndarray]:
+        """Detects DICT_4X4_50 markers and builds an expanded binary exclusion mask."""
+        h, w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if hasattr(cv2.aruco, "ArucoDetector"):
+            detector = cv2.aruco.ArucoDetector(self._aruco_dict, self._aruco_params)
+            corners, ids, _ = detector.detectMarkers(gray)
+        else:
+            corners, ids, _ = cv2.aruco.detectMarkers(
+                gray, self._aruco_dict, parameters=self._aruco_params
+            )
+
+        exclusion_mask = np.zeros((h, w), dtype=np.uint8)
+        if ids is not None and len(ids) > 0:
+            for c in corners:
+                pts = c[0]
+                center = pts.mean(axis=0)
+                expanded = center + 1.5 * (pts - center)
+                cv2.fillPoly(exclusion_mask, [np.int32(expanded)], 255)
+        return corners, ids, exclusion_mask
+
+    def _extract_hsv_detections(
+        self, frame: np.ndarray, exclusion_mask: Optional[np.ndarray] = None
+    ) -> List[DetectedBlock]:
+        """Runs HSV thresholding + contour geometry filtering, excluding ArUco marker regions."""
+        h, w = frame.shape[:2]
+        blurred = cv2.GaussianBlur(frame, (5, 5), 0)
+        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        detections: List[DetectedBlock] = []
+        k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        has_exclusion = exclusion_mask is not None and np.any(exclusion_mask)
+        inv_exclusion = cv2.bitwise_not(exclusion_mask) if has_exclusion else None
+
+        for color_name, hsv_cfg in self.config.hsv_ranges.items():
+            mask = cv2.inRange(
+                hsv,
+                np.array(hsv_cfg.lower1, dtype=np.uint8),
+                np.array(hsv_cfg.upper1, dtype=np.uint8),
+            )
+            if hsv_cfg.lower2 is not None and hsv_cfg.upper2 is not None:
+                mask2 = cv2.inRange(
+                    hsv,
+                    np.array(hsv_cfg.lower2, dtype=np.uint8),
+                    np.array(hsv_cfg.upper2, dtype=np.uint8),
+                )
+                mask = cv2.bitwise_or(mask, mask2)
+
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open)
+            if inv_exclusion is not None:
+                mask = cv2.bitwise_and(mask, inv_exclusion)
+
+            contours, _ = cv2.findContours(
+                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            for cnt in contours:
+                area = float(cv2.contourArea(cnt))
+                if not (self.config.min_contour_area_px <= area <= self.config.max_contour_area_px):
+                    continue
+
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                if bx <= 8 or by <= 8 or bx + bw >= w - 8 or by + bh >= h - 8:
+                    continue
+
+                rect = cv2.minAreaRect(cnt)
+                (u_px, v_px), (rw, rh), angle = rect
+                aspect = max(rw, rh) / max(1e-3, min(rw, rh))
+                if aspect > 1.65:
+                    continue
+
+                solidity = area / max(1e-3, (rw * rh))
+                if solidity < 0.60:
+                    continue
+
+                if rw < rh:
+                    angle = angle + 90.0
+                angle_deg = round(float(angle % 180.0), 1)
+                box_int = np.int32(cv2.boxPoints(rect))
+
+                detections.append(
+                    DetectedBlock(
+                        color=color_name,
+                        u_px=float(u_px),
+                        v_px=float(v_px),
+                        angle_deg=angle_deg,
+                        area_px=area,
+                        box_pts=box_int,
+                    )
+                )
+        return detections
+
     def process_live_frame(
         self, frame: np.ndarray
     ) -> Tuple[List[dict], List[DetectedBlock]]:
@@ -242,17 +336,9 @@ class VisionPipeline:
         cv2.line(annotated, (cx_img, cy_img - 20), (cx_img, cy_img + 20), (200, 200, 200), 1)
         cv2.circle(annotated, (cx_img, cy_img), 3, (255, 255, 255), -1)
 
-        # 2. Detect all standard ArUco Fiducials (DICT_4X4_50)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # 2. Detect all standard ArUco Fiducials (DICT_4X4_50) and exclusion mask
+        corners, ids, aruco_exclusion_mask = self._detect_aruco_markers_and_mask(frame)
         detected_fiducials: List[dict] = []
-
-        if hasattr(cv2.aruco, "ArucoDetector"):
-            detector = cv2.aruco.ArucoDetector(self._aruco_dict, self._aruco_params)
-            corners, ids, _ = detector.detectMarkers(gray)
-        else:
-            corners, ids, _ = cv2.aruco.detectMarkers(
-                gray, self._aruco_dict, parameters=self._aruco_params
-            )
 
         if ids is not None and len(ids) > 0:
             cv2.aruco.drawDetectedMarkers(annotated, corners, ids)
@@ -270,7 +356,6 @@ class VisionPipeline:
                     "v_px": round(v_px, 1),
                     "angle_deg": angle_deg,
                 })
-                # Draw angle orientation arrow (from center along marker forward axis)
                 rad = math.radians(angle_deg)
                 arrow_len = 35
                 ax = int(u_px + arrow_len * math.cos(rad))
@@ -278,17 +363,13 @@ class VisionPipeline:
                 cv2.arrowedLine(annotated, (int(u_px), int(v_px)), (ax, ay), (255, 128, 0), 2, tipLength=0.25)
                 cv2.circle(annotated, (int(u_px), int(v_px)), 5, (0, 255, 0), -1)
 
-                # ArUco label with dark background box for high contrast
                 lbl = f"ARUCO #{m_id} {angle_deg:+.1f}deg"
                 (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
                 lx, ly = max(5, int(u_px) - lw // 2), max(lh + 5, int(v_px) - 20)
                 cv2.rectangle(annotated, (lx - 2, ly - lh - 2), (lx + lw + 2, ly + 4), (0, 0, 0), -1)
                 cv2.putText(annotated, lbl, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
 
-        # 3. Detect all HSV Color Blocks
-        blurred = cv2.GaussianBlur(frame, (5, 5), 0)
-        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-
+        # 3. Detect all HSV Color Blocks (excluding ArUco fiducial regions)
         color_bgr_map = {
             "red": (0, 0, 255),
             "green": (0, 255, 0),
@@ -298,82 +379,23 @@ class VisionPipeline:
             "white": (255, 255, 255),
         }
 
-        detected_blocks: List[DetectedBlock] = []
-        for color_name, hsv_cfg in self.config.hsv_ranges.items():
-            mask = cv2.inRange(
-                hsv,
-                np.array(hsv_cfg.lower1, dtype=np.uint8),
-                np.array(hsv_cfg.upper1, dtype=np.uint8),
-            )
-            if hsv_cfg.lower2 is not None and hsv_cfg.upper2 is not None:
-                mask2 = cv2.inRange(
-                    hsv,
-                    np.array(hsv_cfg.lower2, dtype=np.uint8),
-                    np.array(hsv_cfg.upper2, dtype=np.uint8),
-                )
-                mask = cv2.bitwise_or(mask, mask2)
+        detected_blocks = self._extract_hsv_detections(frame, aruco_exclusion_mask)
+        for det in detected_blocks:
+            bgr = color_bgr_map.get(det.color, (255, 255, 255))
+            cv2.drawContours(annotated, [det.box_pts], 0, bgr, 2)
+            cv2.circle(annotated, (int(det.u_px), int(det.v_px)), 4, (255, 255, 255), -1)
 
-            k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-            k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open)
+            rad = math.radians(det.angle_deg)
+            arrow_len = 30
+            ax = int(det.u_px + arrow_len * math.cos(rad))
+            ay = int(det.v_px + arrow_len * math.sin(rad))
+            cv2.arrowedLine(annotated, (int(det.u_px), int(det.v_px)), (ax, ay), (0, 255, 0), 2, tipLength=0.3)
 
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            for cnt in contours:
-                area = float(cv2.contourArea(cnt))
-                if not (self.config.min_contour_area_px <= area <= self.config.max_contour_area_px):
-                    continue
-
-                # Filter out contours touching camera frame boundaries
-                bx, by, bw, bh = cv2.boundingRect(cnt)
-                if bx <= 8 or by <= 8 or bx + bw >= w - 8 or by + bh >= h - 8:
-                    continue
-
-                rect = cv2.minAreaRect(cnt)
-                (u_px, v_px), (rw, rh), raw_angle = rect
-                aspect = max(rw, rh) / max(1e-3, min(rw, rh))
-                if aspect > 1.30:
-                    continue
-
-                solidity = area / max(1e-3, (rw * rh))
-                if solidity < 0.72:
-                    continue
-
-                if rw < rh:
-                    raw_angle = raw_angle + 90.0
-                angle_deg = round(float(raw_angle % 180.0), 1)
-
-                box = cv2.boxPoints(rect)
-                box_int = np.int32(box)
-
-                det = DetectedBlock(
-                    color=color_name,
-                    u_px=float(u_px),
-                    v_px=float(v_px),
-                    angle_deg=angle_deg,
-                    area_px=area,
-                    box_pts=box_int,
-                )
-                detected_blocks.append(det)
-
-                # Draw rotated box in block color
-                bgr = color_bgr_map.get(color_name, (255, 255, 255))
-                cv2.drawContours(annotated, [box_int], 0, bgr, 2)
-                cv2.circle(annotated, (int(u_px), int(v_px)), 4, (255, 255, 255), -1)
-
-                # Draw orientation axis arrow
-                rad = math.radians(angle_deg)
-                arrow_len = 30
-                ax = int(u_px + arrow_len * math.cos(rad))
-                ay = int(v_px + arrow_len * math.sin(rad))
-                cv2.arrowedLine(annotated, (int(u_px), int(v_px)), (ax, ay), (0, 255, 0), 2, tipLength=0.3)
-
-                # Text label with background
-                lbl = f"{color_name.upper()} {angle_deg:.1f}deg"
-                (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-                lx, ly = max(5, int(u_px) - lw // 2), max(lh + 5, int(v_px) - 14)
-                cv2.rectangle(annotated, (lx - 2, ly - lh - 2), (lx + lw + 2, ly + 4), (0, 0, 0), -1)
-                cv2.putText(annotated, lbl, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+            lbl = f"{det.color.upper()} {det.angle_deg:.1f}deg"
+            (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            lx, ly = max(5, int(det.u_px) - lw // 2), max(lh + 5, int(det.v_px) - 14)
+            cv2.rectangle(annotated, (lx - 2, ly - lh - 2), (lx + lw + 2, ly + 4), (0, 0, 0), -1)
+            cv2.putText(annotated, lbl, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
         # 4. Top HUD Header Banner
         hud_text = f"LIVE CAM (~3 FPS) | Fiducials: {len(detected_fiducials)} | Blocks: {len(detected_blocks)}"
@@ -439,11 +461,7 @@ class VisionPipeline:
         Classical HSV color space thresholding + cv2.findContours() + cv2.minAreaRect()
         to extract block centroids (u, v) and rotation angles (theta).
         """
-        blurred = cv2.GaussianBlur(frame, (5, 5), 0)
-        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
-        detections: List[DetectedBlock] = []
         annotated = frame.copy()
-
         color_bgr_map = {
             "red": (0, 0, 255),
             "green": (0, 255, 0),
@@ -453,112 +471,33 @@ class VisionPipeline:
             "white": (255, 255, 255),
         }
 
-        # Draw optical crosshair
         h, w = frame.shape[:2]
         cv2.drawMarker(
             annotated, (w // 2, h // 2), (255, 255, 255), cv2.MARKER_CROSS, 20, 1
         )
 
-        # Detect ArUco fiducials to mask them out and prevent fiducial paper borders from being detected as blocks
-        gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
-        if hasattr(cv2.aruco, "ArucoDetector"):
-            detector = cv2.aruco.ArucoDetector(self._aruco_dict, self._aruco_params)
-            aruco_corners, aruco_ids, _ = detector.detectMarkers(gray)
-        else:
-            aruco_corners, aruco_ids, _ = cv2.aruco.detectMarkers(
-                gray, self._aruco_dict, parameters=self._aruco_params
+        _, _, aruco_exclusion_mask = self._detect_aruco_markers_and_mask(frame)
+        detections = self._extract_hsv_detections(frame, aruco_exclusion_mask)
+
+        for det in detections:
+            bgr = color_bgr_map.get(det.color, (255, 255, 255))
+            cv2.drawContours(annotated, [det.box_pts], 0, bgr, 2)
+            cv2.circle(annotated, (int(det.u_px), int(det.v_px)), 4, (255, 255, 255), -1)
+
+            lbl = f"{det.color.upper()} {det.angle_deg:.0f}deg"
+            (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            lx, ly = max(5, int(det.u_px) - lw // 2), max(lh + 5, int(det.v_px) - 14)
+            cv2.rectangle(annotated, (lx - 2, ly - lh - 2), (lx + lw + 2, ly + 4), (0, 0, 0), -1)
+            cv2.putText(
+                annotated,
+                lbl,
+                (lx, ly),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
             )
-
-        aruco_exclusion_mask = np.zeros((h, w), dtype=np.uint8)
-        if aruco_ids is not None and len(aruco_ids) > 0:
-            for c in aruco_corners:
-                pts = c[0]
-                center = pts.mean(axis=0)
-                expanded = center + 1.5 * (pts - center)
-                cv2.fillPoly(aruco_exclusion_mask, [np.int32(expanded)], 255)
-
-        for color_name, hsv_cfg in self.config.hsv_ranges.items():
-            mask = cv2.inRange(
-                hsv,
-                np.array(hsv_cfg.lower1, dtype=np.uint8),
-                np.array(hsv_cfg.upper1, dtype=np.uint8),
-            )
-            if hsv_cfg.lower2 is not None and hsv_cfg.upper2 is not None:
-                mask2 = cv2.inRange(
-                    hsv,
-                    np.array(hsv_cfg.lower2, dtype=np.uint8),
-                    np.array(hsv_cfg.upper2, dtype=np.uint8),
-                )
-                mask = cv2.bitwise_or(mask, mask2)
-
-            k_close = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-            k_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open)
-
-            # Exclude regions occupied by ArUco fiducials
-            if aruco_ids is not None and len(aruco_ids) > 0:
-                mask = cv2.bitwise_and(mask, cv2.bitwise_not(aruco_exclusion_mask))
-
-            contours, _ = cv2.findContours(
-                mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-
-            for cnt in contours:
-                area = float(cv2.contourArea(cnt))
-                if not (self.config.min_contour_area_px <= area <= self.config.max_contour_area_px):
-                    continue
-
-                # Filter out contours touching camera frame boundaries
-                bx, by, bw, bh = cv2.boundingRect(cnt)
-                if bx <= 8 or by <= 8 or bx + bw >= w - 8 or by + bh >= h - 8:
-                    continue
-
-                rect = cv2.minAreaRect(cnt)
-                (u_px, v_px), (rw, rh), angle = rect
-                aspect = max(rw, rh) / max(1e-3, min(rw, rh))
-                if aspect > 1.65:
-                    continue
-
-                solidity = area / max(1e-3, (rw * rh))
-                if solidity < 0.60:
-                    continue
-
-                if rw < rh:
-                    angle = angle + 90.0
-                angle_deg = float(angle % 180.0)
-
-                box = cv2.boxPoints(rect)
-                box_int = np.int32(box)
-
-                det = DetectedBlock(
-                    color=color_name,
-                    u_px=float(u_px),
-                    v_px=float(v_px),
-                    angle_deg=angle_deg,
-                    area_px=area,
-                    box_pts=box_int,
-                )
-                detections.append(det)
-
-                bgr = color_bgr_map.get(color_name, (255, 255, 255))
-                cv2.drawContours(annotated, [box_int], 0, bgr, 2)
-                cv2.circle(annotated, (int(u_px), int(v_px)), 4, (255, 255, 255), -1)
-
-                lbl = f"{color_name.upper()} {angle_deg:.0f}deg"
-                (lw, lh), _ = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-                lx, ly = max(5, int(u_px) - lw // 2), max(lh + 5, int(v_px) - 14)
-                cv2.rectangle(annotated, (lx - 2, ly - lh - 2), (lx + lw + 2, ly + 4), (0, 0, 0), -1)
-                cv2.putText(
-                    annotated,
-                    lbl,
-                    (lx, ly),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (255, 255, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
 
         self._encode_annotated_preview(annotated, f"HSV detections: {len(detections)}")
         return detections
@@ -644,7 +583,9 @@ class VisionPipeline:
             "white": (245, 245, 245),
         }
 
-        height_ratio = self.kinematics._height_ratio(camera_z_mm, self.config.z_scan_mm)
+        height_ratio = self.kinematics._height_ratio(
+            camera_z_mm, self.config.z_scan_mm, self.config.block_height_mm
+        )
         px_per_mm = 1.0 / (self.kinematics.kx_mm_per_px * height_ratio)
 
         for blk in self.simulated_blocks:
@@ -657,6 +598,7 @@ class VisionPipeline:
                 camera_y_mm,
                 camera_z_mm,
                 self.config.z_scan_mm,
+                target_height_above_surface_mm=self.config.block_height_mm,
             )
             side_px = blk.size_mm * px_per_mm
             if -side_px <= bu <= w + side_px and -side_px <= bv <= h + side_px:

@@ -34,8 +34,8 @@ class BlockRecord:
 class EyeInHandKinematics:
     """
     Handles conversions between:
-      - Motor travel coordinates (motor_x in [0..236], motor_y in [0..128], motor_z_down in [0..70.36])
-      - Fiducial Plate coordinates (plate_x in [0..284], plate_y in [0..167.4], plate_z above bed)
+      - Motor travel coordinates (motor_x in [0..227], motor_y in [0..128], motor_z_down in [0..70.36])
+      - Course/Fiducial Plate coordinates (plate_x in [0..284], plate_y in [0..167.4], plate_z above bed)
       - Camera pixel coordinates (u_px, v_px)
     """
 
@@ -46,11 +46,12 @@ class EyeInHandKinematics:
         kx_mm_per_px: float = 0.25,
         ky_mm_per_px: float = 0.25,
         cam_skew_deg: float = 0.0,
-        offset_x_mm: float = 0.2,
+        offset_x_mm: float = 0.0,
         offset_y_mm: float = -54.1,
         cam_homed_z_above_plate_mm: float = 135.4,
-        cam_origin_x_mm: float = 27.8,
-        cam_origin_y_mm: float = 60.1,
+        course_elevation_mm: float = 6.35,
+        cam_origin_x_mm: float = 32.5,
+        cam_origin_y_mm: float = 48.1,
         corner_fiducials: Optional[Dict[int, Tuple[float, float]]] = None,
     ):
         self.frame_width = frame_width
@@ -63,6 +64,7 @@ class EyeInHandKinematics:
         self.offset_x_mm = offset_x_mm
         self.offset_y_mm = offset_y_mm
         self.cam_homed_z_above_plate_mm = cam_homed_z_above_plate_mm
+        self.course_elevation_mm = course_elevation_mm
         self.cam_origin_x_mm = cam_origin_x_mm
         self.cam_origin_y_mm = cam_origin_y_mm
         self.corner_fiducials = corner_fiducials or {
@@ -74,13 +76,20 @@ class EyeInHandKinematics:
         self.calibrated = False
         self.origin_calibrated = False
 
-    def _height_ratio(self, z_down_mm: float, z_scan_down_mm: float = 0.0) -> float:
+    def _height_ratio(
+        self,
+        z_down_mm: float,
+        z_scan_down_mm: float = 0.0,
+        target_height_above_surface_mm: float = 0.0,
+    ) -> float:
         """
-        Since Z=0 is at the TOP when homed (camera 135.4 mm above plate) and +Z moves DOWNWARD,
-        camera height above plate = (135.4 - z_down_mm).
+        Since Z=0 is at the TOP when homed (camera 135.4 mm above plate, 129.05 mm above elevated course)
+        and +Z_down moves DOWNWARD, camera distance to the target plane (e.g. +20.0 mm top face of a cube)
+        is (cam_homed_z - course_elevation - z_down_mm - target_height_above_surface_mm).
         """
-        cam_h_now = max(25.0, self.cam_homed_z_above_plate_mm - z_down_mm)
-        cam_h_scan = max(25.0, self.cam_homed_z_above_plate_mm - z_scan_down_mm)
+        cam_above_course = self.cam_homed_z_above_plate_mm - self.course_elevation_mm
+        cam_h_now = max(25.0, cam_above_course - z_down_mm - target_height_above_surface_mm)
+        cam_h_scan = max(25.0, cam_above_course - z_scan_down_mm)
         return cam_h_now / cam_h_scan
 
     def compute_auto_scale(
@@ -92,18 +101,18 @@ class EyeInHandKinematics:
         delta_x_mm: float,
         delta_y_mm: float,
     ) -> Tuple[float, float]:
-        du = abs(u2_px - u1_px)
-        dv = abs(v2_px - v1_px)
-        if du < 5.0 and dv < 5.0:
+        # Use rotation-invariant Euclidean pixel shift so camera housing tilt (cam_skew_deg)
+        # does not inflate Kx/Ky by 1/cos(skew).
+        disp_px = math.hypot(u2_px - u1_px, v2_px - v1_px)
+        step_mm = math.hypot(delta_x_mm, delta_y_mm)
+        if disp_px < 5.0:
             raise ValueError(
-                f"Fiducial pixel shift too small for calibration (du={du:.1f}, dv={dv:.1f})."
+                f"Fiducial pixel shift too small for calibration (disp={disp_px:.1f} px)."
             )
-        if du >= 5.0 and abs(delta_x_mm) > 0.0:
-            self.kx_mm_per_px = abs(delta_x_mm) / du
-        if dv >= 5.0 and abs(delta_y_mm) > 0.0:
-            self.ky_mm_per_px = abs(delta_y_mm) / dv
-        elif du >= 5.0 and abs(delta_x_mm) > 0.0:
-            self.ky_mm_per_px = self.kx_mm_per_px
+        if step_mm > 0.0:
+            scale = step_mm / disp_px
+            self.kx_mm_per_px = scale
+            self.ky_mm_per_px = scale
         self.calibrated = True
         return self.kx_mm_per_px, self.ky_mm_per_px
 
@@ -160,13 +169,17 @@ class EyeInHandKinematics:
         motor_y_mm: float,
         z_current_mm: float = 0.0,
         z_scan_mm: float = 0.0,
+        target_height_above_surface_mm: float = 0.0,
     ) -> Tuple[float, float]:
         """
         Converts pixel coordinates (u, v) captured at motor position (motor_x, motor_y)
         into true Plate Coordinates (mm wrt fiducial plate origin 0,0).
-        Applies height-scaling and 2D rotation compensation for physical camera housing skew.
+        Applies height-scaling (including block top-face height above course surface)
+        and 2D rotation compensation for physical camera housing skew.
         """
-        height_ratio = self._height_ratio(z_current_mm, z_scan_mm)
+        height_ratio = self._height_ratio(
+            z_current_mm, z_scan_mm, target_height_above_surface_mm
+        )
         kx = self.kx_mm_per_px * height_ratio
         ky = self.ky_mm_per_px * height_ratio
 
@@ -198,12 +211,15 @@ class EyeInHandKinematics:
         motor_y_mm: float,
         z_current_mm: float = 0.0,
         z_scan_mm: float = 0.0,
+        target_height_above_surface_mm: float = 0.0,
     ) -> Tuple[float, float]:
         """
         Projects Plate Coordinates (mm) back to pixel coordinates (u, v)
         for a given motor carriage position, inverting the camera skew rotation.
         """
-        height_ratio = self._height_ratio(z_current_mm, z_scan_mm)
+        height_ratio = self._height_ratio(
+            z_current_mm, z_scan_mm, target_height_above_surface_mm
+        )
         kx = self.kx_mm_per_px * height_ratio
         ky = self.ky_mm_per_px * height_ratio
 
@@ -281,8 +297,9 @@ class WorldCatalogAndPlanner:
                 n = b.confidence_views
                 b.x_mm = (b.x_mm * n + x_mm) / (n + 1)
                 b.y_mm = (b.y_mm * n + y_mm) / (n + 1)
-                # Angle wrap-around handling for 180-degree periodic orientation
-                angle_diff = (angle_deg - b.angle_deg + 90.0) % 180.0 - 90.0
+                # Angle wrap-around handling for 90-degree symmetric square blocks
+                # Prevents averaging 28 deg and 118 deg (same cube) into a 73 deg diagonal error
+                angle_diff = (angle_deg - b.angle_deg + 45.0) % 90.0 - 45.0
                 b.angle_deg = (b.angle_deg + angle_diff / (n + 1)) % 180.0
                 b.confidence_views = n + 1
                 return b
