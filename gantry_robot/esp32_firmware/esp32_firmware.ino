@@ -133,8 +133,8 @@ const float TRAVEL_Y_MM = 128.0f;
 const float TRAVEL_Z_MM = 76.7f;
 
 // Safe pull-away distances before homing so axes against bumpers have runway to accelerate beyond blanking
-const float HOME_BACKOFF_MM_XZ = 5.0f;
-const float HOME_BACKOFF_MM_Y  = 30.0f;
+const float HOME_BACKOFF_MM_XZ = 8.0f;
+const float HOME_BACKOFF_MM_Y  = 25.0f;
 const unsigned long HOME_PRE_SETTLE_MS = 50;
 
 // Per-axis cap applied to MOVE feedrates (microsteps/s). StallGuard thresholds are only valid near the speed they
@@ -817,12 +817,8 @@ bool setupAll(bool quietProtocol) {
     Serial.println("-> Setting up steppers...");
   }
 
-  // Pulse PIN_EN HIGH briefly when re-enabling so TMC2209 drivers reset StallGuard/StealthChop tuning cleanly.
-  if (digitalRead(PIN_EN) == LOW) {
-    digitalWrite(PIN_EN, HIGH);
-    delay(20);
-  }
-  digitalWrite(PIN_EN, LOW);           // Enable drivers
+  bool wasDisabled = (digitalRead(PIN_EN) == HIGH);
+  digitalWrite(PIN_EN, LOW);           // Enable drivers (without dropping hold current if already enabled)
 
   int readyCount = 0;
   for (int i = 0; i < NUM_AXES; i++) {
@@ -837,10 +833,10 @@ bool setupAll(bool quietProtocol) {
     return false;
   }
 
-  // Let StealthChop AT#1 (standstill current regulation) settle before StallGuard-dependent motion.
-  // Without this, a HOME right after re-enabling (e.g. after a stall/ESTOP put the drivers to sleep)
-  // started homing on an untuned driver.
-  delay(DRIVER_ENABLE_SETTLE_MS);
+  // Let StealthChop AT#1 (standstill current regulation) settle only when waking from disabled state.
+  if (wasDisabled) {
+    delay(DRIVER_ENABLE_SETTLE_MS);
+  }
 
   if (!quietProtocol) {
     Serial.print("-> Setup done: ");
@@ -1084,9 +1080,9 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
   bool towardOrigin = (reverse == axis.homeReverse);
 
   // --- Safe Pre-Homing Pull-Away ---
-  // Pull away if unhomed, or on Y if within 35 mm of the origin stop so the 30 mm backoff always clears 350 ms blanking.
+  // Pull away if unhomed, or on Y if within 28 mm of the origin stop so backoff always clears 350 ms blanking.
   // If already homed beyond that clearance, skip pull-away so it never drives toward the far end!
-  float minClearMm = (axis.coordCode == 'Y') ? 35.0f : axis.homeBackoffMm;
+  float minClearMm = (axis.coordCode == 'Y') ? 28.0f : axis.homeBackoffMm;
   bool needsBackoff = !axis.homed ||
                       (towardOrigin && stepper->currentPosition() < (long)(minClearMm * axis.stepsPerMm));
   if (withBackoff && axis.homeBackoffMm > 0.0f && needsBackoff) {
@@ -1157,16 +1153,16 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
       stepper->setSpeed(dirSign * axis.homeSpeed);
     }
 
-    // Check DIAG with debouncing after blanking window (350 ms)
+    // Check DIAG with short debouncing after blanking window (350 ms) to stop promptly with minimal endstop buzz
     if (elapsed > HOMING_BLANKING_MS) {
       if (digitalRead(axis.diagPin) == HIGH) {
         if (diagFirstHighMs == 0) {
           diagFirstHighMs = nowMs | 1UL;
-        } else if ((nowMs - diagFirstHighMs) >= 12) {
+        } else if ((nowMs - diagFirstHighMs) >= 2) {
           outcome = HOMED;
         }
       } else {
-        if (diagFirstHighMs != 0 && (nowMs - diagFirstHighMs > 25)) {
+        if (diagFirstHighMs != 0 && (nowMs - diagFirstHighMs > 10)) {
           diagFirstHighMs = 0; // noise glitch cleared
         }
       }

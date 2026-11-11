@@ -289,7 +289,7 @@ class VisionPipeline:
                     continue
 
                 bx, by, bw, bh = cv2.boundingRect(cnt)
-                if bx <= 8 or by <= 8 or bx + bw >= w - 8 or by + bh >= h - 8:
+                if bx <= 3 or by <= 3 or bx + bw >= w - 3 or by + bh >= h - 3:
                     continue
 
                 rect = cv2.minAreaRect(cnt)

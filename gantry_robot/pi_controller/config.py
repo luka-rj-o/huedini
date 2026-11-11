@@ -166,17 +166,17 @@ class GantryConfig:
     calibration_step_y_mm: float = 0.0
 
     # --- Global Scan Grid Coordinates (in motor travel coordinates within 227 x 128 mm envelope) ---
-    # 6-point (3x2) overlapping grid designed around the 20 mm cube top-face FOV (~139 x 104 mm at Z=0):
-    # Effective unclipped cube half-FOV (~52 mm X, ~38 mm Y) overlaps across the entire course,
-    # ensuring blocks anywhere on the course (center, right, rear, or skewed) are cleanly detected.
+    # 6-point (3x2) overlapping grid shifted further back in Y (0.0 and 58.0 mm) because camera is +54.1 mm ahead of EE:
+    # With Cam Y origin ~48.1..61.3 mm and 20 mm cube top-face FOV (~135 x 101 mm at Z=0):
+    # Y=0 covers back edge (Cam Y ~48..61 mm -> Y[10..99] mm), Y=58 covers front edge (Cam Y ~106..119 mm -> Y[68..157] mm).
     scan_grid_points_mm: List[Tuple[float, float]] = field(
         default_factory=lambda: [
-            (30.0, 35.0),
-            (114.0, 35.0),
-            (197.0, 35.0),
-            (197.0, 93.0),
-            (114.0, 93.0),
-            (30.0, 93.0),
+            (20.0, 58.0),
+            (108.0, 58.0),
+            (196.0, 58.0),
+            (196.0, 0.0),
+            (108.0, 0.0),
+            (20.0, 0.0),
         ]
     )
 

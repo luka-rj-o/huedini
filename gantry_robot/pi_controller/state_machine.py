@@ -719,19 +719,21 @@ class GantryStateMachine:
                     f"Proceeding with coarse scan coordinates ({block.x_mm:.1f}, {block.y_mm:.1f}) mm."
                 )
 
-            # Translate plate coordinate to gripper center target & rotate 9g servo to block angle
+            # Translate plate coordinate to gripper center target & fold square block grasp angle into [0..90 deg)
+            # so wrist servo + zero trim stays clear of its 180 deg mechanical end-stop.
             grip_mx, grip_my = self.kinematics.plate_to_gripper_motor(block.x_mm, block.y_mm)
             grip_mx = max(0.0, min(self.config.travel_x_mm, grip_mx))
             grip_my = max(0.0, min(self.config.travel_y_mm, grip_my))
+            servo_angle = round(block.angle_deg % 90.0, 1)
             pick_record.gripper_motor_x = round(grip_mx, 2)
             pick_record.gripper_motor_y = round(grip_my, 2)
-            pick_record.servo_angle_deg = round(block.angle_deg, 1)
+            pick_record.servo_angle_deg = servo_angle
 
             self.serial.move_to(
                 x_mm=grip_mx,
                 y_mm=grip_my,
                 z_mm=self.config.z_hover_mm,
-                angle_deg=block.angle_deg,
+                angle_deg=servo_angle,
                 feedrate_mm_s=self.config.feedrate_fine_mm_s,
             )
 
