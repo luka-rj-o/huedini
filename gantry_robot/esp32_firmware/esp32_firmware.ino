@@ -83,7 +83,7 @@ const float DEFAULT_ACCEL_XZ      = 2000.0f; // 10.0 mm/s^2 on 2mm lead screw
 const float DEFAULT_HOME_SPEED_XZ = 800.0f;  // 4.0 mm/s on 2mm lead screw (calibrated for healthy back-EMF)
 
 const float DEFAULT_MAX_SPEED_Y   = 700.0f;  // 70.0 mm/s on 40mm/rev GT2 20T belt
-const float DEFAULT_ACCEL_Y       = 1000.0f; // 100.0 mm/s^2 on 40mm/rev GT2 20T belt
+const float DEFAULT_ACCEL_Y       = 750.0f;  // 75.0 mm/s^2 on 40mm/rev GT2 20T belt (smooth starts/stops, low belt twang)
 const float DEFAULT_HOME_SPEED_Y  = 700.0f;  // 70.0 mm/s (1.75 rev/s for healthy back-EMF)
 
 const int   DEFAULT_HOME_SENS     = 60;      // Homing sensitivity threshold for X and Z lead screws (SGTHRS=60)
@@ -113,8 +113,8 @@ const bool INVERT_DIR_Y = true;
 const bool INVERT_DIR_Z = false;
 
 // Load cell calibrated scale factor (raw counts per gram):
-// Calibrated using 21.6 g aluminum cube after empty tare (12.50 g avg at old 1179.0 -> 1179.0 * 12.50 / 21.6 = 682.3).
-float hx711ScaleFactor = 682.3f;
+// Calibrated using 21.6 g aluminum cube after empty tare (19.92 g avg at 682.3 -> 682.3 * 19.92 / 21.6 = 629.2).
+float hx711ScaleFactor = 629.2f;
 
 // Solenoid gripper relay logic:
 // Because the solenoid is wired Normally Closed (NC):
@@ -123,8 +123,8 @@ float hx711ScaleFactor = 682.3f;
 // If your mechanical linkage works in the opposite sense, toggle `gripOpenRelayHigh`.
 bool gripOpenRelayHigh = true;
 
-const unsigned long HOMING_RAMP_MS     = 250;    // Smooth linear acceleration ramp (250ms)
-const unsigned long HOMING_BLANKING_MS = 350;    // Ignore DIAG during ramp & initial settle (350ms)
+const unsigned long HOMING_RAMP_MS     = 350;    // Smooth linear acceleration ramp (350ms, matches early 4277325 tuning)
+const unsigned long HOMING_BLANKING_MS = 450;    // Ignore DIAG during 350ms ramp + 100ms steady cruise settle
 const unsigned long HOMING_TIMEOUT_MS  = 30000;  // minimum homing timeout; the real per-axis timeout scales with
                                                  // stroke/homeSpeed (X needs ~60 s for a full 236 mm stroke at 4 mm/s)
 
@@ -133,9 +133,9 @@ const float TRAVEL_X_MM = 236.0f;
 const float TRAVEL_Y_MM = 128.0f;
 const float TRAVEL_Z_MM = 84.0f;
 
-// Safe pull-away distances before homing so axes against bumpers have runway to accelerate
-const float HOME_BACKOFF_MM_XZ = 5.0f;
-const float HOME_BACKOFF_MM_Y  = 15.0f;
+// Safe pull-away distances before homing so axes against bumpers have runway to clear blanking before contact
+const float HOME_BACKOFF_MM_XZ = 8.0f;
+const float HOME_BACKOFF_MM_Y  = 25.0f;
 const unsigned long HOME_PRE_SETTLE_MS = 50;
 
 // Per-axis cap applied to MOVE feedrates (microsteps/s). StallGuard thresholds are only valid near the speed they
@@ -1136,8 +1136,8 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
     unsigned long nowMs = millis();
     unsigned long elapsed = nowMs - startMs;
 
-    // Smooth linear ramp over HOMING_RAMP_MS (250 ms) directly to full homing speed
-    if (elapsed <= HOMING_RAMP_MS && (nowMs - lastRampMs) >= 5) {
+    // Smooth linear ramp over HOMING_RAMP_MS (350 ms, 10 ms cadence) directly to full homing speed
+    if (elapsed <= HOMING_RAMP_MS && (nowMs - lastRampMs) >= 10) {
       lastRampMs = nowMs;
       float frac = (float)elapsed / (float)HOMING_RAMP_MS;
       float curSpd = startSpeed + frac * (axis.homeSpeed - startSpeed);
@@ -1146,16 +1146,16 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
       stepper->setSpeed(dirSign * axis.homeSpeed);
     }
 
-    // Check DIAG with debouncing after blanking window (350 ms)
+    // Check DIAG with tight 2 ms debouncing after blanking window (450 ms) to stop promptly without endstop buzz
     if (elapsed > HOMING_BLANKING_MS) {
       if (digitalRead(axis.diagPin) == HIGH) {
         if (diagFirstHighMs == 0) {
           diagFirstHighMs = nowMs | 1UL;
-        } else if ((nowMs - diagFirstHighMs) >= 12) {
+        } else if ((nowMs - diagFirstHighMs) >= 2) {
           outcome = HOMED;
         }
       } else {
-        if (diagFirstHighMs != 0 && (nowMs - diagFirstHighMs > 25)) {
+        if (diagFirstHighMs != 0 && (nowMs - diagFirstHighMs > 10)) {
           diagFirstHighMs = 0; // noise glitch cleared
         }
       }
