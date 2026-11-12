@@ -124,7 +124,7 @@ float hx711ScaleFactor = 629.2f;
 bool gripOpenRelayHigh = true;
 
 const unsigned long HOMING_RAMP_MS     = 250;    // Smooth linear acceleration ramp (250ms)
-const unsigned long HOMING_BLANKING_MS = 350;    // Ignore DIAG during ramp & initial settle (350ms = 16.75mm on Y, 3.80mm on XZ)
+const unsigned long HOMING_BLANKING_MS = 350;    // Ignore DIAG during ramp & initial settle (350ms)
 const unsigned long HOMING_TIMEOUT_MS  = 30000;  // minimum homing timeout; the real per-axis timeout scales with
                                                  // stroke/homeSpeed (X needs ~60 s for a full 227 mm stroke at 4 mm/s)
 
@@ -133,9 +133,9 @@ const float TRAVEL_X_MM = 227.0f;
 const float TRAVEL_Y_MM = 128.0f;
 const float TRAVEL_Z_MM = 76.7f;
 
-// Safe pull-away distances before homing so axes against bumpers have runway to clear blanking before contact
+// Safe pull-away distances before homing so axes against bumpers have runway to accelerate
 const float HOME_BACKOFF_MM_XZ = 5.0f;
-const float HOME_BACKOFF_MM_Y  = 28.0f;
+const float HOME_BACKOFF_MM_Y  = 15.0f;
 const unsigned long HOME_PRE_SETTLE_MS = 50;
 
 // Per-axis cap applied to MOVE feedrates (microsteps/s). StallGuard thresholds are only valid near the speed they
@@ -872,12 +872,6 @@ bool setupAxis(Axis& axis) {
   axis.driver->intpol(true);           // Enable TMC2209 internal 256x microstep interpolation for silent, smooth motion
   axis.driver->TCOOLTHRS(0xFFFFF);     // Enable StallGuard/DIAG at all speeds above ~0
 
-  // Restore default maxSpeed and acceleration so prior MOVE feedrate caps never taint SETUP/HOME
-  axis.maxSpeed     = (axis.coordCode == 'Y') ? DEFAULT_MAX_SPEED_Y : DEFAULT_MAX_SPEED_XZ;
-  axis.acceleration = (axis.coordCode == 'Y') ? DEFAULT_ACCEL_Y     : DEFAULT_ACCEL_XZ;
-  axis.stepper->setMaxSpeed(axis.maxSpeed);
-  axis.stepper->setAcceleration(axis.acceleration);
-
   // User-facing defaults
   axis.driver->rms_current(axis.currentMa);
   axis.driver->microsteps(axis.microsteps);   // was SETUP_MICROSTEPS: silently undid "s1 m<n>" while stepsPerMm kept the new value
@@ -1080,10 +1074,10 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
   bool towardOrigin = (reverse == axis.homeReverse);
 
   // --- Safe Pre-Homing Pull-Away ---
-  // Pull away if unhomed, or if homed within backoff distance of the origin stop so Y always clears the 16.75 mm (350 ms) blanking window.
-  // If already homed beyond that clearance (e.g. parked at Y=30 mm), skip pull-away so it never drives toward the far end!
+  // Only pull away if unhomed, or if homed but sitting right against the bumper (< backoff distance).
+  // If already homed and positioned out on the axis, skip pull-away so it never drives toward the far end!
   bool needsBackoff = !axis.homed ||
-                      (towardOrigin && stepper->currentPosition() < lroundf(axis.homeBackoffMm * axis.stepsPerMm));
+                      (towardOrigin && stepper->currentPosition() < (long)(axis.homeBackoffMm * axis.stepsPerMm));
   if (withBackoff && axis.homeBackoffMm > 0.0f && needsBackoff) {
     long backoffSteps = lroundf(axis.homeBackoffMm * axis.stepsPerMm);
     long awaySign = reverse ? 1 : -1;     // opposite to the homing direction
@@ -1095,15 +1089,10 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
     Serial.println(" mm before homing.");
 
     float savedMax = axis.maxSpeed;
-    int savedMoveSens = axis.moveSensitivity;
     axis.maxSpeed = axis.homeSpeed;
-    axis.moveSensitivity = 0;
-    axis.driver->SGTHRS(0);
     stepper->setMaxSpeed(axis.maxSpeed);
     MotionResult r = runAxisTo(axis, target);
     axis.maxSpeed = savedMax;
-    axis.moveSensitivity = savedMoveSens;
-    axis.driver->SGTHRS(savedMoveSens);
     stepper->setMaxSpeed(savedMax);
 
     if (r == MOTION_CANCELLED) {
@@ -1111,7 +1100,7 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
       Serial.print("-> "); Serial.print(axis.name); Serial.println(" homing cancelled.");
       return false;
     }
-    delay(HOME_PRE_SETTLE_MS);
+    delay(20);
   }
 
   unsigned long timeoutMs = homingTimeoutMs(axis, false);
@@ -1138,8 +1127,7 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
   unsigned long startMs = millis();
   unsigned long lastRampMs = startMs;
   unsigned long lastWdtYieldMs = startMs;
-  bool diagHighActive = false;
-  unsigned long diagHighStartUs = 0;
+  unsigned long diagFirstHighMs = 0;
 
   while (outcome == RUNNING) {
     yieldWdt(lastWdtYieldMs);
@@ -1158,20 +1146,18 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
       stepper->setSpeed(dirSign * axis.homeSpeed);
     }
 
-    // Check DIAG after blanking window (350 ms).
-    // Confirm DIAG is HIGH for >= 150 us to reject sub-microsecond EMI spikes while halting within < 1/9th of a step
-    // (before any extra step pulse can cause pole-slipping or buzzing against the bumper).
+    // Check DIAG with debouncing after blanking window (350 ms)
     if (elapsed > HOMING_BLANKING_MS) {
       if (digitalRead(axis.diagPin) == HIGH) {
-        unsigned long nowUs = micros();
-        if (!diagHighActive) {
-          diagHighActive = true;
-          diagHighStartUs = nowUs;
-        } else if ((nowUs - diagHighStartUs) >= 150) {
+        if (diagFirstHighMs == 0) {
+          diagFirstHighMs = (nowMs == 0) ? 1UL : nowMs;
+        } else if ((nowMs - diagFirstHighMs) >= 12) {
           outcome = HOMED;
         }
       } else {
-        diagHighActive = false;
+        if (diagFirstHighMs != 0 && (nowMs - diagFirstHighMs > 25)) {
+          diagFirstHighMs = 0; // noise glitch cleared
+        }
       }
     }
 
