@@ -872,6 +872,12 @@ bool setupAxis(Axis& axis) {
   axis.driver->intpol(true);           // Enable TMC2209 internal 256x microstep interpolation for silent, smooth motion
   axis.driver->TCOOLTHRS(0xFFFFF);     // Enable StallGuard/DIAG at all speeds above ~0
 
+  // Restore default maxSpeed and acceleration so prior MOVE feedrate caps never taint SETUP/HOME
+  axis.maxSpeed     = (axis.coordCode == 'Y') ? DEFAULT_MAX_SPEED_Y : DEFAULT_MAX_SPEED_XZ;
+  axis.acceleration = (axis.coordCode == 'Y') ? DEFAULT_ACCEL_Y     : DEFAULT_ACCEL_XZ;
+  axis.stepper->setMaxSpeed(axis.maxSpeed);
+  axis.stepper->setAcceleration(axis.acceleration);
+
   // User-facing defaults
   axis.driver->rms_current(axis.currentMa);
   axis.driver->microsteps(axis.microsteps);   // was SETUP_MICROSTEPS: silently undid "s1 m<n>" while stepsPerMm kept the new value
@@ -1090,7 +1096,7 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
   // Only pull away if unhomed, or if homed but sitting right against the bumper (< backoff distance).
   // If already homed and positioned out on the axis, skip pull-away so it never drives toward the far end!
   bool needsBackoff = !axis.homed ||
-                      (towardOrigin && stepper->currentPosition() < (long)(axis.homeBackoffMm * axis.stepsPerMm));
+                      (towardOrigin && stepper->currentPosition() < lroundf(axis.homeBackoffMm * axis.stepsPerMm));
   if (withBackoff && axis.homeBackoffMm > 0.0f && needsBackoff) {
     long backoffSteps = lroundf(axis.homeBackoffMm * axis.stepsPerMm);
     long awaySign = reverse ? 1 : -1;     // opposite to the homing direction
@@ -1102,10 +1108,15 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
     Serial.println(" mm before homing.");
 
     float savedMax = axis.maxSpeed;
+    int savedMoveSens = axis.moveSensitivity;
     axis.maxSpeed = axis.homeSpeed;
+    axis.moveSensitivity = 0;
+    axis.driver->SGTHRS(0);
     stepper->setMaxSpeed(axis.maxSpeed);
     MotionResult r = runAxisTo(axis, target);
     axis.maxSpeed = savedMax;
+    axis.moveSensitivity = savedMoveSens;
+    axis.driver->SGTHRS(savedMoveSens);
     stepper->setMaxSpeed(savedMax);
 
     if (r == MOTION_CANCELLED) {
@@ -1113,7 +1124,7 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
       Serial.print("-> "); Serial.print(axis.name); Serial.println(" homing cancelled.");
       return false;
     }
-    delay(20);
+    delay(HOME_PRE_SETTLE_MS);
   }
 
   unsigned long timeoutMs = homingTimeoutMs(axis, false);
@@ -1141,6 +1152,8 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
   unsigned long lastRampMs = startMs;
   unsigned long lastWdtYieldMs = startMs;
   unsigned long diagFirstHighMs = 0;
+  bool diagHighActive = false;
+  unsigned long diagHighStartUs = 0;
   // Y belt pulley shows a 2-full-step SG_RESULT square wave (~10..180); track a 60 ms rolling peak via
   // non-blocking UART polling so bumper impact (peak drops <= 104 from 126..144) triggers cleanly with zero step jitter.
   const int Y_SG_WINDOW = 12;
@@ -1205,17 +1218,33 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
       }
     }
 
-    // Check DIAG with debouncing after blanking window (350 ms)
+    // Check DIAG after blanking window (350 ms).
+    // X/Z lead screws emit brief (~2.8 ms) DIAG pulses at SGTHRS=60 on bumper impact, so confirm >= 150 us
+    // to reject EMI spikes while stopping immediately; keep Y on 12 ms fallback alongside 60 ms SG_RESULT peak.
     if (outcome == RUNNING && elapsed > HOMING_BLANKING_MS) {
-      if (digitalRead(axis.diagPin) == HIGH) {
-        if (diagFirstHighMs == 0) {
-          diagFirstHighMs = (nowMs == 0) ? 1UL : nowMs;
-        } else if ((nowMs - diagFirstHighMs) >= 12) {
-          outcome = HOMED;
+      if (axis.coordCode != 'Y') {
+        if (digitalRead(axis.diagPin) == HIGH) {
+          unsigned long nowUs = micros();
+          if (!diagHighActive) {
+            diagHighActive = true;
+            diagHighStartUs = nowUs;
+          } else if ((nowUs - diagHighStartUs) >= 150) {
+            outcome = HOMED;
+          }
+        } else {
+          diagHighActive = false;
         }
       } else {
-        if (diagFirstHighMs != 0 && (nowMs - diagFirstHighMs > 25)) {
-          diagFirstHighMs = 0; // noise glitch cleared
+        if (digitalRead(axis.diagPin) == HIGH) {
+          if (diagFirstHighMs == 0) {
+            diagFirstHighMs = (nowMs == 0) ? 1UL : nowMs;
+          } else if ((nowMs - diagFirstHighMs) >= 12) {
+            outcome = HOMED;
+          }
+        } else {
+          if (diagFirstHighMs != 0 && (nowMs - diagFirstHighMs > 25)) {
+            diagFirstHighMs = 0; // noise glitch cleared
+          }
         }
       }
     }
