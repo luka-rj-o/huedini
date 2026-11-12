@@ -83,7 +83,7 @@ const float DEFAULT_ACCEL_XZ      = 2000.0f; // 10.0 mm/s^2 on 2mm lead screw
 const float DEFAULT_HOME_SPEED_XZ = 800.0f;  // 4.0 mm/s on 2mm lead screw (calibrated for healthy back-EMF)
 
 const float DEFAULT_MAX_SPEED_Y   = 700.0f;  // 70.0 mm/s on 40mm/rev GT2 20T belt
-const float DEFAULT_ACCEL_Y       = 750.0f;  // 75.0 mm/s^2 on 40mm/rev GT2 20T belt (smooth starts/stops, low belt twang)
+const float DEFAULT_ACCEL_Y       = 1000.0f; // 100.0 mm/s^2 on 40mm/rev GT2 20T belt
 const float DEFAULT_HOME_SPEED_Y  = 700.0f;  // 70.0 mm/s (1.75 rev/s for healthy back-EMF)
 
 const int   DEFAULT_HOME_SENS     = 60;      // Homing sensitivity threshold for X and Z lead screws (SGTHRS=60)
@@ -123,19 +123,19 @@ float hx711ScaleFactor = 629.2f;
 // If your mechanical linkage works in the opposite sense, toggle `gripOpenRelayHigh`.
 bool gripOpenRelayHigh = true;
 
-const unsigned long HOMING_RAMP_MS     = 350;    // Smooth linear acceleration ramp (350ms, matches early 4277325 tuning)
-const unsigned long HOMING_BLANKING_MS = 450;    // Ignore DIAG during 350ms ramp + 100ms steady cruise settle
+const unsigned long HOMING_RAMP_MS     = 250;    // Smooth linear acceleration ramp (250ms)
+const unsigned long HOMING_BLANKING_MS = 350;    // Ignore DIAG during ramp & initial settle (350ms = 16.75mm on Y, 3.80mm on XZ)
 const unsigned long HOMING_TIMEOUT_MS  = 30000;  // minimum homing timeout; the real per-axis timeout scales with
-                                                 // stroke/homeSpeed (X needs ~60 s for a full 236 mm stroke at 4 mm/s)
+                                                 // stroke/homeSpeed (X needs ~60 s for a full 227 mm stroke at 4 mm/s)
 
 // Physical strokes from the homed origin (mm). Used for MOVE soft limits and forward-homing position.
-const float TRAVEL_X_MM = 236.0f;
+const float TRAVEL_X_MM = 227.0f;
 const float TRAVEL_Y_MM = 128.0f;
-const float TRAVEL_Z_MM = 84.0f;
+const float TRAVEL_Z_MM = 76.7f;
 
 // Safe pull-away distances before homing so axes against bumpers have runway to clear blanking before contact
-const float HOME_BACKOFF_MM_XZ = 8.0f;
-const float HOME_BACKOFF_MM_Y  = 25.0f;
+const float HOME_BACKOFF_MM_XZ = 5.0f;
+const float HOME_BACKOFF_MM_Y  = 28.0f;
 const unsigned long HOME_PRE_SETTLE_MS = 50;
 
 // Per-axis cap applied to MOVE feedrates (microsteps/s). StallGuard thresholds are only valid near the speed they
@@ -872,6 +872,12 @@ bool setupAxis(Axis& axis) {
   axis.driver->intpol(true);           // Enable TMC2209 internal 256x microstep interpolation for silent, smooth motion
   axis.driver->TCOOLTHRS(0xFFFFF);     // Enable StallGuard/DIAG at all speeds above ~0
 
+  // Restore default maxSpeed and acceleration so prior MOVE feedrate caps never taint SETUP/HOME
+  axis.maxSpeed     = (axis.coordCode == 'Y') ? DEFAULT_MAX_SPEED_Y : DEFAULT_MAX_SPEED_XZ;
+  axis.acceleration = (axis.coordCode == 'Y') ? DEFAULT_ACCEL_Y     : DEFAULT_ACCEL_XZ;
+  axis.stepper->setMaxSpeed(axis.maxSpeed);
+  axis.stepper->setAcceleration(axis.acceleration);
+
   // User-facing defaults
   axis.driver->rms_current(axis.currentMa);
   axis.driver->microsteps(axis.microsteps);   // was SETUP_MICROSTEPS: silently undid "s1 m<n>" while stepsPerMm kept the new value
@@ -1005,7 +1011,7 @@ bool isStalled(Axis& axis) {
     return false;
   }
   if (axis.cruiseSinceMs == 0) {
-    axis.cruiseSinceMs = nowMs | 1UL;   // never store 0 (sentinel)
+    axis.cruiseSinceMs = (nowMs == 0) ? 1UL : nowMs; // never store 0 (sentinel), avoid |1UL underflow on even ms
     return false;
   }
   if (nowMs - axis.cruiseSinceMs < axis.stallSettleMs) return false;
@@ -1014,7 +1020,7 @@ bool isStalled(Axis& axis) {
 
   // Require a second DIAG HIGH sample >= 1 ms after the first one, within STALL_CONFIRM_WINDOW_MS
   if (axis.diagFirstHighMs == 0 || nowMs - axis.diagFirstHighMs > STALL_CONFIRM_WINDOW_MS) {
-    axis.diagFirstHighMs = nowMs | 1UL;
+    axis.diagFirstHighMs = (nowMs == 0) ? 1UL : nowMs;
     return false;
   }
   return (nowMs - axis.diagFirstHighMs) >= 1;
@@ -1074,10 +1080,10 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
   bool towardOrigin = (reverse == axis.homeReverse);
 
   // --- Safe Pre-Homing Pull-Away ---
-  // Only pull away if unhomed, or if homed but sitting right against the bumper (< backoff distance).
-  // If already homed and positioned out on the axis, skip pull-away so it never drives toward the far end!
+  // Pull away if unhomed, or if homed within backoff distance of the origin stop so Y always clears the 16.75 mm (350 ms) blanking window.
+  // If already homed beyond that clearance (e.g. parked at Y=30 mm), skip pull-away so it never drives toward the far end!
   bool needsBackoff = !axis.homed ||
-                      (towardOrigin && stepper->currentPosition() < (long)(axis.homeBackoffMm * axis.stepsPerMm));
+                      (towardOrigin && stepper->currentPosition() < lroundf(axis.homeBackoffMm * axis.stepsPerMm));
   if (withBackoff && axis.homeBackoffMm > 0.0f && needsBackoff) {
     long backoffSteps = lroundf(axis.homeBackoffMm * axis.stepsPerMm);
     long awaySign = reverse ? 1 : -1;     // opposite to the homing direction
@@ -1089,10 +1095,15 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
     Serial.println(" mm before homing.");
 
     float savedMax = axis.maxSpeed;
+    int savedMoveSens = axis.moveSensitivity;
     axis.maxSpeed = axis.homeSpeed;
+    axis.moveSensitivity = 0;
+    axis.driver->SGTHRS(0);
     stepper->setMaxSpeed(axis.maxSpeed);
     MotionResult r = runAxisTo(axis, target);
     axis.maxSpeed = savedMax;
+    axis.moveSensitivity = savedMoveSens;
+    axis.driver->SGTHRS(savedMoveSens);
     stepper->setMaxSpeed(savedMax);
 
     if (r == MOTION_CANCELLED) {
@@ -1100,7 +1111,7 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
       Serial.print("-> "); Serial.print(axis.name); Serial.println(" homing cancelled.");
       return false;
     }
-    delay(20);
+    delay(HOME_PRE_SETTLE_MS);
   }
 
   unsigned long timeoutMs = homingTimeoutMs(axis, false);
@@ -1127,7 +1138,8 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
   unsigned long startMs = millis();
   unsigned long lastRampMs = startMs;
   unsigned long lastWdtYieldMs = startMs;
-  unsigned long diagFirstHighMs = 0;
+  bool diagHighActive = false;
+  unsigned long diagHighStartUs = 0;
 
   while (outcome == RUNNING) {
     yieldWdt(lastWdtYieldMs);
@@ -1136,8 +1148,8 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
     unsigned long nowMs = millis();
     unsigned long elapsed = nowMs - startMs;
 
-    // Smooth linear ramp over HOMING_RAMP_MS (350 ms, 10 ms cadence) directly to full homing speed
-    if (elapsed <= HOMING_RAMP_MS && (nowMs - lastRampMs) >= 10) {
+    // Smooth linear ramp over HOMING_RAMP_MS (250 ms) directly to full homing speed
+    if (elapsed <= HOMING_RAMP_MS && (nowMs - lastRampMs) >= 5) {
       lastRampMs = nowMs;
       float frac = (float)elapsed / (float)HOMING_RAMP_MS;
       float curSpd = startSpeed + frac * (axis.homeSpeed - startSpeed);
@@ -1146,18 +1158,20 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
       stepper->setSpeed(dirSign * axis.homeSpeed);
     }
 
-    // Check DIAG with tight 2 ms debouncing after blanking window (450 ms) to stop promptly without endstop buzz
+    // Check DIAG after blanking window (350 ms).
+    // Confirm DIAG is HIGH for >= 150 us to reject sub-microsecond EMI spikes while halting within < 1/9th of a step
+    // (before any extra step pulse can cause pole-slipping or buzzing against the bumper).
     if (elapsed > HOMING_BLANKING_MS) {
       if (digitalRead(axis.diagPin) == HIGH) {
-        if (diagFirstHighMs == 0) {
-          diagFirstHighMs = nowMs | 1UL;
-        } else if ((nowMs - diagFirstHighMs) >= 2) {
+        unsigned long nowUs = micros();
+        if (!diagHighActive) {
+          diagHighActive = true;
+          diagHighStartUs = nowUs;
+        } else if ((nowUs - diagHighStartUs) >= 150) {
           outcome = HOMED;
         }
       } else {
-        if (diagFirstHighMs != 0 && (nowMs - diagFirstHighMs > 10)) {
-          diagFirstHighMs = 0; // noise glitch cleared
-        }
+        diagHighActive = false;
       }
     }
 

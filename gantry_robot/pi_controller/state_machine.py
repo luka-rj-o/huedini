@@ -297,16 +297,26 @@ class GantryStateMachine:
             self.publish_telemetry()
         elif cmd in ("FREE_MOTORS", "SLEEP_MOTORS"):
             try:
+                self._estop_active = False
+                self.serial.clear_emergency_stop()
                 self.serial.send_command("SLEEP")
+                if self.state == "ESTOPPED":
+                    self.state = "IDLE"
                 self.log_event("Motors unpowered (FREE). Gantry can be moved freely by hand.")
             except Exception as exc:
                 self.log_event(f"Free motors failed: {exc}")
+            self.publish_telemetry()
         elif cmd in ("WAKE_MOTORS", "SETUP_MOTORS"):
             try:
+                self._estop_active = False
+                self.serial.clear_emergency_stop()
                 self.serial.send_command("SETUP")
+                if self.state == "ESTOPPED":
+                    self.state = "IDLE"
                 self.log_event("Motors re-energized (SETUP). Drivers ready.")
             except Exception as exc:
                 self.log_event(f"Wake motors failed: {exc}")
+            self.publish_telemetry()
         elif cmd == "TOGGLE_LIVE_STREAM":
             self._live_stream_enabled = not self._live_stream_enabled
             status_str = "ACTIVE" if self._live_stream_enabled else "PAUSED"

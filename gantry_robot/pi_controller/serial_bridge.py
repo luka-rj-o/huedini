@@ -228,7 +228,7 @@ class ESP32SerialBridge:
         Raises RuntimeError on explicit errors, E-STOP, or detected axis crashes.
         """
         cmd_clean = cmd.strip()
-        if self._abort_flag and cmd_clean.upper() != "ESTOP":
+        if self._abort_flag and cmd_clean.upper() not in ("ESTOP", "SLEEP", "SETUP", "STATUS", "TARE", "WEIGH", "PING"):
             raise RuntimeError("ERR:EMERGENCY_STOP_ACTIVE")
 
         t_start = time.monotonic()
