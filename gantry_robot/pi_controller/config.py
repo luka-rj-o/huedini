@@ -240,12 +240,6 @@ class GantryConfig:
                 upper1=(34, 255, 255),
                 display_hex="#eab308",
             ),
-            "aluminum": HSVRange(
-                name="aluminum",
-                lower1=(0, 0, 100),
-                upper1=(179, 30, 174),
-                display_hex="#94a3b8",
-            ),
         }
     )
 

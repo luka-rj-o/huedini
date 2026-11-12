@@ -75,7 +75,7 @@ const int SETUP_MICROSTEPS    = 2;
 // (see MAX_FEED_SPEED_*), and the check is gated to cruise speed + settle time + debounce (see isStalled()).
 // Set to 0 with "s1 s0" (etc.) to disable crash detection on an axis.
 const int SETUP_STALL_SENS_XZ = 60;  // == DEFAULT_HOME_SENS
-const int SETUP_STALL_SENS_Y  = 3;   // == DEFAULT_HOME_SENS_Y
+const int SETUP_STALL_SENS_Y  = 4;   // == DEFAULT_HOME_SENS_Y
 
 // Per-axis defaults (speeds in microsteps/s, acceleration in microsteps/s^2)
 const float DEFAULT_MAX_SPEED_XZ  = 1000.0f; // 5.0 mm/s on 2mm lead screw
@@ -87,7 +87,7 @@ const float DEFAULT_ACCEL_Y       = 1000.0f; // 100.0 mm/s^2 on 40mm/rev GT2 20T
 const float DEFAULT_HOME_SPEED_Y  = 700.0f;  // 70.0 mm/s (1.75 rev/s for healthy back-EMF)
 
 const int   DEFAULT_HOME_SENS     = 60;      // Homing sensitivity threshold for X and Z lead screws (SGTHRS=60)
-const int   DEFAULT_HOME_SENS_Y   = 3;       // Homing sensitivity threshold for Y belt pulley (SGTHRS=3)
+const int   DEFAULT_HOME_SENS_Y   = 4;       // Homing sensitivity threshold for Y belt pulley (SGTHRS=4 -> SG_RESULT <= 8)
 
 // X & Z: Lead screw lead = 8.0 mm/rev (standard 4-start T8x8), NEMA 11 = 200 full steps/rev -> 50.0 microsteps/mm @ 2x microsteps.
 // (Configurable dynamically via protocol STEPS command: 50.0 for T8x8, 100.0 for T8x4, 200.0 for T8x2).
@@ -112,8 +112,9 @@ const bool INVERT_DIR_X = false;
 const bool INVERT_DIR_Y = true;
 const bool INVERT_DIR_Z = false;
 
-// Load cell default calibration scale factor (raw counts per gram)
-float hx711ScaleFactor = 420.0f;
+// Load cell calibrated scale factor (raw counts per gram):
+// Calibrated using 21.6 g aluminum cube after empty tare (60.63 g avg at old 420.0 -> 420.0 * 60.63 / 21.6 = 1179.0).
+float hx711ScaleFactor = 1179.0f;
 
 // Solenoid gripper relay logic:
 // Because the solenoid is wired Normally Closed (NC):

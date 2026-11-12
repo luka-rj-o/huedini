@@ -660,18 +660,10 @@ class GantryStateMachine:
             v_frame = self.vision.capture_stationary_frame(
                 self.serial.pose.x_mm, self.serial.pose.y_mm, self.serial.pose.z_mm
             )
-            all_v_dets = self.vision.detect_blocks_hsv(v_frame)
-            v_dets = [d for d in all_v_dets if d.color == block.color]
-            cx, cy = self.config.frame_width / 2.0, self.config.frame_height / 2.0
-            # Under hover-height toolhead shadow, white blocks can briefly classify as aluminum
-            if not v_dets and block.color in ("white", "aluminum"):
-                v_dets = [
-                    d for d in all_v_dets
-                    if d.color in ("white", "aluminum")
-                    and ((d.u_px - cx) ** 2 + (d.v_px - cy) ** 2) <= (180.0 ** 2)
-                ]
+            v_dets = [d for d in self.vision.detect_blocks_hsv(v_frame) if d.color == block.color]
             if v_dets:
                 # Pick detection closest to image center
+                cx, cy = self.config.frame_width / 2.0, self.config.frame_height / 2.0
                 best = min(v_dets, key=lambda d: (d.u_px - cx) ** 2 + (d.v_px - cy) ** 2)
                 refined_plate_x, refined_plate_y = self.kinematics.pixel_to_world_mm(
                     best.u_px,

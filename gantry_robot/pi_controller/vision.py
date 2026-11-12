@@ -375,7 +375,6 @@ class VisionPipeline:
             "green": (0, 255, 0),
             "blue": (255, 120, 0),
             "yellow": (0, 230, 255),
-            "aluminum": (200, 200, 200),
             "white": (255, 255, 255),
         }
 
@@ -467,7 +466,6 @@ class VisionPipeline:
             "green": (0, 255, 0),
             "blue": (255, 120, 0),
             "yellow": (0, 230, 255),
-            "aluminum": (200, 200, 200),
             "white": (255, 255, 255),
         }
 
@@ -579,7 +577,6 @@ class VisionPipeline:
             "green": (50, 205, 50),
             "blue": (230, 110, 25),
             "yellow": (20, 215, 235),
-            "aluminum": (160, 160, 160),
             "white": (245, 245, 245),
         }
 
