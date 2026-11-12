@@ -75,7 +75,7 @@ const int SETUP_MICROSTEPS    = 2;
 // (see MAX_FEED_SPEED_*), and the check is gated to cruise speed + settle time + debounce (see isStalled()).
 // Set to 0 with "s1 s0" (etc.) to disable crash detection on an axis.
 const int SETUP_STALL_SENS_XZ = 60;  // == DEFAULT_HOME_SENS
-const int SETUP_STALL_SENS_Y  = 3;   // == DEFAULT_HOME_SENS_Y
+const int SETUP_STALL_SENS_Y  = 2;   // Avoid false stalls on Y MOVE decel/cruise (free-air SG dips to 6)
 
 // Per-axis defaults (speeds in microsteps/s, acceleration in microsteps/s^2)
 const float DEFAULT_MAX_SPEED_XZ  = 1000.0f; // 5.0 mm/s on 2mm lead screw
@@ -135,7 +135,7 @@ const float TRAVEL_Z_MM = 76.7f;
 
 // Safe pull-away distances before homing so axes against bumpers have runway to accelerate
 const float HOME_BACKOFF_MM_XZ = 5.0f;
-const float HOME_BACKOFF_MM_Y  = 15.0f;
+const float HOME_BACKOFF_MM_Y  = 25.0f;
 const unsigned long HOME_PRE_SETTLE_MS = 50;
 
 // Per-axis cap applied to MOVE feedrates (microsteps/s). StallGuard thresholds are only valid near the speed they
@@ -1063,6 +1063,19 @@ MotionResult runAxisTo(Axis& axis, long target) {
   return MOTION_DONE;
 }
 
+static uint8_t tmc2209Crc(const uint8_t* datagram, int len) {
+  uint8_t crc = 0;
+  for (int i = 0; i < len; i++) {
+    uint8_t cur = datagram[i];
+    for (int j = 0; j < 8; j++) {
+      if ((crc >> 7) ^ (cur & 0x01)) crc = (uint8_t)((crc << 1) ^ 0x07);
+      else crc = (uint8_t)(crc << 1);
+      cur >>= 1;
+    }
+  }
+  return crc;
+}
+
 bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
   if (!axis.ready) {
     Serial.print("[ERROR] "); Serial.print(axis.name);
@@ -1128,6 +1141,22 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
   unsigned long lastRampMs = startMs;
   unsigned long lastWdtYieldMs = startMs;
   unsigned long diagFirstHighMs = 0;
+  // Y belt pulley shows a 2-full-step SG_RESULT square wave (~10..180); track a 60 ms rolling peak via
+  // non-blocking UART polling so bumper impact (peak drops <= 104 from 126..144) triggers cleanly with zero step jitter.
+  const int Y_SG_WINDOW = 12;
+  const unsigned long Y_SG_POLL_MS = 5;
+  const unsigned long Y_SG_WARMUP_MS = HOMING_RAMP_MS + 20;
+  const uint16_t Y_SG_PEAK_THRESH = 104;
+  uint16_t ySgRing[12] = {0};
+  int ySgIdx = 0;
+  int ySgCount = 0;
+  unsigned long lastYSgPollMs = 0;
+  bool ySgReqPending = false;
+  uint8_t ySgReq[4] = {0x05, 0b01, 0x41, 0}; // S2 slave address 0b01, read SG_RESULT (0x41)
+  ySgReq[3] = tmc2209Crc(ySgReq, 3);
+  if (axis.coordCode == 'Y') {
+    while (TMCSerial.available()) TMCSerial.read();
+  }
 
   while (outcome == RUNNING) {
     yieldWdt(lastWdtYieldMs);
@@ -1146,8 +1175,38 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
       stepper->setSpeed(dirSign * axis.homeSpeed);
     }
 
+    // Non-blocking UART SG_RESULT sampling for Y (60 ms rolling peak drop catches belt stall without step jitter)
+    if (axis.coordCode == 'Y' && axis.homeSensitivity > 0 && elapsed >= Y_SG_WARMUP_MS && (nowMs - lastYSgPollMs >= Y_SG_POLL_MS)) {
+      lastYSgPollMs = nowMs;
+      if (ySgReqPending && TMCSerial.available() >= 12) {
+        uint8_t buf[16];
+        int n = 0;
+        while (TMCSerial.available() && n < 16) buf[n++] = (uint8_t)TMCSerial.read();
+        if (n >= 12 && buf[4] == 0x05 && buf[5] == 0xFF && buf[6] == 0x41 && buf[11] == tmc2209Crc(&buf[4], 7)) {
+          uint16_t sg = ((uint16_t)(buf[9] & 0x03) << 8) | buf[10];
+          ySgRing[ySgIdx] = sg;
+          ySgIdx = (ySgIdx + 1) % Y_SG_WINDOW;
+          if (ySgCount < Y_SG_WINDOW) ySgCount++;
+          if (elapsed > HOMING_BLANKING_MS && ySgCount >= Y_SG_WINDOW) {
+            uint16_t sgPeak = 0;
+            for (int k = 0; k < Y_SG_WINDOW; k++) {
+              if (ySgRing[k] > sgPeak) sgPeak = ySgRing[k];
+            }
+            if (sgPeak <= Y_SG_PEAK_THRESH) {
+              outcome = HOMED;
+            }
+          }
+        }
+      }
+      if (outcome == RUNNING) {
+        while (TMCSerial.available()) TMCSerial.read();
+        TMCSerial.write(ySgReq, 4);
+        ySgReqPending = true;
+      }
+    }
+
     // Check DIAG with debouncing after blanking window (350 ms)
-    if (elapsed > HOMING_BLANKING_MS) {
+    if (outcome == RUNNING && elapsed > HOMING_BLANKING_MS) {
       if (digitalRead(axis.diagPin) == HIGH) {
         if (diagFirstHighMs == 0) {
           diagFirstHighMs = (nowMs == 0) ? 1UL : nowMs;
@@ -1168,6 +1227,10 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
     }
   }
 
+  if (axis.coordCode == 'Y') {
+    delay(3);
+    while (TMCSerial.available()) TMCSerial.read();
+  }
   uint16_t stallSg = axis.driver->SG_RESULT();
   uint32_t stallTstep = axis.driver->TSTEP();
 
