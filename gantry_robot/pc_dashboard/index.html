@@ -3,312 +3,317 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>HUE-DINI | CAD Skeleton &amp; Gantry Supervisor</title>
-  <link rel="stylesheet" href="styles.css?v=4" />
+  <title>HUE-DINI · Gantry Supervisor</title>
+  <link rel="icon" type="image/png" href="favicon.png?v=2" />
+  <link rel="shortcut icon" type="image/png" href="favicon.png?v=2" />
+  <link rel="apple-touch-icon" href="favicon.png?v=2" />
+  <link rel="stylesheet" href="styles.css?v=7" />
 </head>
 <body>
+  <!-- ======================================================================
+       TOP BAR — identity · machine state · connection · E-STOP
+       ====================================================================== -->
   <header class="topbar">
     <div class="brand">
-      <span class="logo-dot"></span>
-      <div>
-        <h1>HUE-DINI Gantry Supervisor &amp; CAD Skeleton</h1>
-        <p class="subtitle">284&times;167.4 mm Fiducial Plate &bull; 254&times;152.4 mm Course &bull; 227&times;128&times;76.7 mm Stroke</p>
+      <img src="logo.png?v=2" alt="HUE-DINI Logo" class="brand-logo" />
+      <div class="brand-text">
+        <span class="brand-name">HUE-DINI</span>
+        <span class="brand-sub">Gantry Supervisor</span>
       </div>
     </div>
 
-    <div class="connection-bar">
-      <label for="wsUrlInput">Pi WebSocket:</label>
-      <input id="wsUrlInput" type="text" value="ws://localhost:8765" />
-      <button id="connectBtn" class="btn btn-secondary">Connect</button>
-      <span id="connBadge" class="badge badge-disconnected">DISCONNECTED</span>
+    <div class="state-chip" id="stateChip" data-state="IDLE">
+      <span class="state-dot"></span>
+      <span class="state-label">State</span>
+      <strong id="stateReadout">IDLE</strong>
     </div>
+
+    <div class="topbar-spacer"></div>
+
+    <div class="conn-group">
+      <span id="connDot" class="conn-dot" data-status="down" title="Disconnected"></span>
+      <input id="wsUrlInput" type="text" value="ws://localhost:8765" spellcheck="false" aria-label="Pi WebSocket URL" />
+      <button id="connectBtn" class="btn btn-ghost btn-sm">Connect</button>
+      <span id="connBadge" class="conn-text">Disconnected</span>
+    </div>
+
+    <button class="btn btn-estop" onclick="sendCmd('EMERGENCY_STOP')" title="Emergency stop — disables all steppers immediately">
+      <span class="estop-icon">&#9888;</span> E-STOP
+    </button>
   </header>
 
-  <main class="dashboard-grid">
-    <!-- Left Column: 2D XY + Z Side-Profile CAD Skeleton Map -->
-    <section class="card map-card">
-      <div class="card-header">
-        <div class="header-title-group">
-          <h2>CAD Skeleton &amp; Reachability Envelope</h2>
-          <span class="header-desc">XY Top View &bull; Z Elevation Profile</span>
+  <main class="layout">
+    <!-- ====================================================================
+         LEFT RAIL — Operation: run sequence + manual motion
+         ==================================================================== -->
+    <aside class="rail rail-left">
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Run</h2>
         </div>
-        <div class="pose-readout">
-          <span class="readout-item">STATE: <strong id="stateReadout" class="state-pill">IDLE</strong></span>
-          <span class="readout-item">EE Plate: <strong id="eePlateReadout">(32.5, -6.0, 97.6)</strong> mm</span>
-          <span class="readout-item">Cam Plate: <strong id="camPlateReadout">(32.5, 48.1, 135.4)</strong> mm</span>
-          <span class="readout-item">Drop: <strong>(224.5, 44.5, +12.6)</strong> mm</span>
-          <span class="readout-item">&theta;: <strong id="poseA">0.0</strong>&deg;</span>
-          <span class="readout-item">GRIP: <strong id="poseGrip">CLOSED (NC)</strong></span>
-          <span class="readout-item">MASS: <strong id="poseMass" class="mass-pill">--.- g</strong></span>
+        <div class="panel-body run-controls">
+          <button class="btn btn-primary btn-block btn-lg" onclick="sendCmd('START_SCAN')">
+            <span class="ico">&#9654;</span> Start Scan
+          </button>
+          <div class="btn-grid-2">
+            <button id="pauseResumeBtn" class="btn btn-secondary" onclick="togglePauseResume()">
+              <span class="ico">&#10074;&#10074;</span> <span class="lbl">Pause</span>
+            </button>
+            <button class="btn btn-secondary" onclick="sendCmd('RESET')" title="Reset state machine to IDLE">
+              <span class="ico">&#8634;</span> Reset
+            </button>
+          </div>
+          <button class="btn btn-secondary btn-block" onclick="sendCmd('HOME_ALL')" title="Full 3-axis homing (Z, X, Y) to physical origin">
+            <span class="ico">&#8962;</span> Home All Axes
+          </button>
         </div>
-      </div>
+      </section>
 
-      <div class="canvas-wrap">
-        <canvas id="courseCanvas" width="860" height="580"></canvas>
-      </div>
-
-      <!-- Live Motor Telemetry Tracking Bar (replaces manual sliders) -->
-      <div class="motor-telemetry-bar">
-        <div class="motor-telemetry-header">
-          <span class="pulse-indicator"></span>
-          <span class="bar-title">Real-Time Gantry Tracking (Motor Travel from Homed 0,0,0):</span>
-          <span id="trackingStatus" class="tracking-badge">Active Sync</span>
-        </div>
-        <div class="motor-coords-grid">
-          <div class="coord-card">
-            <span class="coord-label">Motor X (Left &ndash; Right)</span>
-            <div class="coord-val-wrap">
-              <span class="coord-num" id="motorXReadout">0.0</span>
-              <span class="coord-unit">mm</span>
-            </div>
-            <div class="coord-progress-bg">
-              <div class="coord-progress-fill" id="motorXBar" style="width: 0%"></div>
-            </div>
-            <span class="coord-sub">Range: 0 &ndash; 227 mm</span>
-          </div>
-
-          <div class="coord-card">
-            <span class="coord-label">Motor Y (Back &ndash; Fore)</span>
-            <div class="coord-val-wrap">
-              <span class="coord-num" id="motorYReadout">0.0</span>
-              <span class="coord-unit">mm</span>
-            </div>
-            <div class="coord-progress-bg">
-              <div class="coord-progress-fill" id="motorYBar" style="width: 0%"></div>
-            </div>
-            <span class="coord-sub">Range: 0 &ndash; 128 mm</span>
-          </div>
-
-          <div class="coord-card">
-            <span class="coord-label">Motor Z (Descend -Z &ndash; Up +Z)</span>
-            <div class="coord-val-wrap">
-              <span class="coord-num" id="motorZReadout">0.00</span>
-              <span class="coord-unit">mm</span>
-            </div>
-            <div class="coord-progress-bg">
-              <div class="coord-progress-fill" id="motorZBar" style="width: 0%"></div>
-            </div>
-            <span class="coord-sub">Range: -76.7 &ndash; 0 mm (Floor -70.36)</span>
-          </div>
-
-          <div class="coord-card mass-coord-card">
-            <div class="coord-header-row">
-              <span class="coord-label">HX711 Load Cell</span>
-              <span id="massClassPill" class="badge badge-dim">STANDBY</span>
-            </div>
-            <div class="coord-val-wrap">
-              <span class="coord-num" id="liveMassReadout">--.--</span>
-              <span class="coord-unit">g</span>
-            </div>
-            <div class="mass-btn-row">
-              <button class="btn btn-xs btn-secondary" onclick="sendTareCmd()" title="Tare (zero) HX711 scale offset">Tare</button>
-              <button class="btn btn-xs btn-primary" onclick="sendWeighCmd()" title="Sample load cell mass reading">Sample</button>
-            </div>
-            <span class="coord-sub" id="massStatusSub">4 Bins: Low, Med, High, Alum</span>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Manual Jog</h2>
+          <div class="segmented" role="group" aria-label="Jog step">
+            <button class="seg jog-step-btn" id="jogStep1" onclick="setJogStep(1.0)">1</button>
+            <button class="seg jog-step-btn active" id="jogStep10" onclick="setJogStep(10.0)">10</button>
+            <button class="seg jog-step-btn" id="jogStep25" onclick="setJogStep(25.0)">25</button>
+            <span class="seg-unit">mm</span>
           </div>
         </div>
-      </div>
+        <div class="panel-body">
+          <div class="jog-pad">
+            <div class="dpad" aria-label="XY jog">
+              <button class="jog-btn dpad-up" onclick="jogAxis('Y', 1)" title="+Y (Forward)">
+                <span class="arrow">&#9650;</span><span class="jog-tag">+Y</span>
+              </button>
+              <button class="jog-btn dpad-left" onclick="jogAxis('X', -1)" title="−X (Left)">
+                <span class="arrow">&#9664;</span><span class="jog-tag">−X</span>
+              </button>
+              <div class="dpad-center">XY</div>
+              <button class="jog-btn dpad-right" onclick="jogAxis('X', 1)" title="+X (Right)">
+                <span class="jog-tag">+X</span><span class="arrow">&#9654;</span>
+              </button>
+              <button class="jog-btn dpad-down" onclick="jogAxis('Y', -1)" title="−Y (Back)">
+                <span class="jog-tag">−Y</span><span class="arrow">&#9660;</span>
+              </button>
+            </div>
+            <div class="zpad" aria-label="Z jog">
+              <button class="jog-btn" onclick="jogAxis('Z', 1)" title="+Z (Up)">
+                <span class="arrow">&#9650;</span><span class="jog-tag">+Z</span>
+              </button>
+              <div class="dpad-center">Z</div>
+              <button class="jog-btn" onclick="jogAxis('Z', -1)" title="−Z (Down)">
+                <span class="jog-tag">−Z</span><span class="arrow">&#9660;</span>
+              </button>
+            </div>
+          </div>
+          <p class="hint">Arrows match the map orientation (+Y = forward / up on map).</p>
+        </div>
+      </section>
 
-      <div class="calibration-bar">
-        <span>Course Floor: <strong>+6.35 mm (1/4" Elevated)</strong></span>
-        <span>Cam Homed: <strong id="camHomedOriginReadout">(32.5, 48.1, 135.4) mm</strong></span>
-        <span>EE Homed: <strong id="eeHomedOriginReadout">(32.5, -6.0, 97.6) mm</strong></span>
-        <span>Scale: <strong id="calKx">0.2500</strong> / <strong id="calKy">0.2500</strong> mm/px (<span id="calStatus">Default</span>)</span>
-        <span>Coord System: <span id="calOriginStatus" class="badge badge-dim">CAD Nominal</span></span>
-        <span>Cam Skew: <strong id="calCamSkew">0.0&deg;</strong> (<span id="calSkewStatus" class="badge badge-dim">Nominal</span>)</span>
-      </div>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Steppers</h2>
+        </div>
+        <div class="panel-body btn-grid-2">
+          <button class="btn btn-secondary" onclick="sendCmd('FREE_MOTORS')" title="Cut stepper power to move the gantry by hand">Free</button>
+          <button class="btn btn-secondary" onclick="sendCmd('WAKE_MOTORS')" title="Re-enable and set up steppers">Wake</button>
+        </div>
+      </section>
+    </aside>
+
+    <!-- ====================================================================
+         CENTER — Digital twin (hero) + bottom drawer
+         ==================================================================== -->
+    <section class="center">
+      <section class="panel twin-panel">
+        <div class="panel-head">
+          <div class="head-title">
+            <h2>Digital Twin</h2>
+            <span class="head-sub">XY top view · Z elevation</span>
+          </div>
+          <div class="legend">
+            <span class="lg"><i class="lg-sw lg-ee"></i>End-effector</span>
+            <span class="lg"><i class="lg-sw lg-cam"></i>Camera</span>
+            <span class="lg"><i class="lg-sw lg-carriage"></i>Carriage</span>
+            <span class="lg"><i class="lg-sw lg-zone"></i>Drop zone</span>
+          </div>
+          <span class="cursor-readout" id="cursorReadout">— , — mm</span>
+        </div>
+        <div class="canvas-wrap" id="canvasWrap">
+          <canvas id="courseCanvas"></canvas>
+        </div>
+
+        <!-- Live axis telemetry strip -->
+        <div class="telemetry-strip">
+          <div class="axis">
+            <div class="axis-top"><span class="axis-name">X</span><span class="axis-val"><b id="motorXReadout">0.0</b> mm</span></div>
+            <div class="axis-bar"><div class="axis-fill" id="motorXBar"></div></div>
+            <span class="axis-range">0 – 227</span>
+          </div>
+          <div class="axis">
+            <div class="axis-top"><span class="axis-name">Y</span><span class="axis-val"><b id="motorYReadout">0.0</b> mm</span></div>
+            <div class="axis-bar"><div class="axis-fill" id="motorYBar"></div></div>
+            <span class="axis-range">0 – 128</span>
+          </div>
+          <div class="axis">
+            <div class="axis-top"><span class="axis-name">Z</span><span class="axis-val"><b id="motorZReadout">0.00</b> mm</span></div>
+            <div class="axis-bar"><div class="axis-fill axis-fill-z" id="motorZBar"></div></div>
+            <span class="axis-range">0 – −70.4 (floor)</span>
+          </div>
+          <div class="strip-divider"></div>
+          <div class="kv-stack">
+            <div class="kv"><span class="k k-ee">EE</span><span class="v" id="eePlateReadout">(32.5, -6.0, 97.6)</span></div>
+            <div class="kv"><span class="k k-cam">CAM</span><span class="v" id="camPlateReadout">(32.5, 48.1, 135.4)</span></div>
+          </div>
+          <div class="kv-stack">
+            <div class="kv"><span class="k">&theta;</span><span class="v"><span id="poseA">0.0</span>&deg;</span></div>
+            <div class="kv"><span class="k">Grip</span><span class="v" id="poseGrip">Closed</span></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Bottom drawer: Console · Reports · Calibration -->
+      <section class="panel drawer">
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-tab="console" onclick="selectTab('console')">Console</button>
+          <button class="tab" data-tab="reports" onclick="selectTab('reports')">Run Reports <span class="tab-badge" id="reportStatusBadge">—</span></button>
+          <button class="tab" data-tab="calibration" onclick="selectTab('calibration')">Calibration</button>
+          <div class="tabs-spacer"></div>
+          <div class="tab-actions" data-for="console">
+            <button class="btn btn-ghost btn-xs" onclick="clearLogs()">Clear</button>
+          </div>
+          <div class="tab-actions hidden" data-for="reports">
+            <button class="btn btn-ghost btn-xs" onclick="fetchRecentReports()">&#8635; Refresh</button>
+            <button class="btn btn-ghost btn-xs" onclick="viewLatestReport()">Open latest</button>
+            <button class="btn btn-ghost btn-xs" onclick="downloadLatestReport()">Download JSON</button>
+          </div>
+        </div>
+
+        <div class="tab-pane active" data-pane="console">
+          <pre id="logConsole" class="log-console">Waiting for connection to Raspberry Pi Zero W...</pre>
+          <div class="console-input">
+            <span class="prompt">esp32&gt;</span>
+            <input id="rawSerialInput" type="text" spellcheck="false"
+              placeholder="Raw CLI (IDLE only) — e.g. setup · s1 500 · home s1 · servo 90 · relay 2 · l" />
+            <button class="btn btn-secondary btn-xs" onclick="sendRawSerial()">Send</button>
+          </div>
+        </div>
+
+        <div class="tab-pane" data-pane="reports">
+          <p id="reportSummaryText" class="report-summary">Run reports are cached automatically after each scan cycle.</p>
+          <div class="recent-reports-list" id="recentReportsList"></div>
+        </div>
+
+        <div class="tab-pane" data-pane="calibration">
+          <div class="cal-grid">
+            <div class="cal-item"><span class="k">Coordinate system</span><span id="calOriginStatus" class="pill pill-dim">CAD Nominal</span></div>
+            <div class="cal-item"><span class="k">Pixel scale (kx / ky)</span><span class="v"><span id="calKx">0.2500</span> / <span id="calKy">0.2500</span> mm/px <span id="calStatus" class="muted">Default</span></span></div>
+            <div class="cal-item"><span class="k">Camera skew</span><span class="v"><span id="calCamSkew">0.0&deg;</span> <span id="calSkewStatus" class="pill pill-dim">Nominal</span></span></div>
+            <div class="cal-item"><span class="k">Cam homed origin</span><span class="v" id="camHomedOriginReadout">(32.5, 48.1, 135.4) mm</span></div>
+            <div class="cal-item"><span class="k">EE homed origin</span><span class="v" id="eeHomedOriginReadout">(32.5, -6.0, 97.6) mm</span></div>
+            <div class="cal-item"><span class="k">Course floor</span><span class="v">+6.35 mm (¼″ elevated)</span></div>
+          </div>
+          <div class="cal-lead">
+            <div class="cal-lead-head">
+              <span class="k">Lead screw steps/mm (X &amp; Z)</span>
+              <span id="currentSpmTag" class="pill pill-accent">X/Z 50.0 · Y 10.0</span>
+            </div>
+            <div class="segmented segmented-wide">
+              <button class="seg preset-btn active" id="presetT8x8" onclick="applyLeadPreset(8.0, 50.0)" title="4-start T8: 8 mm lead">T8×8 · 50</button>
+              <button class="seg preset-btn" id="presetT8x4" onclick="applyLeadPreset(4.0, 100.0)" title="2-start T8: 4 mm lead">T8×4 · 100</button>
+              <button class="seg preset-btn" id="presetT8x2" onclick="applyLeadPreset(2.0, 200.0)" title="1-start T8: 2 mm lead">T8×2 · 200</button>
+              <button class="seg" onclick="promptCustomSpm()" title="Enter exact calibrated steps/mm">Custom…</button>
+            </div>
+          </div>
+        </div>
+      </section>
     </section>
 
-    <!-- Right Column: Controls, Camera View, Block Table, Logs -->
-    <div class="right-col">
-      <!-- Control Triggers -->
-      <section class="card controls-card">
-        <h2>Supervisor Controls</h2>
-        <div class="btn-row">
-          <button class="btn btn-primary" onclick="sendCmd('START_SCAN')">&#9654; START SCAN</button>
-          <button class="btn btn-secondary" onclick="sendCmd('HOME_ALL')" title="Execute full 3-axis homing (Z, X, Y) to physical origin">&#8962; HOME GANTRY</button>
-          <button class="btn btn-secondary" onclick="sendTareCmd()" title="Zero HX711 load cell offset">&#9878; Tare Scale</button>
-          <button class="btn btn-secondary" onclick="sendWeighCmd()" title="Sample load cell mass">&#9878; Sample Mass</button>
-          <button class="btn btn-warning" onclick="sendCmd('PAUSE')">&#10074;&#10074; PAUSE</button>
-          <button class="btn btn-secondary" onclick="sendCmd('RESUME')">&#8635; RESUME</button>
-          <button class="btn btn-secondary" onclick="sendCmd('RESET')">RESET</button>
-          <button class="btn btn-danger" onclick="sendCmd('EMERGENCY_STOP')">&#9888; E-STOP</button>
+    <!-- ====================================================================
+         RIGHT RAIL — Sensing: camera, load cell, block catalog
+         ==================================================================== -->
+    <aside class="rail rail-right">
+      <section class="panel cam-panel" id="camPanel">
+        <div class="panel-head">
+          <h2>Camera</h2>
+          <span id="liveCamPill" class="live-pill" data-live="1"><i></i>LIVE</span>
+          <div class="head-actions">
+            <button id="toggleLiveCvBtn" class="btn btn-ghost btn-xs" onclick="toggleLiveCv()" title="Toggle full ArUco + HSV detection vs. fast eco stream">CV: Eco</button>
+            <button id="toggleLiveBtn" class="btn btn-ghost btn-xs" onclick="toggleLiveStream()" title="Pause / resume the camera stream">Pause</button>
+            <button class="btn btn-ghost btn-xs btn-icon" onclick="toggleCamExpand()" title="Expand / collapse">&#x26F6;</button>
+          </div>
         </div>
-        <div class="manual-serial-row">
-          <input
-            id="rawSerialInput"
-            type="text"
-            placeholder="Manual ESP32 CLI in IDLE (e.g. setup, s1 500, home s1, servo 90, relay 2, l)"
-          />
-          <button class="btn btn-secondary" onclick="sendRawSerial()">Send TX</button>
+        <div class="cam-frame" onclick="toggleCamExpand()">
+          <img id="visionPreviewImg" alt="" />
+          <div id="camOverlayEmpty" class="cam-empty">
+            <span class="cam-empty-icon">&#9673;</span>
+            <span>Waiting for 640×480 stream…</span>
+          </div>
+        </div>
+        <div class="cam-hud" id="liveDetectionHud">
+          <span id="liveDetectionText">No detections</span>
         </div>
       </section>
 
-      <!-- Manual Hardware Jog & Lead Screw Calibration -->
-      <section class="card jog-controls-card">
-        <div class="card-header">
-          <h2>Manual Hardware Jog</h2>
-          <div class="jog-step-selector">
-            <span class="selector-label">Jog Step:</span>
-            <button class="btn btn-sm btn-secondary jog-step-btn" id="jogStep1" onclick="setJogStep(1.0)">1 mm</button>
-            <button class="btn btn-sm btn-primary jog-step-btn active" id="jogStep10" onclick="setJogStep(10.0)">10 mm</button>
-            <button class="btn btn-sm btn-secondary jog-step-btn" id="jogStep25" onclick="setJogStep(25.0)">25 mm</button>
-          </div>
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Load Cell</h2>
+          <span id="massClassPill" class="pill pill-dim">Standby</span>
         </div>
-
-        <div class="manual-jog-grid">
-          <div class="jog-axis-row">
-            <span class="jog-axis-label">X Axis (Lead Screw)</span>
-            <div class="jog-btn-pair">
-              <button class="btn btn-secondary btn-sm" onclick="jogAxis('X', -1)">&larr; -X (Left)</button>
-              <button class="btn btn-secondary btn-sm" onclick="jogAxis('X', 1)">+X (Right) &rarr;</button>
-            </div>
+        <div class="panel-body mass-body">
+          <div class="mass-readout">
+            <span class="mass-num" id="liveMassReadout">--.--</span>
+            <span class="mass-unit">g</span>
           </div>
-          <div class="jog-axis-row">
-            <span class="jog-axis-label">Y Axis (GT2 Belt)</span>
-            <div class="jog-btn-pair">
-              <button class="btn btn-secondary btn-sm" onclick="jogAxis('Y', -1)">&uarr; -Y (Back)</button>
-              <button class="btn btn-secondary btn-sm" onclick="jogAxis('Y', 1)">+Y (Forward) &darr;</button>
-            </div>
+          <div class="btn-grid-2">
+            <button class="btn btn-secondary" onclick="sendTareCmd()" title="Zero the HX711 scale offset">Tare</button>
+            <button class="btn btn-secondary" onclick="sendWeighCmd()" title="Sample load-cell mass">Sample</button>
           </div>
-          <div class="jog-axis-row">
-            <span class="jog-axis-label">Z Axis (Lead Screw)</span>
-            <div class="jog-btn-pair">
-              <button class="btn btn-secondary btn-sm" onclick="jogAxis('Z', 1)">&uarr; +Z (Up)</button>
-              <button class="btn btn-secondary btn-sm" onclick="jogAxis('Z', -1)">-Z (Down) &darr;</button>
-            </div>
-          </div>
-        </div>
-
-        <!-- Axis Kinematics & Steps/mm Lead Screw Preset Tuning -->
-        <div class="kinematics-calibration-row">
-          <div class="cal-title-wrap">
-            <span class="cal-title">Lead Screw (X &amp; Z) Pitch &amp; Calibration:</span>
-            <span id="currentSpmTag" class="badge badge-accent">X/Z: 50.0 &bull; Y: 10.0 spm</span>
-          </div>
-          <div class="cal-presets">
-            <button class="btn btn-sm btn-secondary preset-btn active" id="presetT8x8" onclick="applyLeadPreset(8.0, 50.0)" title="Standard 4-start T8 screw: 8mm lead = 50 steps/mm (fixes 10mm moving 40mm)">
-              T8&times;8 (8mm Lead: 50 spm)
-            </button>
-            <button class="btn btn-sm btn-secondary preset-btn" id="presetT8x4" onclick="applyLeadPreset(4.0, 100.0)" title="2-start T8 screw: 4mm lead = 100 steps/mm (fixes 10mm moving 20mm)">
-              T8&times;4 (4mm Lead: 100 spm)
-            </button>
-            <button class="btn btn-sm btn-secondary preset-btn" id="presetT8x2" onclick="applyLeadPreset(2.0, 200.0)" title="1-start T8 screw: 2mm lead = 200 steps/mm">
-              T8&times;2 (2mm Lead: 200 spm)
-            </button>
-            <button class="btn btn-sm btn-secondary" onclick="promptCustomSpm()" title="Enter exact calibrated steps/mm">
-              Custom...
-            </button>
+          <div class="mass-bins" id="massBins">
+            <span data-cls="low_infill">Low<small>≤4.75</small></span>
+            <span data-cls="med_infill">Med<small>≤8.40</small></span>
+            <span data-cls="high_infill">High<small>≤15.7</small></span>
+            <span data-cls="aluminum">Alum<small>&gt;15.7</small></span>
           </div>
         </div>
       </section>
 
-      <!-- Eye-in-Hand Camera Viewer & Live Stream -->
-      <section class="card vision-card">
-        <div class="card-header">
-          <div class="vision-title-group">
-            <h2>Eye-in-Hand Camera Viewer</h2>
-            <span class="badge badge-dim">640 &times; 480 px (4:3)</span>
-          </div>
-          <div class="vision-header-controls">
-            <button class="btn btn-warning btn-sm" onclick="sendCmd('FREE_MOTORS')" title="Cut power to steppers to move gantry freely by hand">Free Motors</button>
-            <button class="btn btn-secondary btn-sm" onclick="sendCmd('WAKE_MOTORS')" title="Re-enable and setup steppers">Wake Motors</button>
-            <button id="toggleLiveCvBtn" class="btn btn-secondary btn-sm" onclick="toggleLiveCv()" title="Toggle full live ArUco &amp; HSV block detection vs eco fast stream">CV: Eco (Fast)</button>
-            <button id="toggleLiveBtn" class="btn btn-primary btn-sm" onclick="toggleLiveStream()">Stream: Active</button>
-            <span id="liveCamPill" class="badge badge-connected">&bull; LIVE (~3 FPS)</span>
-          </div>
+      <section class="panel blocks-panel">
+        <div class="panel-head">
+          <h2>Blocks</h2>
+          <span id="blockCountBadge" class="pill pill-dim">0</span>
         </div>
-
-        <!-- Exact 4:3 Aspect Ratio Container (matches 640x480 frame without letterbox bars) -->
-        <div class="vision-frame-wrapper">
-          <div class="vision-preview-box">
-            <img id="visionPreviewImg" alt="Waiting for 640x480 camera feed..." />
-            <div id="camOverlayEmpty" class="cam-empty-placeholder">
-              <span class="cam-icon">&#128247;</span>
-              <p>Connecting to Pi Camera Stream (640 &times; 480)...</p>
-            </div>
-          </div>
-        </div>
-
-        <div id="liveDetectionHud" class="live-detection-hud">
-          <span class="hud-label">Live Detections:</span>
-          <span id="liveDetectionText" class="hud-value">Searching for fiducials or blocks...</span>
-        </div>
-      </section>
-
-      <!-- Detected Block Catalog & Mass Telemetry -->
-      <section class="card table-card">
-        <div class="card-header">
-          <h2>20&times;20 mm Blocks &amp; 4-Class Mass Sorting</h2>
-          <span id="blockCountBadge" class="badge">0 Blocks</span>
-        </div>
-        <div class="table-scroll">
-          <table>
+        <div class="blocks-scroll">
+          <table class="blocks-table">
             <thead>
-              <tr>
-                <th>ID</th>
-                <th>Color</th>
-                <th>Plate (X, Y)</th>
-                <th>&theta; Angle</th>
-                <th>Mass &amp; Class</th>
-                <th>Status</th>
-              </tr>
+              <tr><th>ID</th><th>Color</th><th>X, Y</th><th>&theta;</th><th>Mass</th><th>Status</th></tr>
             </thead>
             <tbody id="blocksTableBody">
-              <tr>
-                <td colspan="6" class="empty-cell">No blocks cataloged yet. Click START SCAN.</td>
-              </tr>
+              <tr><td colspan="6" class="empty-cell">No blocks cataloged yet.</td></tr>
             </tbody>
           </table>
         </div>
       </section>
-
-      <!-- Diagnostic Run Reports (Cached History & Detailed Execution Logs) -->
-      <section class="card report-card">
-        <div class="card-header">
-          <div class="report-title-group">
-            <h2>Diagnostic Run Reports</h2>
-            <span class="badge badge-dim">Cached Run History</span>
-          </div>
-          <div class="report-header-actions">
-            <button class="btn btn-sm btn-secondary" onclick="fetchRecentReports()" title="Refresh recent reports list">&#8635; Refresh</button>
-            <button class="btn btn-sm btn-primary" onclick="viewLatestReport()" title="View latest run diagnostics in detail">&#128221; View Last Report</button>
-            <button class="btn btn-sm btn-secondary" onclick="downloadLatestReport()" title="Download full diagnostic JSON file">&#128190; Download JSON</button>
-          </div>
-        </div>
-        <div id="latestReportSummary" class="latest-report-summary">
-          <span class="report-status-badge badge badge-dim" id="reportStatusBadge">NO RUNS CACHED</span>
-          <span id="reportSummaryText" class="report-summary-text">Run reports cache automatically upon each scan cycle.</span>
-        </div>
-        <div class="recent-reports-list" id="recentReportsList"></div>
-      </section>
-
-      <!-- System Event Logs -->
-      <section class="card log-card">
-        <div class="card-header">
-          <h2>Orchestrator Telemetry Log</h2>
-          <button class="btn btn-sm btn-secondary" onclick="clearLogs()">Clear</button>
-        </div>
-        <pre id="logConsole" class="log-console">Waiting for connection to Raspberry Pi Zero W...</pre>
-      </section>
-    </div>
+    </aside>
   </main>
 
-  <!-- Full Diagnostic Report Modal Dialog -->
-  <div id="reportModal" class="report-modal" style="display: none;">
-    <div class="report-modal-content">
-      <div class="report-modal-header">
-        <h3 id="modalReportTitle">Run Report Diagnostics</h3>
-        <button class="modal-close-btn" onclick="closeReportModal()">&times;</button>
+  <!-- Report detail modal -->
+  <div id="reportModal" class="modal" style="display: none;" onclick="if (event.target === this) closeReportModal()">
+    <div class="modal-content">
+      <div class="modal-head">
+        <h3 id="modalReportTitle">Run Report</h3>
+        <button class="modal-close" onclick="closeReportModal()" aria-label="Close">&times;</button>
       </div>
-      <div class="report-modal-body" id="modalReportBody"></div>
-      <div class="report-modal-footer">
+      <div class="modal-body" id="modalReportBody"></div>
+      <div class="modal-foot">
         <button class="btn btn-secondary" onclick="closeReportModal()">Close</button>
-        <a id="modalDownloadBtn" class="btn btn-primary" href="#" target="_blank">&#128190; Download Full JSON</a>
+        <a id="modalDownloadBtn" class="btn btn-primary" href="#" target="_blank">Download JSON</a>
       </div>
     </div>
   </div>
 
-  <script src="app.js?v=8"></script>
+  <div id="camBackdrop" class="cam-backdrop" onclick="toggleCamExpand(false)"></div>
+
+  <script src="app.js?v=10"></script>
 </body>
 </html>

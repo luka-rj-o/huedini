@@ -174,6 +174,10 @@ class TelemetryServer:
         elif clean_path == "/app.js":
             target = self._dashboard_dir / "app.js"
             ctype = "application/javascript; charset=utf-8"
+        elif clean_path in ("/logo.png", "/favicon.png", "/favicon.ico"):
+            fname = "favicon.png" if clean_path == "/favicon.ico" else clean_path.lstrip("/")
+            target = self._dashboard_dir / fname
+            ctype = "image/png"
         elif clean_path == "/api/state":
             body = json.dumps(self._latest_payload).encode("utf-8")
             resp = (
