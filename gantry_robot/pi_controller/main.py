@@ -89,6 +89,7 @@ def print_cli_help() -> None:
         "  stop / estop   - Emergency stop (disable all steppers immediately)\n"
         "  reset          - Reset state machine to IDLE\n"
         "  home           - Execute 3-axis StallGuard4 sensorless homing\n"
+        "  chime          - Play Windows 3.1 Tada! victory chime on X/Z steppers\n"
         "  status         - Show current state, gantry coordinates, and status\n"
         "  blocks         - List cataloged blocks\n"
         "  raw <cmd>      - Send manual command to ESP32 (e.g. 'raw STATUS', 'raw s1 500')\n"
@@ -146,6 +147,8 @@ def interactive_cli(fsm: GantryStateMachine) -> None:
         elif cmd in ("s1", "s2", "s3", "servo", "relay"):
             raw_line = f"{cmd} {arg}".strip()
             fsm._on_user_command("RAW_SERIAL", {"line": raw_line})
+        elif cmd == "chime":
+            fsm._on_user_command("PLAY_CHIME", {"tune": arg.upper() if arg else "TADA"})
         elif cmd == "status":
             pose = fsm.serial.pose
             print(

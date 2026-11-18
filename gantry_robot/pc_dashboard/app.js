@@ -46,10 +46,10 @@ const EE_HOMED_X = 32.5;
 const EE_HOMED_Y = -6.0;
 const EE_HOMED_Z = 97.6;
 const CAM_HOMED_X = 32.5;
-const CAM_HOMED_Y = 48.1;
+const CAM_HOMED_Y = 33.1;
 const CAM_HOMED_Z = 135.4;
-const EE_OFFSET_X = 0.0;
-const EE_OFFSET_Y = -54.1;
+const EE_OFFSET_X = -1.5;
+const EE_OFFSET_Y = -41.6;
 
 // Aluminum drop-off pedestal
 const DROPOFF_X = 224.6;
@@ -421,13 +421,28 @@ function getCamHomedOrigin() {
   return { x: ox, y: oy, calibrated: !!cal.origin_calibrated };
 }
 
+function motorCamToPlate(cx_m, cy_m) {
+  const pt = latestState.calibration?.plate_transform;
+  if (pt && pt.a00 !== undefined) {
+    return {
+      x: pt.a00 * cx_m + pt.a01 * cy_m + pt.tx,
+      y: pt.a10 * cx_m + pt.a11 * cy_m + pt.ty,
+    };
+  }
+  const o = getCamHomedOrigin();
+  return { x: o.x + cx_m, y: o.y + cy_m };
+}
+
 function updateReadoutsFromMotor() {
   const o = getCamHomedOrigin();
+  const camP = motorCamToPlate(motorX, motorY);
+  const eeP = motorCamToPlate(motorX + EE_OFFSET_X, motorY + EE_OFFSET_Y);
+  const eeH = motorCamToPlate(EE_OFFSET_X, EE_OFFSET_Y);
 
-  setText("camPlateReadout", fmt3(o.x + motorX, o.y + motorY, CAM_HOMED_Z - motorZDown));
-  setText("eePlateReadout", fmt3(o.x + EE_OFFSET_X + motorX, o.y + EE_OFFSET_Y + motorY, EE_HOMED_Z - motorZDown));
+  setText("camPlateReadout", fmt3(camP.x, camP.y, CAM_HOMED_Z - motorZDown));
+  setText("eePlateReadout", fmt3(eeP.x, eeP.y, EE_HOMED_Z - motorZDown));
   setText("camHomedOriginReadout", `${fmt3(o.x, o.y, CAM_HOMED_Z)} mm`);
-  setText("eeHomedOriginReadout", `${fmt3(o.x + EE_OFFSET_X, o.y + EE_OFFSET_Y, EE_HOMED_Z)} mm`);
+  setText("eeHomedOriginReadout", `${fmt3(eeH.x, eeH.y, EE_HOMED_Z)} mm`);
 
   // Z displayed as negative displacement from top home so +Z reads as Up
   setText("motorXReadout", motorX.toFixed(1));
@@ -483,7 +498,14 @@ function updateUI(data, prevState) {
   setText("calStatus", cal.calibrated ? "Calibrated" : "Default");
   const originEl = $("calOriginStatus");
   if (originEl) {
-    originEl.textContent = cal.origin_calibrated ? "Fiducial calibrated" : "CAD nominal";
+    const markers = Array.isArray(cal.markers_detected) ? cal.markers_detected : [];
+    let labelText = "CAD nominal";
+    if (cal.origin_calibrated) {
+      if (markers.length >= 3) labelText = `${markers.length}-ArUco Ground Truth`;
+      else if (markers.length === 2) labelText = "2-ArUco Similarity";
+      else labelText = "1-ArUco Fallback";
+    }
+    originEl.textContent = labelText;
     originEl.className = `pill ${cal.origin_calibrated ? "pill-success" : "pill-dim"}`;
   }
   setText("calKx", (cal.kx_mm_per_px ?? 0.25).toFixed(4));
@@ -496,6 +518,9 @@ function updateUI(data, prevState) {
     skewEl.textContent = comp ? "Compensated" : "Nominal";
     skewEl.className = `pill ${comp ? "pill-success" : "pill-dim"}`;
   }
+  const plateYaw = Number(cal.plate_yaw_deg) || 0.0;
+  const rmsStr = cal.residual_rms_mm != null ? `${Number(cal.residual_rms_mm).toFixed(3)} mm` : "— mm";
+  setText("calPlateFitReadout", `${plateYaw >= 0 ? "+" : ""}${plateYaw.toFixed(2)}° · ${rmsStr}`);
 
   if (data.steps_per_mm) setSpmTag(data.steps_per_mm.x, data.steps_per_mm.y);
 
@@ -639,17 +664,21 @@ function canvasToMm(cx, cy) {
   };
 }
 
-// Project a camera pixel to plate mm (mirrors EyeInHandKinematics.calibrate_origin conventions)
-function pixelToPlate(u, v, camX, camY, fovScale) {
+// Project a camera pixel to plate mm (mirrors EyeInHandKinematics.pixel_to_world_mm conventions)
+function pixelToPlate(u, v, motorXMm, motorYMm, fovScale) {
   const cal = latestState.calibration || {};
   const kx = (Number(cal.kx_mm_per_px) || 0.25) * fovScale;
   const ky = (Number(cal.ky_mm_per_px) || 0.25) * fovScale;
   const up = -(u - FRAME_W_PX / 2) * kx;
   const vp = (v - FRAME_H_PX / 2) * ky;
-  const rad = ((Number(cal.cam_skew_deg) || 0) * Math.PI) / 180;
+  const pt = cal.plate_transform;
+  const skewDeg = pt ? (Number(cal.cam_motor_skew_deg ?? cal.cam_skew_deg) || 0) : (Number(cal.cam_skew_deg) || 0);
+  const rad = (skewDeg * Math.PI) / 180;
   const c = Math.cos(rad);
   const s = Math.sin(rad);
-  return { x: camX + up * c - vp * s, y: camY + up * s + vp * c };
+  const dx = up * c - vp * s;
+  const dy = up * s + vp * c;
+  return motorCamToPlate(motorXMm + dx, motorYMm + dy);
 }
 
 function rectMm(x0, y0, x1, y1) {
@@ -776,26 +805,40 @@ function drawXYView() {
   }
 
   // --- Reach envelopes -------------------------------------------------------
-  const eeHx = o.x + EE_OFFSET_X;
-  const eeHy = o.y + EE_OFFSET_Y;
-  r = rectMm(eeHx, eeHy, eeHx + STROKE_X, eeHy + STROKE_Y);
+  const eeCorners = [
+    motorCamToPlate(EE_OFFSET_X, EE_OFFSET_Y),
+    motorCamToPlate(EE_OFFSET_X + STROKE_X, EE_OFFSET_Y),
+    motorCamToPlate(EE_OFFSET_X + STROKE_X, EE_OFFSET_Y + STROKE_Y),
+    motorCamToPlate(EE_OFFSET_X, EE_OFFSET_Y + STROKE_Y),
+  ].map((p) => mmToCanvas(p.x, p.y));
+  ctx.beginPath();
+  eeCorners.forEach((c, i) => (i ? ctx.lineTo(c.cx, c.cy) : ctx.moveTo(c.cx, c.cy)));
+  ctx.closePath();
   ctx.fillStyle = "rgba(60, 207, 145, 0.035)";
-  ctx.fillRect(...r);
+  ctx.fill();
   ctx.strokeStyle = "rgba(60, 207, 145, 0.55)";
   ctx.setLineDash([5, 4]);
   ctx.lineWidth = 1;
-  ctx.strokeRect(...r);
+  ctx.stroke();
   ctx.setLineDash([]);
-  label("EE REACH", r[0] + 6, r[1] + r[3] - 6, "rgba(60, 207, 145, 0.85)", { size: 9, weight: 700 });
+  label("EE REACH", eeCorners[0].cx + 6, eeCorners[0].cy - 6, "rgba(60, 207, 145, 0.85)", { size: 9, weight: 700 });
 
-  r = rectMm(o.x, o.y, o.x + STROKE_X, o.y + STROKE_Y);
+  const camCorners = [
+    motorCamToPlate(0, 0),
+    motorCamToPlate(STROKE_X, 0),
+    motorCamToPlate(STROKE_X, STROKE_Y),
+    motorCamToPlate(0, STROKE_Y),
+  ].map((p) => mmToCanvas(p.x, p.y));
+  ctx.beginPath();
+  camCorners.forEach((c, i) => (i ? ctx.lineTo(c.cx, c.cy) : ctx.moveTo(c.cx, c.cy)));
+  ctx.closePath();
   ctx.fillStyle = "rgba(79, 156, 249, 0.03)";
-  ctx.fillRect(...r);
+  ctx.fill();
   ctx.strokeStyle = "rgba(79, 156, 249, 0.55)";
   ctx.setLineDash([2, 3]);
-  ctx.strokeRect(...r);
+  ctx.stroke();
   ctx.setLineDash([]);
-  label("CAM REACH", r[0] + r[2] - 6, r[1] - 6, "rgba(79, 156, 249, 0.9)", { size: 9, weight: 700, align: "right" });
+  label("CAM REACH", camCorners[2].cx - 6, camCorners[2].cy - 6, "rgba(79, 156, 249, 0.9)", { size: 9, weight: 700, align: "right" });
 
   // --- Drop zones ------------------------------------------------------------
   for (const zone of STACK_ZONES) {
@@ -813,12 +856,10 @@ function drawXYView() {
   }
 
   // --- Camera FOV footprint (approx., scales with height above cube tops) -----
-  const camX = o.x + mX;
-  const camY = o.y + mY;
   const curCamZ = CAM_HOMED_Z - drawZ;
   const fovScale = Math.max(0.05, (curCamZ - CAL_PLANE_Z) / (CAM_HOMED_Z - CAL_PLANE_Z));
   const corners = [[0, 0], [FRAME_W_PX, 0], [FRAME_W_PX, FRAME_H_PX], [0, FRAME_H_PX]]
-    .map(([u, v]) => pixelToPlate(u, v, camX, camY, fovScale))
+    .map(([u, v]) => pixelToPlate(u, v, mX, mY, fovScale))
     .map((p) => mmToCanvas(p.x, p.y));
   ctx.beginPath();
   corners.forEach((c, i) => (i ? ctx.lineTo(c.cx, c.cy) : ctx.moveTo(c.cx, c.cy)));
@@ -833,7 +874,7 @@ function drawXYView() {
   const liveBlocks = latestState.live_blocks || [];
   for (const b of liveBlocks) {
     if (b.u_px === undefined) continue;
-    const pm = pixelToPlate(Number(b.u_px), Number(b.v_px), camX, camY, fovScale);
+    const pm = pixelToPlate(Number(b.u_px), Number(b.v_px), mX, mY, fovScale);
     const p = mmToCanvas(pm.x, pm.y);
     const s = BLOCK_SIZE * p.scale;
     ctx.save();
@@ -872,8 +913,10 @@ function drawXYView() {
   // --- Gantry skeleton: carriage datum → end-effector → camera ---------------
   const homeDatum = mmToCanvas(DATUM_X, DATUM_Y);
   const datum = mmToCanvas(DATUM_X + mX, DATUM_Y + mY);
-  const ee = mmToCanvas(eeHx + mX, eeHy + mY);
-  const cam = mmToCanvas(camX, camY);
+  const eePlate = motorCamToPlate(mX + EE_OFFSET_X, mY + EE_OFFSET_Y);
+  const camPlate = motorCamToPlate(mX, mY);
+  const ee = mmToCanvas(eePlate.x, eePlate.y);
+  const cam = mmToCanvas(camPlate.x, camPlate.y);
 
   // Home datum anchor
   ctx.strokeStyle = THEME.carriage;
@@ -1201,15 +1244,14 @@ function showReportModal(report) {
     </div>
 
     <div class="report-section">
-      <h4>1 · Homing, fiducial calibration &amp; camera skew</h4>
+      <h4>1 · Homing, 4-ArUco calibration &amp; camera skew</h4>
       <div class="report-grid-kv">
-        <div><span class="kv-label">ArUco marker</span><span class="kv-val">#${cal.marker_id ?? "N/A"}</span></div>
-        <div><span class="kv-label">Pixel centre</span><span class="kv-val">(${cal.u_px ?? "—"}, ${cal.v_px ?? "—"}) px</span></div>
-        <div><span class="kv-label">Marker orientation</span><span class="kv-val">${cal.marker_angle_deg != null ? cal.marker_angle_deg + "°" : "N/A"}</span></div>
+        <div><span class="kv-label">Calibration mode</span><span class="kv-val">${cal.calibration_mode || "single_marker"} (${(cal.markers_detected || []).join(", ") || ("#" + (cal.marker_id ?? "N/A"))})</span></div>
+        <div><span class="kv-label">Plate yaw / RMS err</span><span class="kv-val">${cal.plate_yaw_deg != null ? cal.plate_yaw_deg + "°" : "0.0°"} / ${cal.residual_rms_mm != null ? cal.residual_rms_mm + " mm" : "—"}</span></div>
         <div><span class="kv-label">Camera skew</span><span class="kv-val" style="color:${Math.abs(cal.cam_skew_deg || 0) > 0.05 ? "var(--accent)" : "inherit"}">${cal.cam_skew_deg !== undefined ? cal.cam_skew_deg + "° (compensated)" : "0.0°"}</span></div>
         <div><span class="kv-label">Scale kx / ky</span><span class="kv-val">${cal.kx_mm_per_px || 0.25} / ${cal.ky_mm_per_px || 0.25} mm/px</span></div>
-        <div><span class="kv-label">Cam origin</span><span class="kv-val">(${cal.cam_origin_x_mm ?? 32.5}, ${cal.cam_origin_y_mm ?? 48.1}) mm</span></div>
-        <div><span class="kv-label">Cam → gripper offset</span><span class="kv-val">(${cal.offset_x_mm ?? 0.0}, ${cal.offset_y_mm ?? -54.1}) mm</span></div>
+        <div><span class="kv-label">Cam origin</span><span class="kv-val">(${cal.cam_origin_x_mm ?? 32.5}, ${cal.cam_origin_y_mm ?? 33.1}) mm</span></div>
+        <div><span class="kv-label">Cam → gripper offset</span><span class="kv-val">(${cal.offset_x_mm ?? -1.5}, ${cal.offset_y_mm ?? -41.6}) mm</span></div>
         <div><span class="kv-label">Course floor</span><span class="kv-val">+6.35 mm (¼″)</span></div>
       </div>
     </div>

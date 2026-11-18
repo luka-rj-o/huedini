@@ -12,6 +12,7 @@ import base64
 import logging
 import math
 import threading
+import time
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -84,10 +85,17 @@ class VisionPipeline:
         else:
             self._aruco_params = cv2.aruco.DetectorParameters_create()
 
-        # Pre-generate the 15x15 mm ArUco ID 0 marker image (60x60 px @ 0.25 mm/px)
-        self._synthetic_marker_img = self._generate_aruco_patch(
-            self.config.aruco_marker_id, side_px=48
+        # Pre-generate 15x15 mm ArUco markers for all configured corner fiducial IDs
+        self._synthetic_markers: Dict[int, np.ndarray] = {
+            int(mid): self._generate_aruco_patch(int(mid), side_px=60)
+            for mid in self.config.corner_fiducials_by_id
+        }
+        self._synthetic_marker_img = self._synthetic_markers.get(
+            self.config.aruco_marker_id,
+            self._generate_aruco_patch(self.config.aruco_marker_id, side_px=60),
         )
+        # Optional separate physical ground-truth kinematics for mock calibration tests
+        self.mock_ground_truth_kinematics: Optional[EyeInHandKinematics] = None
 
         # Ground-truth blocks for --mock-hardware mode
         self.simulated_blocks: List[SimulatedCourseBlock] = []
@@ -96,10 +104,10 @@ class VisionPipeline:
     def reset_simulated_course(self) -> None:
         """Populates 20x20 mm blocks across the 4 mass classes inside the reachable course."""
         self.simulated_blocks = [
-            SimulatedCourseBlock(1, "red", 80.0, 75.0, 28.0, 21.6),     # Aluminum (~21.6 g)
-            SimulatedCourseBlock(2, "green", 155.0, 82.0, 64.0, 15.1),  # High infill (~15 g)
-            SimulatedCourseBlock(3, "blue", 150.0, 125.0, 15.0, 10.2),  # Med infill (~10 g)
-            SimulatedCourseBlock(4, "yellow", 88.0, 122.0, 42.0, 5.1),  # Low infill (~5 g)
+            SimulatedCourseBlock(1, "white", 80.0, 75.0, 28.0, 21.6),  # Aluminum (~21.6 g)
+            SimulatedCourseBlock(2, "green", 155.0, 82.0, 64.0, 9.75), # High infill (~9.75 g)
+            SimulatedCourseBlock(3, "blue", 150.0, 125.0, 15.0, 7.05), # Med infill (~7.05 g)
+            SimulatedCourseBlock(4, "red", 88.0, 122.0, 42.0, 2.46),   # Low infill (~2.46 g)
         ]
 
     def open_camera(self) -> None:
@@ -167,8 +175,12 @@ class VisionPipeline:
                 self.open_camera()
 
             assert self._cap is not None
-            # Flush 3 stale frames from V4L2 ring buffer
-            for _ in range(3):
+            # Let gantry vibrations settle before capturing to prevent motion blur
+            settle_s = max(0.0, float(getattr(self.config, "scan_settle_s", 0.35)))
+            if settle_s > 0.0:
+                time.sleep(settle_s)
+            # Flush stale frames from V4L2 ring buffer
+            for _ in range(4):
                 self._cap.grab()
             ok, frame = self._cap.read()
             if not ok or frame is None:
@@ -409,14 +421,12 @@ class VisionPipeline:
 
         return detected_fiducials, detected_blocks
 
-    def detect_aruco_fiducial(
-        self, frame: np.ndarray, target_id: Optional[int] = None
-    ) -> Optional[Tuple[int, float, float, float]]:
+    def detect_all_aruco_fiducials(
+        self, frame: np.ndarray
+    ) -> List[Tuple[int, float, float, float]]:
         """
-        Detects an ArUco calibration marker (DICT_4X4_50).
-        If target_id is specified, looks for that specific marker ID.
-        If target_id is None, detects any corner fiducial from config (defaulting to
-        the marker closest to image center) and returns (marker_id, center_u_px, center_v_px, angle_deg).
+        Detects all DICT_4X4_50 ArUco markers in `frame` and returns a list of
+        (marker_id, center_u_px, center_v_px, angle_deg), sorted closest to center first.
         """
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if hasattr(cv2.aruco, "ArucoDetector"):
@@ -428,31 +438,44 @@ class VisionPipeline:
             )
 
         annotated = frame.copy()
+        results: List[Tuple[float, int, float, float, float]] = []
         if ids is not None and len(ids) > 0:
             cv2.aruco.drawDetectedMarkers(annotated, corners, ids)
             cx, cy = self.config.frame_width / 2.0, self.config.frame_height / 2.0
-            candidates = []
             for marker_corners, marker_id in zip(corners, ids.flatten()):
                 m_id = int(marker_id)
-                if target_id is not None and m_id != int(target_id):
-                    continue
-                pts = marker_corners[0]  # shape (4, 2)
+                pts = marker_corners[0]
                 u_px = float(np.mean(pts[:, 0]))
                 v_px = float(np.mean(pts[:, 1]))
                 dx = float(pts[1, 0] - pts[0, 0])
                 dy = float(pts[1, 1] - pts[0, 1])
                 angle_deg = math.degrees(math.atan2(dy, dx))
                 dist_center = (u_px - cx) ** 2 + (v_px - cy) ** 2
-                candidates.append((dist_center, m_id, u_px, v_px, angle_deg))
-
-            if candidates:
-                candidates.sort(key=lambda c: c[0])
-                _, best_id, u_px, v_px, angle_deg = candidates[0]
+                results.append((dist_center, m_id, u_px, v_px, angle_deg))
                 cv2.circle(annotated, (int(u_px), int(v_px)), 6, (0, 255, 0), -1)
-                self._encode_annotated_preview(annotated, f"ArUco ID {best_id}: ({u_px:.1f}, {v_px:.1f})")
-                return best_id, u_px, v_px, angle_deg
 
-        self._encode_annotated_preview(annotated, "ArUco search: no marker in view")
+        if results:
+            results.sort(key=lambda c: c[0])
+            summary = ", ".join(f"#{r[1]}({r[2]:.0f},{r[3]:.0f})" for r in results)
+            self._encode_annotated_preview(annotated, f"ArUco: {summary}")
+        else:
+            self._encode_annotated_preview(annotated, "ArUco search: no marker in view")
+
+        return [(r[1], r[2], r[3], r[4]) for r in results]
+
+    def detect_aruco_fiducial(
+        self, frame: np.ndarray, target_id: Optional[int] = None
+    ) -> Optional[Tuple[int, float, float, float]]:
+        """
+        Detects an ArUco calibration marker (DICT_4X4_50).
+        If target_id is specified, looks for that specific marker ID.
+        If target_id is None, detects any corner fiducial from config (defaulting to
+        the marker closest to image center) and returns (marker_id, center_u_px, center_v_px, angle_deg).
+        """
+        all_markers = self.detect_all_aruco_fiducials(frame)
+        for m_id, u_px, v_px, angle_deg in all_markers:
+            if target_id is None or m_id == int(target_id):
+                return m_id, u_px, v_px, angle_deg
         return None
 
     def detect_blocks_hsv(self, frame: np.ndarray) -> List[DetectedBlock]:
@@ -535,41 +558,70 @@ class VisionPipeline:
     ) -> np.ndarray:
         """
         Renders a top-down 640x480 BGR image of the course bed from the camera's
-        current (camera_x_mm, camera_y_mm, camera_z_mm) viewpoint, including the
-        ArUco calibration fiducial and all unpicked blocks.
+        current (camera_x_mm, camera_y_mm, camera_z_mm) viewpoint, including all 4
+        corner ArUco calibration fiducials and all unpicked blocks.
         """
         w, h = self.config.frame_width, self.config.frame_height
+        render_kin = self.mock_ground_truth_kinematics or self.kinematics
         # Matte dark gray course surface
         frame = np.full((h, w, 3), (38, 42, 46), dtype=np.uint8)
 
         # Draw subtle 20mm grid lines on course floor
         for gx in range(0, int(self.config.workspace_x_mm) + 1, 20):
-            u, _ = self.kinematics.world_to_pixel(
+            u, _ = render_kin.world_to_pixel(
                 gx, camera_y_mm, camera_x_mm, camera_y_mm, camera_z_mm, self.config.z_scan_mm
             )
             if 0 <= int(u) < w:
                 cv2.line(frame, (int(u), 0), (int(u), h), (48, 52, 58), 1)
         for gy in range(0, int(self.config.workspace_y_mm) + 1, 20):
-            _, v = self.kinematics.world_to_pixel(
+            _, v = render_kin.world_to_pixel(
                 camera_x_mm, gy, camera_x_mm, camera_y_mm, camera_z_mm, self.config.z_scan_mm
             )
             if 0 <= int(v) < h:
                 cv2.line(frame, (0, int(v)), (w, int(v)), (48, 52, 58), 1)
 
-        # 1. Draw the 4 corner ArUco calibration fiducials (15x15 mm squares on 284x167.4 mm border)
-        mh, mw = self._synthetic_marker_img.shape[:2]
-        for fx_mm, fy_mm in self.config.corner_fiducials_mm:
-            fu, fv = self.kinematics.world_to_pixel(
-                fx_mm,
-                fy_mm,
-                camera_x_mm,
-                camera_y_mm,
-                camera_z_mm,
-                self.config.z_scan_mm,
+        # 1. Draw the 4 corner ArUco calibration fiducials (15x15 mm + 3mm quiet border = 21x21 mm)
+        half_plate_mm = self.config.fiducial_size_mm / 2.0 + 3.0
+        for mid, (fx_mm, fy_mm) in self.config.corner_fiducials_by_id.items():
+            patch = self._synthetic_markers.get(mid, self._synthetic_marker_img)
+            ph, pw = patch.shape[:2]
+            dst_quad = np.array(
+                [
+                    render_kin.world_to_pixel(
+                        fx_mm - half_plate_mm, fy_mm + half_plate_mm,
+                        camera_x_mm, camera_y_mm, camera_z_mm, self.config.z_scan_mm,
+                    ),
+                    render_kin.world_to_pixel(
+                        fx_mm + half_plate_mm, fy_mm + half_plate_mm,
+                        camera_x_mm, camera_y_mm, camera_z_mm, self.config.z_scan_mm,
+                    ),
+                    render_kin.world_to_pixel(
+                        fx_mm + half_plate_mm, fy_mm - half_plate_mm,
+                        camera_x_mm, camera_y_mm, camera_z_mm, self.config.z_scan_mm,
+                    ),
+                    render_kin.world_to_pixel(
+                        fx_mm - half_plate_mm, fy_mm - half_plate_mm,
+                        camera_x_mm, camera_y_mm, camera_z_mm, self.config.z_scan_mm,
+                    ),
+                ],
+                dtype=np.float32,
             )
-            x0, y0 = int(round(fu - mw / 2)), int(round(fv - mh / 2))
-            if 0 <= x0 and x0 + mw <= w and 0 <= y0 and y0 + mh <= h:
-                frame[y0 : y0 + mh, x0 : x0 + mw] = self._synthetic_marker_img
+            min_x = float(np.min(dst_quad[:, 0]))
+            max_x = float(np.max(dst_quad[:, 0]))
+            min_y = float(np.min(dst_quad[:, 1]))
+            max_y = float(np.max(dst_quad[:, 1]))
+            if max_x < 0 or min_x >= w or max_y < 0 or min_y >= h:
+                continue
+            src_quad = np.array(
+                [[0, 0], [pw, 0], [pw, ph], [0, ph]], dtype=np.float32
+            )
+            M = cv2.getPerspectiveTransform(src_quad, dst_quad)
+            warped = cv2.warpPerspective(patch, M, (w, h), flags=cv2.INTER_LINEAR)
+            mask_poly = np.int32(dst_quad)
+            cv2.fillConvexPoly(frame, mask_poly, (0, 0, 0))
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillConvexPoly(mask, mask_poly, 255)
+            frame[mask > 0] = warped[mask > 0]
 
         # 2. Draw scattered colored blocks in BGR matching our HSV ranges
         bgr_map: Dict[str, Tuple[int, int, int]] = {
@@ -580,26 +632,29 @@ class VisionPipeline:
             "white": (245, 245, 245),
         }
 
-        height_ratio = self.kinematics._height_ratio(
+        height_ratio = render_kin._height_ratio(
             camera_z_mm, self.config.z_scan_mm, self.config.block_height_mm
         )
-        px_per_mm = 1.0 / (self.kinematics.kx_mm_per_px * height_ratio)
+        px_per_mm = 1.0 / (render_kin.kx_mm_per_px * height_ratio)
 
         for blk in self.simulated_blocks:
             if blk.picked:
                 continue
-            bu, bv = self.kinematics.world_to_pixel(
+            bu, bv = render_kin.world_to_pixel(
                 blk.x_mm,
                 blk.y_mm,
                 camera_x_mm,
                 camera_y_mm,
                 camera_z_mm,
                 self.config.z_scan_mm,
-                target_height_above_surface_mm=self.config.block_height_mm,
+                target_height_above_surface_mm=self.config.block_top_height_mm_at(
+                    blk.x_mm, blk.y_mm
+                ),
             )
             side_px = blk.size_mm * px_per_mm
             if -side_px <= bu <= w + side_px and -side_px <= bv <= h + side_px:
-                rect = ((float(bu), float(bv)), (float(side_px), float(side_px * 0.88)), float(blk.angle_deg))
+                rect_angle = float(blk.angle_deg) + float(render_kin.cam_skew_deg)
+                rect = ((float(bu), float(bv)), (float(side_px), float(side_px * 0.88)), rect_angle)
                 box = np.int32(cv2.boxPoints(rect))
                 color_bgr = bgr_map.get(blk.color, (200, 200, 200))
                 cv2.fillPoly(frame, [box], color_bgr)

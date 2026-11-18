@@ -27,17 +27,26 @@ class CalibrationRecord:
     timestamp: float = 0.0
     calibrated: bool = False
     origin_calibrated: bool = False
+    calibration_mode: str = "nominal"
+    markers_detected: List[int] = field(default_factory=list)
     marker_id: Optional[int] = None
     u_px: Optional[float] = None
     v_px: Optional[float] = None
     marker_angle_deg: Optional[float] = None
     cam_skew_deg: float = 0.0
+    cam_motor_skew_deg: float = 0.0
+    plate_yaw_deg: float = 0.0
+    plate_scale_x: float = 1.0
+    plate_scale_y: float = 1.0
+    residual_rms_mm: Optional[float] = None
+    residual_max_mm: Optional[float] = None
+    corner_residuals_mm: Dict[str, float] = field(default_factory=dict)
     kx_mm_per_px: float = 0.25
     ky_mm_per_px: float = 0.25
     cam_origin_x_mm: float = 32.5
-    cam_origin_y_mm: float = 48.1
-    offset_x_mm: float = 0.0
-    offset_y_mm: float = -54.1
+    cam_origin_y_mm: float = 33.1
+    offset_x_mm: float = -1.5
+    offset_y_mm: float = -41.6
 
 
 @dataclass
@@ -174,19 +183,42 @@ class RunReportRecorder:
         cam_origin_y: float,
         offset_x: float,
         offset_y: float,
+        calibration_mode: str = "single_marker",
+        markers_detected: Optional[List[int]] = None,
+        cam_motor_skew_deg: Optional[float] = None,
+        plate_yaw_deg: float = 0.0,
+        plate_scale_x: float = 1.0,
+        plate_scale_y: float = 1.0,
+        residual_rms_mm: Optional[float] = None,
+        residual_max_mm: Optional[float] = None,
+        corner_residuals_mm: Optional[Dict[int, float]] = None,
     ) -> None:
         with self._lock:
             if not self._current_report:
                 return
+            residuals_str = (
+                {str(k): round(float(v), 3) for k, v in corner_residuals_mm.items()}
+                if corner_residuals_mm
+                else {}
+            )
             rec = CalibrationRecord(
                 timestamp=time.time(),
                 calibrated=calibrated,
                 origin_calibrated=origin_calibrated,
+                calibration_mode=calibration_mode,
+                markers_detected=list(markers_detected or ([marker_id] if marker_id is not None else [])),
                 marker_id=marker_id,
                 u_px=round(u_px, 1) if u_px is not None else None,
                 v_px=round(v_px, 1) if v_px is not None else None,
                 marker_angle_deg=round(marker_angle_deg, 1) if marker_angle_deg is not None else None,
                 cam_skew_deg=round(cam_skew_deg, 2),
+                cam_motor_skew_deg=round(cam_motor_skew_deg if cam_motor_skew_deg is not None else cam_skew_deg, 2),
+                plate_yaw_deg=round(plate_yaw_deg, 3),
+                plate_scale_x=round(plate_scale_x, 4),
+                plate_scale_y=round(plate_scale_y, 4),
+                residual_rms_mm=round(residual_rms_mm, 3) if residual_rms_mm is not None else None,
+                residual_max_mm=round(residual_max_mm, 3) if residual_max_mm is not None else None,
+                corner_residuals_mm=residuals_str,
                 kx_mm_per_px=round(kx, 4),
                 ky_mm_per_px=round(ky, 4),
                 cam_origin_x_mm=round(cam_origin_x, 2),
@@ -315,10 +347,12 @@ class RunReportRecorder:
             f"- **Hardware Mode**: `{'MOCK' if r.get('mock_hardware') else 'PHYSICAL ESP32'}`",
             "",
             "## 1. Homing & Fiducial Calibration",
-            f"- **Marker ID**: `{cal.get('marker_id')}`",
+            f"- **Calibration Mode**: `{cal.get('calibration_mode', 'single_marker')}` (Markers: `{cal.get('markers_detected', [])}`)",
+            f"- **Primary Marker ID**: `{cal.get('marker_id')}`",
             f"- **Detected Pixel Position**: `({cal.get('u_px')}, {cal.get('v_px')}) px`",
             f"- **Marker Angle**: `{cal.get('marker_angle_deg')}°`",
-            f"- **Camera Skew Angle**: `{cal.get('cam_skew_deg')}°` (Physical Tilt Compensation)",
+            f"- **Camera Skew Angle**: `{cal.get('cam_skew_deg')}°` (Plate Yaw: `{cal.get('plate_yaw_deg', 0.0)}°`)",
+            f"- **Fit Residual (RMS / Max)**: `{cal.get('residual_rms_mm')} / {cal.get('residual_max_mm')} mm`",
             f"- **Pixel Scale Kx / Ky**: `{cal.get('kx_mm_per_px')} / {cal.get('ky_mm_per_px')} mm/px`",
             f"- **Calibrated Camera Origin**: `({cal.get('cam_origin_x_mm')}, {cal.get('cam_origin_y_mm')}) mm` wrt plate",
             f"- **Gripper Offset**: `({cal.get('offset_x_mm')}, {cal.get('offset_y_mm')}) mm`",

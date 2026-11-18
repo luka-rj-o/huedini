@@ -5,7 +5,7 @@ Core 6-Phase Operational State Machine for the HUE-DINI Gantry Robot:
   Phase 3: SCANNING     — Multi-point stop-and-capture global course scan
   Phase 4: PLANNING     — Deduplicated block catalog & clearance-based pick order
   Phase 5: PICKING & WEIGHING — Fine visual alignment, angle match, NC solenoid grip, HX711 weigh
-  Phase 6: STACKING     — Sort by color & mass (rejecting out-of-spec weights) and stack
+  Phase 6: STACKING     — Sort by color & mass into pedestal/laydown zones and stack
 """
 
 from collections import deque
@@ -104,6 +104,13 @@ class GantryStateMachine:
         self.vision.open_camera()
         self.serial.connect()
 
+        if self.serial.is_connected:
+            try:
+                self.serial.play_chime("WIN95")
+                self.log_event("Played boot chime (Windows 95 startup theme).")
+            except Exception as exc:
+                logger.debug("Boot startup chime skipped: %s", exc)
+
         # Render initial stationary preview frame in IDLE
         frame = self.vision.capture_stationary_frame(
             self.serial.pose.x_mm, self.serial.pose.y_mm, self.serial.pose.z_mm
@@ -147,9 +154,19 @@ class GantryStateMachine:
             "calibration": {
                 "calibrated": self.kinematics.calibrated,
                 "origin_calibrated": self.kinematics.origin_calibrated,
+                "calibration_mode": self.kinematics.calibration_mode,
+                "markers_detected": list(self.kinematics.markers_detected),
                 "cam_origin_x_mm": round(self.kinematics.cam_origin_x_mm, 2),
                 "cam_origin_y_mm": round(self.kinematics.cam_origin_y_mm, 2),
                 "cam_skew_deg": round(self.kinematics.cam_skew_deg, 2),
+                "cam_motor_skew_deg": round(self.kinematics.cam_motor_skew_deg, 2),
+                "plate_yaw_deg": round(self.kinematics.plate_yaw_deg, 3),
+                "plate_scale_x": round(self.kinematics.plate_scale_x, 4),
+                "plate_scale_y": round(self.kinematics.plate_scale_y, 4),
+                "residual_rms_mm": self.kinematics.residual_rms_mm,
+                "residual_max_mm": self.kinematics.residual_max_mm,
+                "corner_residuals_mm": {str(k): v for k, v in self.kinematics.corner_residuals_mm.items()},
+                "plate_transform": self.kinematics.plate_transform_dict(),
                 "kx_mm_per_px": round(self.kinematics.kx_mm_per_px, 4),
                 "ky_mm_per_px": round(self.kinematics.ky_mm_per_px, 4),
             },
@@ -165,10 +182,31 @@ class GantryStateMachine:
     def _on_pose_updated(self, pose: GantryPose) -> None:
         self.publish_telemetry()
 
+    def _activate_emergency_stop(self, reason: str, notify_esp32: bool) -> None:
+        self._estop_active = True
+        self._start_requested = False
+        self.state = "ESTOPPED"
+        if notify_esp32:
+            self.serial.trigger_emergency_stop()
+        self.log_event(reason)
+        while not self._cmd_queue.empty():
+            try:
+                self._cmd_queue.get_nowait()
+                self._cmd_queue.task_done()
+            except queue.Empty:
+                break
+        self.publish_telemetry()
+
     def _on_hardware_event(self, event_name: str) -> None:
         if event_name == "START_SCAN":
-            self.log_event("Hardware START button pressed on ESP32.")
-            self._start_requested = True
+            self._on_user_command("START_SCAN", {"source": "hardware"})
+        elif event_name == "EMERGENCY_STOP":
+            self._activate_emergency_stop(
+                "Hardware E-STOP switch triggered on ESP32! All steppers disabled.",
+                notify_esp32=False,
+            )
+        elif event_name == "CHIME_BTN":
+            self.log_event("Hardware CHIME switch pressed on ESP32.")
 
     def _on_user_command(self, cmd: str, data: dict) -> None:
         """
@@ -177,19 +215,10 @@ class GantryStateMachine:
         commands are queued to a background worker thread so the WebSocket server never blocks.
         """
         if cmd == "EMERGENCY_STOP":
-            self._estop_active = True
-            self._start_requested = False
-            self.state = "ESTOPPED"
-            self.serial.trigger_emergency_stop()
-            self.log_event("EMERGENCY STOP triggered! All steppers disabled.")
-            # Clear any pending commands in queue
-            while not self._cmd_queue.empty():
-                try:
-                    self._cmd_queue.get_nowait()
-                    self._cmd_queue.task_done()
-                except queue.Empty:
-                    break
-            self.publish_telemetry()
+            self._activate_emergency_stop(
+                "EMERGENCY STOP triggered! All steppers disabled.",
+                notify_esp32=True,
+            )
             return
 
         self._cmd_queue.put((cmd, data))
@@ -219,7 +248,8 @@ class GantryStateMachine:
                     self.vision.reset_simulated_course()
                 self.planner.clear()
                 self._start_requested = True
-                self.log_event("Received START_SCAN trigger from Tier 1 Dashboard.")
+                source = "hardware START switch (ESP32)" if data.get("source") == "hardware" else "Tier 1 Dashboard"
+                self.log_event(f"Received START_SCAN trigger from {source}.")
         elif cmd == "PAUSE":
             self._pause_requested = True
             self.log_event("System PAUSED by user.")
@@ -355,6 +385,17 @@ class GantryStateMachine:
                     self.log_event(f"Manual TX '{raw_line}' -> OK ({', '.join(replies) if replies else 'done'})")
                 except Exception as exc:
                     self.log_event(f"Manual TX '{raw_line}' failed: {exc}")
+        elif cmd == "PLAY_CHIME":
+            if self.state in ("IDLE", "COMPLETE", "ERROR"):
+                tune = str(data.get("tune", "TADA")).strip() or "TADA"
+                try:
+                    self.serial.ensure_awake()
+                    self.serial.play_chime(tune)
+                    self.log_event(f"Played victory chime ({tune}).")
+                except Exception as exc:
+                    self.log_event(f"Victory chime failed: {exc}")
+            else:
+                self.log_event(f"Cannot play chime while state is {self.state}.")
 
     def _check_pause_or_abort(self) -> None:
         if self._pause_requested and not self._estop_active and self._running:
@@ -430,6 +471,11 @@ class GantryStateMachine:
                 self._run_full_cycle()
                 self.reports.finish_run(status="COMPLETED")
             except Exception as exc:
+                try:
+                    if not self.serial.pose.grip_closed:
+                        self.serial.set_gripper(closed=True)
+                except Exception:
+                    pass
                 exc_str = str(exc)
                 if not self._estop_active:
                     self.state = "ERROR"
@@ -444,27 +490,50 @@ class GantryStateMachine:
 
     def _run_full_cycle(self) -> None:
         # ==============================================================
-        # PHASE 2: Homing & Eye-in-Hand Self-Calibration (CALIBRATING)
+        # PHASE 2: Homing & 4-ArUco Ground-Truth Calibration (CALIBRATING)
         # ==============================================================
         self.state = "CALIBRATING"
         self.log_event("Phase 2 [CALIBRATING]: Homing Z, X, Y axes via TMC2209 StallGuard4...")
         self._check_pause_or_abort()
         self.serial.home_all()
 
-        # Move to base fiducial marker at scanning height Z_scan
-        fx, fy = self.config.fiducial_base_x_mm, self.config.fiducial_base_y_mm
+        # Reset kinematic plate transform prior to fresh calibration
+        self.kinematics.cam_origin_x_mm = self.config.nominal_cam_origin_x_mm
+        self.kinematics.cam_origin_y_mm = self.config.nominal_cam_origin_y_mm
+        self.kinematics.cam_skew_deg = self.config.default_cam_skew_deg
+        self.kinematics.cam_motor_skew_deg = self.config.default_cam_skew_deg
+        self.kinematics.plate_yaw_deg = 0.0
+        self.kinematics._plate_A = None
+        self.kinematics._plate_t = None
+        self.kinematics._plate_A_inv = None
+        self.kinematics._plate_t_inv = None
+        self.kinematics.origin_calibrated = False
+        self.kinematics.calibrated = False
+
         z_scan = self.config.z_scan_mm
-        self.log_event(f"Moving camera above base ArUco fiducial at ({fx:.1f}, {fy:.1f}, {z_scan:.1f}) mm...")
+        corner_wps = dict(getattr(self.config, "calibration_corner_waypoints_mm", {}))
+        if not corner_wps:
+            corner_wps = {1: (self.config.fiducial_base_x_mm, self.config.fiducial_base_y_mm)}
+
+        wp_items = list(corner_wps.items())
+        first_id, (fx, fy) = wp_items[0]
+
+        # 2A. Visit primary corner fiducial & take 2-frame step for pixel scale (Kx, Ky)
+        self.log_event(
+            f"Visiting Corner ArUco #{first_id} at motor ({fx:.1f}, {fy:.1f}, {z_scan:.1f}) mm..."
+        )
         self.serial.move_to(x_mm=fx, y_mm=fy, z_mm=z_scan, angle_deg=0.0)
         self._check_pause_or_abort()
 
-        # Stop-and-Capture Frame A
+        observations = []  # (marker_id, u_px, v_px, motor_x, motor_y, angle_deg)
         frame_a = self.vision.capture_stationary_frame(
             self.serial.pose.x_mm, self.serial.pose.y_mm, self.serial.pose.z_mm
         )
-        fid_a = self.vision.detect_aruco_fiducial(frame_a)
+        fids_a = self.vision.detect_all_aruco_fiducials(frame_a)
+        for m_id, u_px, v_px, ang in fids_a:
+            if m_id in self.kinematics.corner_fiducials:
+                observations.append((m_id, u_px, v_px, fx, fy, ang))
 
-        # Step a known physical distance (+dx, +dy) and capture Frame B
         step_x = self.config.calibration_step_x_mm
         step_y = self.config.calibration_step_y_mm
         self.serial.move_to(x_mm=fx + step_x, y_mm=fy + step_y, z_mm=z_scan)
@@ -473,44 +542,85 @@ class GantryStateMachine:
         frame_b = self.vision.capture_stationary_frame(
             self.serial.pose.x_mm, self.serial.pose.y_mm, self.serial.pose.z_mm
         )
-        fid_b = self.vision.detect_aruco_fiducial(frame_b, target_id=fid_a[0] if fid_a else None)
+        fids_b = self.vision.detect_all_aruco_fiducials(frame_b)
+        for m_id, u_px, v_px, ang in fids_b:
+            if m_id in self.kinematics.corner_fiducials:
+                observations.append((m_id, u_px, v_px, fx + step_x, fy + step_y, ang))
 
-        if fid_a is not None and fid_b is not None:
+        # Match a marker seen in both Frame A and Frame B for local pixel scale + camera-to-motor twist
+        step_obs = None
+        fids_a_map = {m_id: (u_px, v_px, ang) for m_id, u_px, v_px, ang in fids_a}
+        fids_b_map = {m_id: (u_px, v_px, ang) for m_id, u_px, v_px, ang in fids_b}
+        common_ids = [mid for mid in fids_a_map if mid in fids_b_map and mid in self.kinematics.corner_fiducials]
+        primary_fid = None
+        if common_ids:
+            scale_id = first_id if first_id in common_ids else common_ids[0]
+            u1, v1, _a1 = fids_a_map[scale_id]
+            u2, v2, a2 = fids_b_map[scale_id]
+            primary_fid = (scale_id, u2, v2, a2)
             try:
-                # fid_a: (marker_id, u_px, v_px, angle_deg)
-                marker_id = fid_a[0]
-                kx, ky = self.kinematics.compute_auto_scale(
-                    fid_a[1], fid_a[2], fid_b[1], fid_b[2], step_x, step_y
-                )
+                kx, ky = self.kinematics.compute_auto_scale(u1, v1, u2, v2, step_x, step_y)
+                step_obs = (u1, v1, fx, fy, u2, v2, fx + step_x, fy + step_y)
                 self.log_event(
-                    f"Auto-Scale calibrated on Marker #{marker_id}! Kx={kx:.4f} mm/px, Ky={ky:.4f} mm/px at Z={z_scan:.0f} mm."
+                    f"Auto-Scale calibrated on Marker #{scale_id}: Kx={kx:.4f} mm/px, Ky={ky:.4f} mm/px at Z={z_scan:.0f} mm."
                 )
-                # Calibrate primary coordinate system origin using ground truth fiducial and camera skew
-                ox, oy = self.kinematics.calibrate_origin(
-                    marker_id=marker_id,
-                    u_px=fid_b[1],
-                    v_px=fid_b[2],
-                    motor_x_mm=fx + step_x,
-                    motor_y_mm=fy + step_y,
-                    fid_angle_deg=fid_b[3],
+            except Exception as exc:
+                self.log_event(f"Auto-Scale step failed ({exc}); keeping Kx={self.kinematics.kx_mm_per_px:.4f} mm/px.")
+
+        # 2B. Visit the remaining 3 corner ArUco markers to cross-reference full course geometry
+        for corner_id, (cx_m, cy_m) in wp_items[1:]:
+            self._check_pause_or_abort()
+            self.log_event(
+                f"Scanning Corner ArUco #{corner_id} at motor ({cx_m:.1f}, {cy_m:.1f}, {z_scan:.1f}) mm..."
+            )
+            self.serial.move_to(x_mm=cx_m, y_mm=cy_m, z_mm=z_scan, angle_deg=0.0)
+            self._check_pause_or_abort()
+            c_frame = self.vision.capture_stationary_frame(
+                self.serial.pose.x_mm, self.serial.pose.y_mm, self.serial.pose.z_mm
+            )
+            c_fids = self.vision.detect_all_aruco_fiducials(c_frame)
+            for m_id, u_px, v_px, ang in c_fids:
+                if m_id in self.kinematics.corner_fiducials:
+                    observations.append((m_id, u_px, v_px, cx_m, cy_m, ang))
+                    if primary_fid is None:
+                        primary_fid = (m_id, u_px, v_px, ang)
+
+        # 2C. Solve unified ground-truth Plate <-> Motor transform across all observed markers
+        if observations:
+            try:
+                cal_res = self.kinematics.calibrate_from_fiducials(
+                    observations, step_observation=step_obs
                 )
+                detected_ids = cal_res["markers_detected"]
                 self.log_event(
-                    f"Primary Coordinate System Calibrated to Fiducials! Camera origin = ({ox:.1f}, {oy:.1f}) mm, Skew = {self.kinematics.cam_skew_deg:+.2f}° wrt plate."
+                    f"Ground-Truth Calibration [{cal_res['mode']}] using ArUcos {detected_ids}: "
+                    f"Cam origin=({cal_res['cam_origin_x_mm']:.2f}, {cal_res['cam_origin_y_mm']:.2f}) mm, "
+                    f"Plate yaw={cal_res['plate_yaw_deg']:+.2f}°, Cam skew={cal_res['cam_skew_deg']:+.2f}°, "
+                    f"RMS err={cal_res['residual_rms_mm']:.3f} mm (max {cal_res['residual_max_mm']:.3f} mm)."
                 )
                 self.reports.record_calibration(
                     calibrated=True,
                     origin_calibrated=True,
-                    marker_id=marker_id,
-                    u_px=fid_b[1],
-                    v_px=fid_b[2],
-                    marker_angle_deg=fid_b[3],
+                    marker_id=primary_fid[0] if primary_fid else detected_ids[0],
+                    u_px=primary_fid[1] if primary_fid else None,
+                    v_px=primary_fid[2] if primary_fid else None,
+                    marker_angle_deg=primary_fid[3] if primary_fid else None,
                     cam_skew_deg=self.kinematics.cam_skew_deg,
-                    kx=kx,
-                    ky=ky,
-                    cam_origin_x=ox,
-                    cam_origin_y=oy,
+                    kx=self.kinematics.kx_mm_per_px,
+                    ky=self.kinematics.ky_mm_per_px,
+                    cam_origin_x=self.kinematics.cam_origin_x_mm,
+                    cam_origin_y=self.kinematics.cam_origin_y_mm,
                     offset_x=self.kinematics.offset_x_mm,
                     offset_y=self.kinematics.offset_y_mm,
+                    calibration_mode=cal_res["mode"],
+                    markers_detected=detected_ids,
+                    cam_motor_skew_deg=cal_res["cam_motor_skew_deg"],
+                    plate_yaw_deg=cal_res["plate_yaw_deg"],
+                    plate_scale_x=cal_res["scale_x"],
+                    plate_scale_y=cal_res["scale_y"],
+                    residual_rms_mm=cal_res["residual_rms_mm"],
+                    residual_max_mm=cal_res["residual_max_mm"],
+                    corner_residuals_mm=cal_res["corner_residuals_mm"],
                 )
             except Exception as exc:
                 self.kinematics.calibrated = True
@@ -520,10 +630,10 @@ class GantryStateMachine:
                 self.reports.record_calibration(
                     calibrated=True,
                     origin_calibrated=False,
-                    marker_id=fid_a[0] if fid_a else None,
-                    u_px=fid_a[1] if fid_a else None,
-                    v_px=fid_a[2] if fid_a else None,
-                    marker_angle_deg=fid_a[3] if fid_a else None,
+                    marker_id=primary_fid[0] if primary_fid else None,
+                    u_px=primary_fid[1] if primary_fid else None,
+                    v_px=primary_fid[2] if primary_fid else None,
+                    marker_angle_deg=primary_fid[3] if primary_fid else None,
                     cam_skew_deg=self.kinematics.cam_skew_deg,
                     kx=self.kinematics.kx_mm_per_px,
                     ky=self.kinematics.ky_mm_per_px,
@@ -531,11 +641,14 @@ class GantryStateMachine:
                     cam_origin_y=self.kinematics.cam_origin_y_mm,
                     offset_x=self.kinematics.offset_x_mm,
                     offset_y=self.kinematics.offset_y_mm,
+                    calibration_mode="nominal_fallback",
                 )
         else:
             self.kinematics.calibrated = True
+            self.kinematics.calibration_mode = "nominal_fallback"
+            self.kinematics.markers_detected = []
             self.log_event(
-                f"Fiducial not in view; using default scale Kx={self.kinematics.kx_mm_per_px:.4f} mm/px and nominal CAD origin."
+                f"No corner ArUco fiducials detected; using default scale Kx={self.kinematics.kx_mm_per_px:.4f} mm/px and nominal CAD origin."
             )
             self.reports.record_calibration(
                 calibrated=True,
@@ -551,6 +664,7 @@ class GantryStateMachine:
                 cam_origin_y=self.kinematics.cam_origin_y_mm,
                 offset_x=self.kinematics.offset_x_mm,
                 offset_y=self.kinematics.offset_y_mm,
+                calibration_mode="nominal_fallback",
             )
 
         # ==============================================================
@@ -578,6 +692,17 @@ class GantryStateMachine:
                     z_scan,
                     target_height_above_surface_mm=self.config.block_height_mm,
                 )
+                # Re-project once if the block rests on the raised 76.2x76.2 mm aluminum platform
+                if self.config.surface_z_up_mm_at(wx, wy) > self.config.course_elevation_mm + 1e-3:
+                    wx, wy = self.kinematics.pixel_to_world_mm(
+                        det.u_px,
+                        det.v_px,
+                        gx,
+                        gy,
+                        z_scan,
+                        z_scan,
+                        target_height_above_surface_mm=self.config.block_top_height_mm_at(wx, wy),
+                    )
                 comp_angle = self.kinematics.compensate_block_angle(det.angle_deg)
                 self.planner.merge_detection(det.color, wx, wy, comp_angle)
                 det_records.append({
@@ -614,28 +739,73 @@ class GantryStateMachine:
         self.state = "PLANNING"
         self._check_pause_or_abort()
         pick_queue = self.planner.compute_pick_sequence(
-            self.serial.pose.x_mm, self.serial.pose.y_mm
+            self.serial.pose.x_mm,
+            self.serial.pose.y_mm,
+            stack_zones_mm=self.config.stack_zones_mm,
         )
+        total_blocks = len(pick_queue)
         self.log_event(
-            f"Phase 4 [PLANNING]: Computed clearance-optimized pick order for {len(pick_queue)} blocks."
+            f"Phase 4 [PLANNING]: Computed laydown-first, sequential pick order for {total_blocks} blocks."
         )
 
         # ==============================================================
         # PHASE 5 & 6: Pick, Align, Weigh (PICKING / WEIGHING) & Sort/Stack (STACKING)
         # ==============================================================
-        for block in pick_queue:
+        pair_stage_counts = {}
+        cycles_done = 0
+        max_cycles = max(8, total_blocks * 6)
+
+        while pick_queue:
             self._check_pause_or_abort()
-            self._execute_pick_weigh_and_stack(block)
+            cycles_done += 1
+            if cycles_done > max_cycles:
+                raise RuntimeError("Exceeded max pick/staging cycles; aborting to prevent infinite loop.")
+
+            block = pick_queue.pop(0)
+            staged_blocker_id = self._execute_pick_weigh_and_stack(block)
+            if staged_blocker_id is not None:
+                pair = (block.id, staged_blocker_id)
+                pair_stage_counts[pair] = pair_stage_counts.get(pair, 0) + 1
+                if pair_stage_counts[pair] > 3:
+                    raise RuntimeError(
+                        f"Repeated staging loop between Block #{block.id} and blocker Block #{staged_blocker_id}."
+                    )
+                pick_queue = self.planner.compute_pick_sequence(
+                    block.x_mm,
+                    block.y_mm,
+                    stack_zones_mm=self.config.stack_zones_mm,
+                    priority_block_id=staged_blocker_id,
+                    deferred_block_ids={block.id},
+                )
 
         # Return to home park position: retract Z first to avoid collisions, park clear of Y blanking stop
         self.serial.move_to(z_mm=self.config.z_scan_mm, feedrate_mm_s=self.config.feedrate_z_mm_s)
         self.serial.move_to(x_mm=20.0, y_mm=30.0, angle_deg=0.0)
         self.state = "COMPLETE"
         self.log_event(
-            f"All {len(pick_queue)} blocks processed and sorted! Returning to IDLE/COMPLETE."
+            f"All {total_blocks} blocks processed and sorted! Returning to IDLE/COMPLETE."
         )
+        try:
+            self.serial.play_chime("TADA")
+            self.log_event("Played completion chime (Windows 3.1 Tada!).")
+        except Exception as exc:
+            logger.debug("Completion chime skipped: %s", exc)
 
-    def _execute_pick_weigh_and_stack(self, block: BlockRecord) -> None:
+    def _safe_transit_z_down(self, clearance_margin_mm: float = 11.0) -> float:
+        """
+        Computes safe transit Z_down clearance.
+        At z_hover_mm (25.0 mm), the end-effector naturally clears 1-high (26.35 mm)
+        and 2-high (46.35 mm) RGB stacks as well as 1-high Aluminum (35.9 mm).
+        Only raise transit Z above z_hover_mm once a 3rd+ cube stack (> 48.0 mm top)
+        exists so 1- and 2-cube stacks do not trigger unnecessary Z travel.
+        """
+        max_top_z_up = self.planner.max_stack_top_z_up_mm(self.config.stack_zones_mm)
+        if max_top_z_up <= 48.0:
+            return self.config.z_hover_mm
+        req_z_down = self.config.base_plate_z_down_mm - (max_top_z_up + clearance_margin_mm)
+        return round(max(0.0, min(self.config.z_hover_mm, req_z_down)), 2)
+
+    def _execute_pick_weigh_and_stack(self, block: BlockRecord, can_stage: bool = True) -> Optional[int]:
         pick_record = PickActionRecord(
             block_id=block.id,
             color=block.color,
@@ -643,6 +813,8 @@ class GantryStateMachine:
             target_plate_y=round(block.y_mm, 2),
             target_angle_deg=round(block.angle_deg, 1),
         )
+        picked_sb = None
+        staged_blocker_id: Optional[int] = None
 
         try:
             # --- PHASE 5A: Move Camera Above Block & Stop-and-Check Fine Alignment ---
@@ -654,14 +826,17 @@ class GantryStateMachine:
             pick_record.camera_motor_x = round(cam_mx, 2)
             pick_record.camera_motor_y = round(cam_my, 2)
 
+            transit_z = self._safe_transit_z_down()
             self.log_event(
                 f"Phase 5 [PICKING]: Moving camera above Block #{block.id} ({block.color.upper()}) "
-                f"at plate ({block.x_mm:.1f}, {block.y_mm:.1f}) mm -> motor ({cam_mx:.1f}, {cam_my:.1f}) mm..."
+                f"at plate ({block.x_mm:.1f}, {block.y_mm:.1f}) mm -> motor ({cam_mx:.1f}, {cam_my:.1f}, Z={transit_z:.1f}) mm..."
             )
+            if self.serial.pose.z_mm > transit_z + 0.1:
+                self.serial.move_to(z_mm=transit_z, feedrate_mm_s=self.config.feedrate_z_mm_s)
             self.serial.move_to(
                 x_mm=cam_mx,
                 y_mm=cam_my,
-                z_mm=self.config.z_hover_mm,
+                z_mm=transit_z,
                 angle_deg=0.0,
             )
             self._check_pause_or_abort()
@@ -682,7 +857,9 @@ class GantryStateMachine:
                     self.serial.pose.y_mm,
                     self.serial.pose.z_mm,
                     self.config.z_scan_mm,
-                    target_height_above_surface_mm=self.config.block_height_mm,
+                    target_height_above_surface_mm=self.config.block_top_height_mm_at(
+                        block.x_mm, block.y_mm
+                    ),
                 )
                 refined_angle = self.kinematics.compensate_block_angle(best.angle_deg)
                 # For square blocks (90 deg rotational symmetry), keep refined angle within +/-45 deg of coarse angle
@@ -726,7 +903,7 @@ class GantryStateMachine:
             grip_mx, grip_my = self.kinematics.plate_to_gripper_motor(block.x_mm, block.y_mm)
             grip_mx = max(0.0, min(self.config.travel_x_mm, grip_mx))
             grip_my = max(0.0, min(self.config.travel_y_mm, grip_my))
-            servo_angle = round(block.angle_deg % 90.0, 1)
+            servo_angle = self.kinematics.servo_angle_for_plate_angle(block.angle_deg)
             pick_record.gripper_motor_x = round(grip_mx, 2)
             pick_record.gripper_motor_y = round(grip_my, 2)
             pick_record.servo_angle_deg = servo_angle
@@ -734,7 +911,7 @@ class GantryStateMachine:
             self.serial.move_to(
                 x_mm=grip_mx,
                 y_mm=grip_my,
-                z_mm=self.config.z_hover_mm,
+                z_mm=transit_z,
                 angle_deg=servo_angle,
                 feedrate_mm_s=self.config.feedrate_fine_mm_s,
             )
@@ -748,8 +925,13 @@ class GantryStateMachine:
                 pick_record.tare_success = False
                 self.log_event(f"Notice: Tare scale skipped ({exc}).")
 
+            pick_z_down = self.config.surface_pick_z_down_mm(block.x_mm, block.y_mm)
+            if pick_z_down < self.config.z_pick_mm - 0.1:
+                self.log_event(
+                    f"Topology [PICKING]: Block #{block.id} rests on raised aluminum platform -> picking at Z_down={pick_z_down:.2f} mm."
+                )
             self.serial.set_gripper(closed=False)  # Energize relay to open NC jaws
-            self.serial.move_to(z_mm=self.config.z_pick_mm, feedrate_mm_s=self.config.feedrate_z_mm_s)
+            self.serial.move_to(z_mm=pick_z_down, feedrate_mm_s=self.config.feedrate_z_mm_s)
             self.serial.set_gripper(closed=True)   # De-energize relay so NC solenoid grips block
 
             # Mark closest ground-truth block as picked in synthetic renderer if in mock mode
@@ -761,10 +943,11 @@ class GantryStateMachine:
                         key=lambda sb: (sb.x_mm - block.x_mm) ** 2 + (sb.y_mm - block.y_mm) ** 2,
                     )
                     nearest_sb.picked = True
+                    picked_sb = nearest_sb
                     self.serial.set_simulated_held_mass(nearest_sb.mass_g)
 
-            # Lift to hover height
-            self.serial.move_to(z_mm=self.config.z_hover_mm, feedrate_mm_s=self.config.feedrate_z_mm_s)
+            # Lift to safe transit height (clears tallest existing stack on the course)
+            self.serial.move_to(z_mm=transit_z, feedrate_mm_s=self.config.feedrate_z_mm_s)
 
             # --- PHASE 5B: Weigh Block on HX711 Load Cell & Classify Mass ---
             self.state = "WEIGHING"
@@ -772,8 +955,8 @@ class GantryStateMachine:
             try:
                 measured_mass_g = self.serial.weigh_block()
             except Exception as exc:
-                self.log_event(f"Notice: Load cell sample failed ({exc}); assigning default nominal mass 10.0g.")
-                measured_mass_g = 10.0
+                self.log_event(f"Notice: Load cell sample failed ({exc}); assigning default nominal mass 7.05g.")
+                measured_mass_g = 7.05
 
             self._current_mass_g = round(measured_mass_g, 2)
             block.mass_g = measured_mass_g
@@ -786,20 +969,52 @@ class GantryStateMachine:
                 f"-> class [{block.mass_class.upper()}]."
             )
 
-            # --- PHASE 6: Sort & Stack (Drop-off at X=224.5, Y=44.5, Z=+12.6 mm -> Z_down=57.76 mm) ---
+            # --- PHASE 6: Sort & Laydown (Aluminum pedestal vs Red/Green/Blue laydown areas) ---
             self.state = "STACKING"
             self._check_pause_or_abort()
-            drop_plate_x, drop_plate_y, drop_z_down, is_rejected = self.planner.get_stack_target(
+            drop_plate_x, drop_plate_y, drop_z_down, zone_key = self.planner.get_stack_target(
                 color=block.color,
                 mass_class=block.mass_class,
                 stack_zones_mm=self.config.stack_zones_mm,
-                base_pick_z_down_mm=self.config.z_dropoff_base_down_mm,
+                base_plate_z_down_mm=self.config.base_plate_z_down_mm,
+                commit=False,
             )
-            zone_label = (
-                "REJECT ZONE"
-                if is_rejected
-                else f"{block.mass_class.upper()} / {block.color.upper()} STACK"
+
+            blocker = self.planner.find_zone_obstruction(
+                drop_plate_x,
+                drop_plate_y,
+                exclude_block_id=block.id,
             )
+            stage_pt = None
+            if blocker is not None:
+                if not can_stage:
+                    raise RuntimeError(
+                        f"Cannot stack Block #{block.id}: destination {zone_key.upper()} blocked by Block #{blocker.id} and staging disallowed."
+                    )
+                stage_pt = self.planner.find_staging_spot(
+                    ref_x_mm=block.x_mm,
+                    ref_y_mm=block.y_mm,
+                    stack_zones_mm=self.config.stack_zones_mm,
+                    exclude_block_id=block.id,
+                    kinematics=self.kinematics,
+                    travel_x_mm=self.config.travel_x_mm,
+                    travel_y_mm=self.config.travel_y_mm,
+                    min_safe_y_mm=self.config.servo_safe_y_mm,
+                    aluminum_platform_size_mm=self.config.aluminum_platform_size_mm,
+                )
+                if stage_pt is None:
+                    raise RuntimeError(
+                        f"Cannot stack Block #{block.id}: destination {zone_key.upper()} blocked by Block #{blocker.id} and no clear staging spot exists."
+                    )
+
+            if blocker is not None and stage_pt is not None:
+                staged_blocker_id = blocker.id
+                drop_plate_x, drop_plate_y = stage_pt
+                drop_z_down = self.config.surface_pick_z_down_mm(drop_plate_x, drop_plate_y)
+                zone_label = f"STAGE_TEMP (Blocked by #{blocker.id})"
+            else:
+                zone_label = f"{zone_key.upper()} ({block.mass_class.upper()})"
+
             pick_record.drop_plate_x = round(drop_plate_x, 2)
             pick_record.drop_plate_y = round(drop_plate_y, 2)
             pick_record.drop_z_down_mm = round(drop_z_down, 2)
@@ -809,37 +1024,66 @@ class GantryStateMachine:
             drop_mx, drop_my = self.kinematics.plate_to_gripper_motor(drop_plate_x, drop_plate_y)
             drop_mx = max(0.0, min(self.config.travel_x_mm, drop_mx))
             drop_my = max(0.0, min(self.config.travel_y_mm, drop_my))
-            self.log_event(
-                f"Phase 6 [STACKING]: Routing Block #{block.id} to {zone_label} "
-                f"at plate ({drop_plate_x:.1f}, {drop_plate_y:.1f}) -> motor ({drop_mx:.1f}, {drop_my:.1f}, Z_down={drop_z_down:.1f}) mm..."
-            )
+            if staged_blocker_id is not None:
+                self.log_event(
+                    f"Phase 6 [STAGING]: Destination {zone_key.upper()} blocked by Block #{blocker.id} "
+                    f"({blocker.color.upper()} at {blocker.x_mm:.1f}, {blocker.y_mm:.1f}); "
+                    f"staging Block #{block.id} at intermediate ({drop_plate_x:.1f}, {drop_plate_y:.1f}) mm "
+                    f"-> motor ({drop_mx:.1f}, {drop_my:.1f}, Z_down={drop_z_down:.1f}) mm..."
+                )
+            else:
+                self.log_event(
+                    f"Phase 6 [STACKING]: Routing Block #{block.id} to {zone_label} "
+                    f"at plate ({drop_plate_x:.1f}, {drop_plate_y:.1f}) -> motor ({drop_mx:.1f}, {drop_my:.1f}, Z_down={drop_z_down:.1f}) mm..."
+                )
 
-            # Travel at hover height (Z_down = z_hover_mm, closer to 0=top) to target stack coordinate
-            travel_z_down = min(self.config.z_hover_mm, max(0.0, drop_z_down - 25.0))
+            # Travel horizontally at safe clearance height BEFORE descending vertically onto the stack
+            pre_drop_z_down = min(transit_z, max(0.0, drop_z_down - 10.0))
+            if self.serial.pose.z_mm > pre_drop_z_down + 0.1:
+                self.serial.move_to(z_mm=pre_drop_z_down, feedrate_mm_s=self.config.feedrate_z_mm_s)
             self.serial.move_to(
                 x_mm=drop_mx,
                 y_mm=drop_my,
-                z_mm=travel_z_down,
-                angle_deg=0.0,
+                z_mm=pre_drop_z_down,
+                angle_deg=self.kinematics.servo_angle_for_plate_angle(0.0),
                 feedrate_mm_s=self.config.feedrate_travel_mm_s,
             )
             self.serial.move_to(z_mm=drop_z_down, feedrate_mm_s=self.config.feedrate_z_mm_s)
             self.serial.set_gripper(closed=False)  # Release block
             self.serial.set_simulated_held_mass(None)
-            self.serial.move_to(z_mm=travel_z_down, feedrate_mm_s=self.config.feedrate_z_mm_s)
+            if staged_blocker_id is None:
+                self.planner.commit_stack_placement(zone_key)
+            # Retract straight UP high enough to clear the newly heightened stack BEFORE any X/Y move
+            post_drop_z_down = min(self._safe_transit_z_down(), max(0.0, drop_z_down - 10.0))
+            self.serial.move_to(z_mm=post_drop_z_down, feedrate_mm_s=self.config.feedrate_z_mm_s)
             self.serial.set_gripper(closed=True)   # Return NC solenoid to de-energized rest state
             self._current_mass_g = 0.00
 
             block.x_mm = drop_plate_x
             block.y_mm = drop_plate_y
             block.angle_deg = 0.0
-            block.status = "REJECTED" if is_rejected else "STACKED"
-            pick_record.status = "SUCCESS"
+            if staged_blocker_id is not None:
+                block.status = "QUEUED"
+                if self.mock_hardware and picked_sb is not None:
+                    picked_sb.x_mm = drop_plate_x
+                    picked_sb.y_mm = drop_plate_y
+                    picked_sb.angle_deg = 0.0
+                    picked_sb.picked = False
+                pick_record.status = "STAGED"
+            else:
+                block.status = "STACKED"
+                pick_record.status = "SUCCESS"
             self.publish_telemetry()
         except Exception as exc:
+            try:
+                if not self.serial.pose.grip_closed:
+                    self.serial.set_gripper(closed=True)
+            except Exception:
+                pass
             pick_record.status = "FAILED"
             pick_record.error = str(exc)
             raise
         finally:
             self.reports.record_pick_action(pick_record)
         self.publish_telemetry()
+        return staged_blocker_id

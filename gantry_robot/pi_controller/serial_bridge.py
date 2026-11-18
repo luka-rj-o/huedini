@@ -61,8 +61,81 @@ class ESP32SerialBridge:
         self.command_log_callback = command_log_callback
         self._ser: Optional["serial.Serial"] = None
         self._lock = threading.Lock()
+        self._rx_buffer = bytearray()
+        self._running = False
+        self._monitor_thread: Optional[threading.Thread] = None
         self._abort_flag = False
         self._simulated_held_mass_g: Optional[float] = None
+
+    def _start_event_monitor(self) -> None:
+        if self._monitor_thread is not None and self._monitor_thread.is_alive():
+            return
+        self._running = True
+        self._monitor_thread = threading.Thread(
+            target=self._event_monitor_loop,
+            name="esp32-event-monitor",
+            daemon=True,
+        )
+        self._monitor_thread.start()
+
+    def _handle_unsolicited_line(self, line: str) -> bool:
+        if line == "EVENT:START_BTN":
+            if self.event_callback:
+                self.event_callback("START_SCAN")
+            return True
+        if line == "EVENT:ESTOP":
+            self._abort_flag = True
+            if self.event_callback:
+                self.event_callback("EMERGENCY_STOP")
+            return True
+        if line == "EVENT:CHIME_BTN":
+            if self.event_callback:
+                self.event_callback("CHIME_BTN")
+            return True
+        return False
+
+    def _drain_unsolicited_events(self) -> None:
+        """Non-blockingly drains available serial bytes and dispatches complete EVENT:* lines."""
+        if not self._ser or not self._ser.is_open:
+            return
+        waiting = self._ser.in_waiting
+        if waiting <= 0:
+            return
+        chunk = self._ser.read(waiting)
+        if not chunk:
+            return
+        self._rx_buffer.extend(chunk)
+        while b"\n" in self._rx_buffer:
+            raw_line, _, rest = self._rx_buffer.partition(b"\n")
+            self._rx_buffer = bytearray(rest)
+            line = raw_line.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            logger.debug("RX (idle) <- ESP32: %s", line)
+            self._handle_unsolicited_line(line)
+
+    def _read_serial_line(self) -> bytes:
+        """Reads a line from _rx_buffer first, completing partial buffered bytes from serial."""
+        if b"\n" in self._rx_buffer:
+            raw_line, _, rest = self._rx_buffer.partition(b"\n")
+            self._rx_buffer = bytearray(rest)
+            return raw_line + b"\n"
+        raw = self._ser.readline()
+        if self._rx_buffer:
+            raw = bytes(self._rx_buffer) + raw
+            self._rx_buffer.clear()
+        return raw
+
+    def _event_monitor_loop(self) -> None:
+        while self._running:
+            if self._lock.acquire(blocking=False):
+                try:
+                    self._drain_unsolicited_events()
+                except Exception as exc:
+                    logger.debug("Idle serial monitor error: %s", exc)
+                finally:
+                    self._lock.release()
+            time.sleep(0.025)
 
     def connect(self) -> None:
         if self.mock_hardware:
@@ -95,6 +168,7 @@ class ESP32SerialBridge:
             self._ser.rts = False
             time.sleep(1.0)
             self._ser.reset_input_buffer()
+            self._rx_buffer.clear()
 
             # Configure steps/mm and enable TMC2209 drivers
             self.send_command(
@@ -103,6 +177,7 @@ class ESP32SerialBridge:
                 f"Z{self.config.steps_per_mm_z:.2f}"
             )
             self.send_command("SETUP")
+            self._start_event_monitor()
         except Exception as exc:
             msg = str(exc)
             if "VM" in msg or "UART" in msg or "driver not responding" in msg:
@@ -110,6 +185,7 @@ class ESP32SerialBridge:
                     "Motor supply VM is unpowered (%s). Continuing in idle/manual-test mode.",
                     msg,
                 )
+                self._start_event_monitor()
             else:
                 logger.warning(
                     "ESP32 initial connection failed on %s (%s). Starting in offline mode so GUI remains active.",
@@ -175,6 +251,8 @@ class ESP32SerialBridge:
             self._ser.flush()
             time.sleep(0.3)
             self._ser.reset_input_buffer()
+            self._rx_buffer.clear()
+            self._start_event_monitor()
             logger.info("ESP32SerialBridge successfully reconnected and initialized.")
             return True
         except Exception as exc:
@@ -203,7 +281,14 @@ class ESP32SerialBridge:
                 return p
         return None
 
+    @property
+    def is_connected(self) -> bool:
+        return self.mock_hardware or (self._ser is not None and self._ser.is_open)
+
     def close(self) -> None:
+        self._running = False
+        if self._monitor_thread is not None and self._monitor_thread.is_alive():
+            self._monitor_thread.join(timeout=0.5)
         if self._ser and self._ser.is_open:
             self._ser.close()
 
@@ -253,11 +338,12 @@ class ESP32SerialBridge:
                     logger.warning("Command '%s' dropped: ESP32 is offline.", cmd_clean)
                     return _log_and_return(["ERR: ESP32 OFFLINE"])
 
-            # Flush any unread trailing bytes from previous commands to prevent desync
+            # Drain any pending hardware switch events before transmitting; keep partial lines intact
             try:
-                if self._ser.in_waiting > 0:
-                    discarded = self._ser.read(self._ser.in_waiting)
-                    logger.debug("Flushed %d stale serial bytes before TX", len(discarded))
+                self._drain_unsolicited_events()
+                if self._rx_buffer and not self._rx_buffer.startswith(b"EVENT:"):
+                    logger.debug("Flushed %d stale serial bytes before TX", len(self._rx_buffer))
+                    self._rx_buffer.clear()
             except Exception:
                 pass
 
@@ -299,7 +385,7 @@ class ESP32SerialBridge:
 
             while time.monotonic() < deadline:
                 try:
-                    raw = self._ser.readline()
+                    raw = self._read_serial_line()
                 except io_exceptions as io_err:
                     logger.warning("Serial read failed (%s); attempting auto-reconnect...", io_err)
                     if self._reconnect():
@@ -316,9 +402,7 @@ class ESP32SerialBridge:
                     continue
                 logger.debug("RX <- ESP32: %s", line)
 
-                if line == "EVENT:START_BTN":
-                    if self.event_callback:
-                        self.event_callback("START_SCAN")
+                if self._handle_unsolicited_line(line):
                     continue
 
                 lines.append(line)
@@ -401,6 +485,24 @@ class ESP32SerialBridge:
         ty = max(0.0, min(self.config.travel_y_mm, ty))
         tz = max(0.0, min(self.config.travel_z_bottom_mm, tz))
 
+        # EE rotation clearance: never rotate servo A when Y < servo_safe_y_mm (10 mm),
+        # because swinging the end-effector near Y=0 hits the rear end stop.
+        safe_y = self.config.servo_safe_y_mm
+        if abs(ta - self.pose.angle_deg) > 0.1 and ty < safe_y:
+            if self.pose.y_mm < safe_y:
+                self.move_to(
+                    y_mm=safe_y,
+                    angle_deg=self.pose.angle_deg,
+                    feedrate_mm_s=tf,
+                    timeout_s=timeout_s,
+                )
+            self.move_to(
+                y_mm=max(self.pose.y_mm, safe_y),
+                angle_deg=ta,
+                feedrate_mm_s=tf,
+                timeout_s=timeout_s,
+            )
+
         # Dynamically scale timeout based on travel distance and feedrate
         dist = max(abs(tx - self.pose.x_mm), abs(ty - self.pose.y_mm), abs(tz - self.pose.z_mm))
         calc_timeout = max(self.config.serial_timeout_s, (dist / max(1.0, tf)) * 2.5 + 10.0)
@@ -437,6 +539,10 @@ class ESP32SerialBridge:
             if line.startswith("WEIGHT:"):
                 return float(line.split(":", 1)[1].strip())
         raise RuntimeError(f"Expected WEIGHT:<float> from ESP32, got: {lines}")
+
+    def play_chime(self, tune: str = "TADA") -> None:
+        """Plays a celebratory stepper victory chime on the X/Z axes without losing position."""
+        self.send_command(f"CHIME {tune}".strip(), timeout_s=10.0)
 
     def set_simulated_held_mass(self, mass_g: Optional[float]) -> None:
         """Used in --mock-hardware mode so WEIGH returns the picked block's mass."""
@@ -497,6 +603,11 @@ class ESP32SerialBridge:
             else:
                 mass = round(random.uniform(48.0, 56.0), 2)
             return [f"WEIGHT:{mass:.2f}"]
+
+        if upper == "CHIME" or upper.startswith("CHIME "):
+            tune = upper.split(maxsplit=1)[1] if " " in upper else "TADA"
+            time.sleep(1.5 if tune in ("WIN95", "95") else 0.75)
+            return [f"CHIME:{tune}"]
 
         time.sleep(0.05)
         return [f"MOCK_ACK:{cmd}"]
