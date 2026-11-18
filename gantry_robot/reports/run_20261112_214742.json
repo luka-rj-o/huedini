@@ -1,0 +1,715 @@
+{
+  "run_id": "run_20261112_214742",
+  "start_time": "2026-11-12T21:47:42.039890",
+  "start_epoch": 1794538062.0398905,
+  "end_time": "2026-11-12T21:48:24.340011",
+  "duration_s": 42.3,
+  "mock_hardware": true,
+  "status": "COMPLETED",
+  "calibration": {
+    "timestamp": 1794538063.6318388,
+    "calibrated": true,
+    "origin_calibrated": true,
+    "marker_id": 1,
+    "u_px": 479.5,
+    "v_px": 286.5,
+    "marker_angle_deg": 0.0,
+    "cam_skew_deg": -180.0,
+    "kx_mm_per_px": 0.25,
+    "ky_mm_per_px": 0.25,
+    "cam_origin_x_mm": -47.38,
+    "cam_origin_y_mm": 71.53,
+    "offset_x_mm": 0.0,
+    "offset_y_mm": -54.1
+  },
+  "scan_waypoints": [
+    {
+      "waypoint_index": 1,
+      "motor_x_mm": 20.0,
+      "motor_y_mm": 58.0,
+      "motor_z_mm": 0.0,
+      "raw_detections": [],
+      "unique_blocks_count": 0
+    },
+    {
+      "waypoint_index": 2,
+      "motor_x_mm": 108.0,
+      "motor_y_mm": 58.0,
+      "motor_z_mm": 0.0,
+      "raw_detections": [
+        {
+          "color": "red",
+          "u_px": 449.0,
+          "v_px": 275.2,
+          "area_px": 7378.5,
+          "raw_angle_deg": 42.3,
+          "comp_angle_deg": 42.3,
+          "world_x_mm": 87.87,
+          "world_y_mm": 122.1
+        }
+      ],
+      "unique_blocks_count": 1
+    },
+    {
+      "waypoint_index": 3,
+      "motor_x_mm": 196.0,
+      "motor_y_mm": 58.0,
+      "motor_z_mm": 0.0,
+      "raw_detections": [
+        {
+          "color": "blue",
+          "u_px": 326.0,
+          "v_px": 260.8,
+          "area_px": 7410.0,
+          "raw_angle_deg": 15.3,
+          "comp_angle_deg": 15.3,
+          "world_x_mm": 149.9,
+          "world_y_mm": 125.13
+        }
+      ],
+      "unique_blocks_count": 2
+    },
+    {
+      "waypoint_index": 4,
+      "motor_x_mm": 196.0,
+      "motor_y_mm": 0.0,
+      "motor_z_mm": 0.0,
+      "raw_detections": [
+        {
+          "color": "green",
+          "u_px": 349.6,
+          "v_px": 190.2,
+          "area_px": 7354.5,
+          "raw_angle_deg": 63.4,
+          "comp_angle_deg": 63.4,
+          "world_x_mm": 154.87,
+          "world_y_mm": 82.05
+        }
+      ],
+      "unique_blocks_count": 3
+    },
+    {
+      "waypoint_index": 5,
+      "motor_x_mm": 108.0,
+      "motor_y_mm": 0.0,
+      "motor_z_mm": 0.0,
+      "raw_detections": [
+        {
+          "color": "white",
+          "u_px": 411.3,
+          "v_px": 223.3,
+          "area_px": 6977.0,
+          "raw_angle_deg": 28.2,
+          "comp_angle_deg": 28.2,
+          "world_x_mm": 79.9,
+          "world_y_mm": 75.05
+        }
+      ],
+      "unique_blocks_count": 4
+    },
+    {
+      "waypoint_index": 6,
+      "motor_x_mm": 20.0,
+      "motor_y_mm": 0.0,
+      "motor_z_mm": 0.0,
+      "raw_detections": [],
+      "unique_blocks_count": 4
+    }
+  ],
+  "cataloged_blocks": [
+    {
+      "id": 1,
+      "color": "red",
+      "x_mm": 87.87,
+      "y_mm": 122.1,
+      "angle_deg": 42.3,
+      "mass_g": 0.0,
+      "mass_class": "unknown",
+      "status": "DETECTED"
+    },
+    {
+      "id": 2,
+      "color": "blue",
+      "x_mm": 149.9,
+      "y_mm": 125.13,
+      "angle_deg": 15.3,
+      "mass_g": 0.0,
+      "mass_class": "unknown",
+      "status": "DETECTED"
+    },
+    {
+      "id": 3,
+      "color": "green",
+      "x_mm": 154.87,
+      "y_mm": 82.05,
+      "angle_deg": 63.4,
+      "mass_g": 0.0,
+      "mass_class": "unknown",
+      "status": "DETECTED"
+    },
+    {
+      "id": 4,
+      "color": "white",
+      "x_mm": 79.9,
+      "y_mm": 75.05,
+      "angle_deg": 28.2,
+      "mass_g": 0.0,
+      "mass_class": "unknown",
+      "status": "DETECTED"
+    }
+  ],
+  "pick_actions": [
+    {
+      "block_id": 3,
+      "color": "green",
+      "target_plate_x": 154.87,
+      "target_plate_y": 82.05,
+      "target_angle_deg": 63.4,
+      "fine_align_checked": true,
+      "fine_align_found": true,
+      "fine_u_px": 320.4,
+      "fine_v_px": 239.7,
+      "fine_contour_area_px": 12628.5,
+      "fine_residual_err_mm": 0.08,
+      "refined_plate_x": 154.94,
+      "refined_plate_y": 82.09,
+      "refined_angle_deg": 63.9,
+      "camera_motor_x": 202.25,
+      "camera_motor_y": 10.52,
+      "gripper_motor_x": 202.32,
+      "gripper_motor_y": 64.66,
+      "servo_angle_deg": 63.9,
+      "tare_success": true,
+      "measured_mass_g": 10.03,
+      "mass_class": "high_infill",
+      "drop_plate_x": 210.2,
+      "drop_plate_y": 115.0,
+      "drop_z_down_mm": 70.36,
+      "stack_zone": "GREEN (HIGH_INFILL)",
+      "status": "SUCCESS",
+      "error": null
+    },
+    {
+      "block_id": 2,
+      "color": "blue",
+      "target_plate_x": 149.9,
+      "target_plate_y": 125.13,
+      "target_angle_deg": 15.3,
+      "fine_align_checked": true,
+      "fine_align_found": true,
+      "fine_u_px": 319.9,
+      "fine_v_px": 240.3,
+      "fine_contour_area_px": 12591.5,
+      "fine_residual_err_mm": 0.05,
+      "refined_plate_x": 149.89,
+      "refined_plate_y": 125.08,
+      "refined_angle_deg": 15.1,
+      "camera_motor_x": 197.28,
+      "camera_motor_y": 53.6,
+      "gripper_motor_x": 197.27,
+      "gripper_motor_y": 107.65,
+      "servo_angle_deg": 15.1,
+      "tare_success": true,
+      "measured_mass_g": 6.76,
+      "mass_class": "med_infill",
+      "drop_plate_x": 170.2,
+      "drop_plate_y": 115.0,
+      "drop_z_down_mm": 70.36,
+      "stack_zone": "BLUE (MED_INFILL)",
+      "status": "SUCCESS",
+      "error": null
+    },
+    {
+      "block_id": 1,
+      "color": "red",
+      "target_plate_x": 87.87,
+      "target_plate_y": 122.1,
+      "target_angle_deg": 42.3,
+      "fine_align_checked": true,
+      "fine_align_found": true,
+      "fine_u_px": 320.1,
+      "fine_v_px": 240.0,
+      "fine_contour_area_px": 12633.5,
+      "fine_residual_err_mm": 0.01,
+      "refined_plate_x": 87.89,
+      "refined_plate_y": 122.1,
+      "refined_angle_deg": 42.0,
+      "camera_motor_x": 135.25,
+      "camera_motor_y": 50.57,
+      "gripper_motor_x": 135.27,
+      "gripper_motor_y": 104.67,
+      "servo_angle_deg": 42.0,
+      "tare_success": true,
+      "measured_mass_g": 2.25,
+      "mass_class": "low_infill",
+      "drop_plate_x": 250.2,
+      "drop_plate_y": 115.0,
+      "drop_z_down_mm": 70.36,
+      "stack_zone": "RED (LOW_INFILL)",
+      "status": "SUCCESS",
+      "error": null
+    },
+    {
+      "block_id": 4,
+      "color": "white",
+      "target_plate_x": 79.9,
+      "target_plate_y": 75.05,
+      "target_angle_deg": 28.2,
+      "fine_align_checked": true,
+      "fine_align_found": true,
+      "fine_u_px": 320.3,
+      "fine_v_px": 239.7,
+      "fine_contour_area_px": 12069.0,
+      "fine_residual_err_mm": 0.07,
+      "refined_plate_x": 79.95,
+      "refined_plate_y": 75.1,
+      "refined_angle_deg": 27.8,
+      "camera_motor_x": 127.28,
+      "camera_motor_y": 3.52,
+      "gripper_motor_x": 127.33,
+      "gripper_motor_y": 57.67,
+      "servo_angle_deg": 27.8,
+      "tare_success": true,
+      "measured_mass_g": 21.75,
+      "mass_class": "aluminum",
+      "drop_plate_x": 224.6,
+      "drop_plate_y": 44.5,
+      "drop_z_down_mm": 60.81,
+      "stack_zone": "ALUMINUM (ALUMINUM)",
+      "status": "SUCCESS",
+      "error": null
+    }
+  ],
+  "motor_commands": [
+    {
+      "timestamp": 1794538062.091,
+      "command": "SETUP",
+      "replies": [
+        "MOCK_ACK:SETUP"
+      ],
+      "duration_ms": 62.0
+    },
+    {
+      "timestamp": 1794538062.173,
+      "command": "HOME",
+      "replies": [
+        "-> S3 homed",
+        "-> S1 homed",
+        "-> S2 homed"
+      ],
+      "duration_ms": 78.0
+    },
+    {
+      "timestamp": 1794538063.394,
+      "command": "MOVE X0.00 Y100.00 Z0.00 A0.0 F25.0",
+      "replies": [],
+      "duration_ms": 1219.0
+    },
+    {
+      "timestamp": 1794538063.627,
+      "command": "MOVE X15.00 Y100.00 Z0.00 A0.0 F25.0",
+      "replies": [],
+      "duration_ms": 218.0
+    },
+    {
+      "timestamp": 1794538064.234,
+      "command": "MOVE X20.00 Y58.00 Z0.00 A0.0 F25.0",
+      "replies": [],
+      "duration_ms": 610.0
+    },
+    {
+      "timestamp": 1794538065.464,
+      "command": "MOVE X108.00 Y58.00 Z0.00 A0.0 F25.0",
+      "replies": [],
+      "duration_ms": 1219.0
+    },
+    {
+      "timestamp": 1794538066.693,
+      "command": "MOVE X196.00 Y58.00 Z0.00 A0.0 F25.0",
+      "replies": [],
+      "duration_ms": 1219.0
+    },
+    {
+      "timestamp": 1794538067.526,
+      "command": "MOVE X196.00 Y0.00 Z0.00 A0.0 F25.0",
+      "replies": [],
+      "duration_ms": 812.0
+    },
+    {
+      "timestamp": 1794538068.754,
+      "command": "MOVE X108.00 Y0.00 Z0.00 A0.0 F25.0",
+      "replies": [],
+      "duration_ms": 1218.0
+    },
+    {
+      "timestamp": 1794538069.984,
+      "command": "MOVE X20.00 Y0.00 Z0.00 A0.0 F25.0",
+      "replies": [],
+      "duration_ms": 1219.0
+    },
+    {
+      "timestamp": 1794538071.213,
+      "command": "MOVE X202.25 Y10.52 Z25.00 A0.0 F25.0",
+      "replies": [],
+      "duration_ms": 1219.0
+    },
+    {
+      "timestamp": 1794538072.441,
+      "command": "MOVE X202.32 Y64.66 Z25.00 A63.9 F12.0",
+      "replies": [],
+      "duration_ms": 1219.0
+    },
+    {
+      "timestamp": 1794538072.542,
+      "command": "TARE",
+      "replies": [],
+      "duration_ms": 94.0
+    },
+    {
+      "timestamp": 1794538072.662,
+      "command": "GRIP 0",
+      "replies": [],
+      "duration_ms": 125.0
+    },
+    {
+      "timestamp": 1794538073.74,
+      "command": "MOVE X202.32 Y64.66 Z70.36 A63.9 F15.0",
+      "replies": [],
+      "duration_ms": 1078.0
+    },
+    {
+      "timestamp": 1794538073.86,
+      "command": "GRIP 1",
+      "replies": [],
+      "duration_ms": 125.0
+    },
+    {
+      "timestamp": 1794538074.935,
+      "command": "MOVE X202.32 Y64.66 Z25.00 A63.9 F15.0",
+      "replies": [],
+      "duration_ms": 1078.0
+    },
+    {
+      "timestamp": 1794538075.115,
+      "command": "WEIGH",
+      "replies": [
+        "WEIGHT:10.03"
+      ],
+      "duration_ms": 172.0
+    },
+    {
+      "timestamp": 1794538075.701,
+      "command": "MOVE X227.00 Y97.57 Z25.00 A0.0 F25.0",
+      "replies": [],
+      "duration_ms": 594.0
+    },
+    {
+      "timestamp": 1794538076.778,
+      "command": "MOVE X227.00 Y97.57 Z70.36 A0.0 F15.0",
+      "replies": [],
+      "duration_ms": 1078.0
+    },
+    {
+      "timestamp": 1794538076.899,
+      "command": "GRIP 0",
+      "replies": [],
+      "duration_ms": 109.0
+    },
+    {
+      "timestamp": 1794538077.98,
+      "command": "MOVE X227.00 Y97.57 Z25.00 A0.0 F15.0",
+      "replies": [],
+      "duration_ms": 1094.0
+    },
+    {
+      "timestamp": 1794538078.101,
+      "command": "GRIP 1",
+      "replies": [],
+      "duration_ms": 109.0
+    },
+    {
+      "timestamp": 1794538078.859,
+      "command": "MOVE X197.28 Y53.60 Z25.00 A0.0 F25.0",
+      "replies": [],
+      "duration_ms": 766.0
+    },
+    {
+      "timestamp": 1794538080.088,
+      "command": "MOVE X197.27 Y107.65 Z25.00 A15.1 F12.0",
+      "replies": [],
+      "duration_ms": 1219.0
+    },
+    {
+      "timestamp": 1794538080.189,
+      "command": "TARE",
+      "replies": [],
+      "duration_ms": 109.0
+    },
+    {
+      "timestamp": 1794538080.309,
+      "command": "GRIP 0",
+      "replies": [],
+      "duration_ms": 125.0
+    },
+    {
+      "timestamp": 1794538081.387,
+      "command": "MOVE X197.27 Y107.65 Z70.36 A15.1 F15.0",
+      "replies": [],
+      "duration_ms": 1078.0
+    },
+    {
+      "timestamp": 1794538081.508,
+      "command": "GRIP 1",
+      "replies": [],
+      "duration_ms": 109.0
+    },
+    {
+      "timestamp": 1794538082.587,
+      "command": "MOVE X197.27 Y107.65 Z25.00 A15.1 F15.0",
+      "replies": [],
+      "duration_ms": 1079.0
+    },
+    {
+      "timestamp": 1794538082.767,
+      "command": "WEIGH",
+      "replies": [
+        "WEIGHT:6.76"
+      ],
+      "duration_ms": 187.0
+    },
+    {
+      "timestamp": 1794538083.09,
+      "command": "MOVE X217.58 Y97.57 Z25.00 A0.0 F25.0",
+      "replies": [],
+      "duration_ms": 328.0
+    },
+    {
+      "timestamp": 1794538084.169,
+      "command": "MOVE X217.58 Y97.57 Z70.36 A0.0 F15.0",
+      "replies": [],
+      "duration_ms": 1078.0
+    },
+    {
+      "timestamp": 1794538084.29,
+      "command": "GRIP 0",
+      "replies": [],
+      "duration_ms": 110.0
+    },
+    {
+      "timestamp": 1794538085.367,
+      "command": "MOVE X217.58 Y97.57 Z25.00 A0.0 F15.0",
+      "replies": [],
+      "duration_ms": 1078.0
+    },
+    {
+      "timestamp": 1794538085.487,
+      "command": "GRIP 1",
+      "replies": [],
+      "duration_ms": 125.0
+    },
+    {
+      "timestamp": 1794538086.71,
+      "command": "MOVE X135.25 Y50.57 Z25.00 A0.0 F25.0",
+      "replies": [],
+      "duration_ms": 1219.0
+    },
+    {
+      "timestamp": 1794538087.938,
+      "command": "MOVE X135.27 Y104.67 Z25.00 A42.0 F12.0",
+      "replies": [],
+      "duration_ms": 1219.0
+    },
+    {
+      "timestamp": 1794538088.039,
+      "command": "TARE",
+      "replies": [],
+      "duration_ms": 94.0
+    },
+    {
+      "timestamp": 1794538088.159,
+      "command": "GRIP 0",
+      "replies": [],
+      "duration_ms": 125.0
+    },
+    {
+      "timestamp": 1794538089.237,
+      "command": "MOVE X135.27 Y104.67 Z70.36 A42.0 F15.0",
+      "replies": [],
+      "duration_ms": 1078.0
+    },
+    {
+      "timestamp": 1794538089.358,
+      "command": "GRIP 1",
+      "replies": [],
+      "duration_ms": 125.0
+    },
+    {
+      "timestamp": 1794538090.435,
+      "command": "MOVE X135.27 Y104.67 Z25.00 A42.0 F15.0",
+      "replies": [],
+      "duration_ms": 1078.0
+    },
+    {
+      "timestamp": 1794538090.615,
+      "command": "WEIGH",
+      "replies": [
+        "WEIGHT:2.25"
+      ],
+      "duration_ms": 172.0
+    },
+    {
+      "timestamp": 1794538091.837,
+      "command": "MOVE X227.00 Y97.57 Z25.00 A0.0 F25.0",
+      "replies": [],
+      "duration_ms": 1219.0
+    },
+    {
+      "timestamp": 1794538092.914,
+      "command": "MOVE X227.00 Y97.57 Z70.36 A0.0 F15.0",
+      "replies": [],
+      "duration_ms": 1078.0
+    },
+    {
+      "timestamp": 1794538093.035,
+      "command": "GRIP 0",
+      "replies": [],
+      "duration_ms": 125.0
+    },
+    {
+      "timestamp": 1794538094.112,
+      "command": "MOVE X227.00 Y97.57 Z25.00 A0.0 F15.0",
+      "replies": [],
+      "duration_ms": 1078.0
+    },
+    {
+      "timestamp": 1794538094.233,
+      "command": "GRIP 1",
+      "replies": [],
+      "duration_ms": 125.0
+    },
+    {
+      "timestamp": 1794538095.456,
+      "command": "MOVE X127.28 Y3.52 Z25.00 A0.0 F25.0",
+      "replies": [],
+      "duration_ms": 1219.0
+    },
+    {
+      "timestamp": 1794538096.686,
+      "command": "MOVE X127.33 Y57.67 Z25.00 A27.8 F12.0",
+      "replies": [],
+      "duration_ms": 1234.0
+    },
+    {
+      "timestamp": 1794538096.787,
+      "command": "TARE",
+      "replies": [],
+      "duration_ms": 94.0
+    },
+    {
+      "timestamp": 1794538096.907,
+      "command": "GRIP 0",
+      "replies": [],
+      "duration_ms": 125.0
+    },
+    {
+      "timestamp": 1794538097.988,
+      "command": "MOVE X127.33 Y57.67 Z70.36 A27.8 F15.0",
+      "replies": [],
+      "duration_ms": 1078.0
+    },
+    {
+      "timestamp": 1794538098.108,
+      "command": "GRIP 1",
+      "replies": [],
+      "duration_ms": 125.0
+    },
+    {
+      "timestamp": 1794538099.184,
+      "command": "MOVE X127.33 Y57.67 Z25.00 A27.8 F15.0",
+      "replies": [],
+      "duration_ms": 1078.0
+    },
+    {
+      "timestamp": 1794538099.366,
+      "command": "WEIGH",
+      "replies": [
+        "WEIGHT:21.75"
+      ],
+      "duration_ms": 172.0
+    },
+    {
+      "timestamp": 1794538100.587,
+      "command": "MOVE X227.00 Y27.07 Z25.00 A0.0 F25.0",
+      "replies": [],
+      "duration_ms": 1219.0
+    },
+    {
+      "timestamp": 1794538101.436,
+      "command": "MOVE X227.00 Y27.07 Z60.81 A0.0 F15.0",
+      "replies": [],
+      "duration_ms": 859.0
+    },
+    {
+      "timestamp": 1794538101.557,
+      "command": "GRIP 0",
+      "replies": [],
+      "duration_ms": 109.0
+    },
+    {
+      "timestamp": 1794538102.407,
+      "command": "MOVE X227.00 Y27.07 Z25.00 A0.0 F15.0",
+      "replies": [],
+      "duration_ms": 860.0
+    },
+    {
+      "timestamp": 1794538102.528,
+      "command": "GRIP 1",
+      "replies": [],
+      "duration_ms": 125.0
+    },
+    {
+      "timestamp": 1794538103.12,
+      "command": "MOVE X227.00 Y27.07 Z0.00 A0.0 F15.0",
+      "replies": [],
+      "duration_ms": 578.0
+    },
+    {
+      "timestamp": 1794538104.339,
+      "command": "MOVE X20.00 Y30.00 Z0.00 A0.0 F25.0",
+      "replies": [],
+      "duration_ms": 1234.0
+    }
+  ],
+  "event_logs": [
+    "[21:47:42] Phase 2 [CALIBRATING]: Homing Z, X, Y axes via TMC2209 StallGuard4...",
+    "[21:47:42] Moving camera above base ArUco fiducial at (0.0, 100.0, 0.0) mm...",
+    "[21:47:43] Auto-Scale calibrated on Marker #1! Kx=0.2500 mm/px, Ky=0.2500 mm/px at Z=0 mm.",
+    "[21:47:43] Primary Coordinate System Calibrated to Fiducials! Camera origin = (-47.4, 71.5) mm, Skew = -180.00\u00b0 wrt plate.",
+    "[21:47:43] Phase 3 [SCANNING]: Stepping through 6-point grid...",
+    "[21:47:44] Scan waypoint 1/6 (20, 58 mm): 0 detections (0 unique blocks cataloged).",
+    "[21:47:45] Scan waypoint 2/6 (108, 58 mm): 1 detections (1 unique blocks cataloged).",
+    "[21:47:46] Scan waypoint 3/6 (196, 58 mm): 1 detections (2 unique blocks cataloged).",
+    "[21:47:47] Scan waypoint 4/6 (196, 0 mm): 1 detections (3 unique blocks cataloged).",
+    "[21:47:48] Scan waypoint 5/6 (108, 0 mm): 1 detections (4 unique blocks cataloged).",
+    "[21:47:49] Scan waypoint 6/6 (20, 0 mm): 0 detections (4 unique blocks cataloged).",
+    "[21:47:49] Phase 4 [PLANNING]: Computed laydown-first, sequential pick order for 4 blocks.",
+    "[21:47:49] Phase 5 [PICKING]: Moving camera above Block #3 (GREEN) at plate (154.9, 82.1) mm -> motor (202.3, 10.5, Z=25.0) mm...",
+    "[21:47:51] Fine alignment check on Block #3: residual offset 0.08 mm (area 12628 px), angle 63.9 deg.",
+    "[21:47:55] Phase 5 [WEIGHING]: Block #3 (GREEN) mass = 10.03 g -> class [HIGH_INFILL].",
+    "[21:47:55] Phase 6 [STACKING]: Routing Block #3 to GREEN (HIGH_INFILL) at plate (210.2, 115.0) -> motor (227.0, 97.6, Z_down=70.4) mm...",
+    "[21:47:58] Phase 5 [PICKING]: Moving camera above Block #2 (BLUE) at plate (149.9, 125.1) mm -> motor (197.3, 53.6, Z=25.0) mm...",
+    "[21:47:58] Fine alignment check on Block #2: residual offset 0.05 mm (area 12592 px), angle 15.1 deg.",
+    "[21:48:02] Phase 5 [WEIGHING]: Block #2 (BLUE) mass = 6.76 g -> class [MED_INFILL].",
+    "[21:48:02] Phase 6 [STACKING]: Routing Block #2 to BLUE (MED_INFILL) at plate (170.2, 115.0) -> motor (217.6, 97.6, Z_down=70.4) mm...",
+    "[21:48:05] Phase 5 [PICKING]: Moving camera above Block #1 (RED) at plate (87.9, 122.1) mm -> motor (135.3, 50.6, Z=25.0) mm...",
+    "[21:48:06] Fine alignment check on Block #1: residual offset 0.01 mm (area 12634 px), angle 42.0 deg.",
+    "[21:48:10] Phase 5 [WEIGHING]: Block #1 (RED) mass = 2.25 g -> class [LOW_INFILL].",
+    "[21:48:10] Phase 6 [STACKING]: Routing Block #1 to RED (LOW_INFILL) at plate (250.2, 115.0) -> motor (227.0, 97.6, Z_down=70.4) mm...",
+    "[21:48:14] Phase 5 [PICKING]: Moving camera above Block #4 (WHITE) at plate (79.9, 75.0) mm -> motor (127.3, 3.5, Z=25.0) mm...",
+    "[21:48:15] Fine alignment check on Block #4: residual offset 0.07 mm (area 12069 px), angle 27.8 deg.",
+    "[21:48:19] Phase 5 [WEIGHING]: Block #4 (WHITE) mass = 21.75 g -> class [ALUMINUM].",
+    "[21:48:19] Phase 6 [STACKING]: Routing Block #4 to ALUMINUM (ALUMINUM) at plate (224.6, 44.5) -> motor (227.0, 27.1, Z_down=60.8) mm...",
+    "[21:48:24] All 4 blocks processed and sorted! Returning to IDLE/COMPLETE."
+  ],
+  "error": null
+}

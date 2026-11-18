@@ -263,6 +263,24 @@ struct ChimeSegment {
   int dirZ;
 };
 
+struct SavedAxisSnapshot {
+  bool     hasRegs;
+  uint32_t gconf;
+  uint32_t chopconf;
+  uint32_t pwmconf;
+  uint32_t iholdIrun;
+  float    maxSpeed;
+  float    acceleration;
+  float    stepsPerMm;
+  float    maxTravelMm;
+  float    maxFeedSpeed;
+  int      currentMa;
+  int      microsteps;
+  int      moveSensitivity;
+  int      homeSensitivity;
+  long     stepperPos;
+};
+
 float currentAngleDeg = 0.0f;
 int   currentGripState = 1; // 1 = gripping (NC default), 0 = open
 
@@ -299,10 +317,13 @@ void handleGripGcode(String params);
 void handleTareGcode();
 void handleWeighGcode();
 void handleStatusGcode();
+void handleRegsGcode();
 void handleStepsGcode(String params);
 void handleChimeGcode(String params, bool emitProtocolReply = true);
 void applyAxisDriverSettings(Axis& axis);
 bool restoreAxisFromChime(Axis& axis);
+void captureAxisSnapshot(Axis& axis, SavedAxisSnapshot& snap);
+bool restoreAxisSnapshot(Axis& axis, const SavedAxisSnapshot& snap);
 void handleStepperCommand(Axis& axis, String param);
 void handleHomeSettings(Axis& axis, String param);
 void handleHomeCommand(String param);
@@ -528,6 +549,10 @@ void handleCommand(String rawCommand) {
     handleStatusGcode();
     return;
   }
+  if (upper == "REGS") {
+    handleRegsGcode();
+    return;
+  }
   if (upper.startsWith("STEPS ")) {
     handleStepsGcode(upper.substring(6));
     return;
@@ -600,10 +625,12 @@ void handleHomeAllGcode() {
     return;
   }
 
-  // Guarantee every axis has its calibrated microsteps, current, and StealthChop before homing
+  // Guarantee every axis has its calibrated microsteps, interpolation, current, and StealthChop before homing
   bool restoredAny = false;
   for (int i = 0; i < NUM_AXES; i++) {
-    if (axes[i].driver->microsteps() != axes[i].microsteps || axes[i].driver->en_spreadCycle()) {
+    if (axes[i].driver->microsteps() != axes[i].microsteps ||
+        axes[i].driver->en_spreadCycle() ||
+        !axes[i].driver->intpol()) {
       restoreAxisFromChime(axes[i]);
       restoredAny = true;
     }
@@ -821,6 +848,39 @@ void handleStatusGcode() {
   Serial.print(" HOMED:");
   for (int i = 0; i < NUM_AXES; i++) Serial.print(axes[i].homed ? axes[i].coordCode : '-');
   Serial.println();
+  Serial.println("OK");
+}
+
+void handleRegsGcode() {
+  for (int i = 0; i < NUM_AXES; i++) {
+    Axis& ax = axes[i];
+    Serial.print("REGS "); Serial.print(ax.name);
+    Serial.print(" GCONF=0x"); Serial.print(ax.driver->GCONF(), HEX);
+    Serial.print(" GSTAT=0x"); Serial.print(ax.driver->GSTAT(), HEX);
+    Serial.print(" CHOP=0x"); Serial.print(ax.driver->CHOPCONF(), HEX);
+    Serial.print(" PWM=0x"); Serial.print(ax.driver->PWMCONF(), HEX);
+    Serial.print(" DRV=0x"); Serial.print(ax.driver->DRV_STATUS(), HEX);
+    Serial.print(" STEALTH="); Serial.print(ax.driver->stealth());
+    Serial.print(" CS_ACT="); Serial.print(ax.driver->cs_actual());
+    Serial.print(" IRUN="); Serial.print(ax.driver->irun());
+    Serial.print(" IHOLD="); Serial.print(ax.driver->ihold());
+    Serial.print(" MS="); Serial.print(ax.driver->microsteps());
+    Serial.print(" INTPOL="); Serial.print(ax.driver->intpol());
+    Serial.print(" SPREAD="); Serial.print(ax.driver->en_spreadCycle());
+    Serial.print(" VSENSE="); Serial.print(ax.driver->vsense());
+    Serial.print(" MREG="); Serial.print(ax.driver->mstep_reg_select());
+    Serial.print(" PWM_OFS_A="); Serial.print(ax.driver->pwm_ofs_auto());
+    Serial.print(" PWM_GRAD_A="); Serial.print(ax.driver->pwm_grad_auto());
+    Serial.print(" PWM_SUM="); Serial.print(ax.driver->pwm_scale_sum());
+    Serial.print(" TPWM=0x"); Serial.print(ax.driver->TPWMTHRS(), HEX);
+    Serial.print(" TCOOL=0x"); Serial.print(ax.driver->TCOOLTHRS(), HEX);
+    Serial.print(" SGTHRS="); Serial.print(ax.driver->SGTHRS());
+    Serial.print(" MSCNT="); Serial.print(ax.driver->MSCNT());
+    Serial.print(" SPM="); Serial.print(ax.stepsPerMm, 1);
+    Serial.print(" VMAX="); Serial.print(ax.maxSpeed, 0);
+    Serial.print(" ACC="); Serial.print(ax.acceleration, 0);
+    Serial.print(" LIM="); Serial.println(ax.maxTravelMm, 1);
+  }
   Serial.println("OK");
 }
 
@@ -1081,13 +1141,17 @@ static inline float axisHoldMultiplier(const Axis& axis) {
 void applyAxisDriverSettings(Axis& axis) {
   // Required for UART control + StallGuard
   axis.driver->pdn_disable(true);
+  axis.driver->mstep_reg_select(true);
   axis.driver->I_scale_analog(false);
+  axis.driver->multistep_filt(true);
   axis.driver->shaft(axis.invertDir);
   axis.driver->toff(5);
   axis.driver->en_spreadCycle(false);  // StealthChop on (needed for StallGuard)
   axis.driver->pwm_autoscale(true);
+  axis.driver->pwm_autograd(true);
   axis.driver->intpol(true);           // Enable TMC2209 internal 256x microstep interpolation for silent, smooth motion
   axis.driver->TCOOLTHRS(0xFFFFF);     // Enable StallGuard/DIAG at all speeds above ~0
+  axis.driver->TPWMTHRS(0);
 
   // Restore default maxSpeed and acceleration so prior MOVE feedrate caps never taint SETUP/HOME
   axis.maxSpeed     = (axis.coordCode == 'Y') ? DEFAULT_MAX_SPEED_Y :
@@ -1105,24 +1169,115 @@ void applyAxisDriverSettings(Axis& axis) {
   axis.driver->SGTHRS(axis.moveSensitivity);
 }
 
-bool restoreAxisFromChime(Axis& axis) {
-  for (int attempt = 0; attempt < 3; attempt++) {
+void captureAxisSnapshot(Axis& axis, SavedAxisSnapshot& snap) {
+  while (TMCSerial.available()) TMCSerial.read();
+  snap.maxSpeed        = axis.maxSpeed;
+  snap.acceleration    = axis.acceleration;
+  snap.stepsPerMm      = axis.stepsPerMm;
+  snap.maxTravelMm     = axis.maxTravelMm;
+  snap.maxFeedSpeed    = axis.maxFeedSpeed;
+  snap.currentMa       = axis.currentMa;
+  snap.microsteps      = axis.microsteps;
+  snap.moveSensitivity = axis.moveSensitivity;
+  snap.homeSensitivity = axis.homeSensitivity;
+  snap.stepperPos      = axis.stepper->currentPosition();
+
+  uint32_t g = axis.driver->GCONF();
+  bool gOk = !axis.driver->CRCerror;
+  uint32_t c = axis.driver->CHOPCONF();
+  bool cOk = !axis.driver->CRCerror && c != 0;
+  uint32_t p = axis.driver->PWMCONF();
+  bool pOk = !axis.driver->CRCerror && p != 0;
+  snap.gconf     = g;
+  snap.chopconf  = c;
+  snap.pwmconf   = p;
+  snap.iholdIrun = axis.driver->IHOLD_IRUN();
+  snap.hasRegs   = (gOk && cOk && pOk);
+}
+
+bool restoreAxisSnapshot(Axis& axis, const SavedAxisSnapshot& snap) {
+  axis.maxSpeed        = snap.maxSpeed;
+  axis.acceleration    = snap.acceleration;
+  axis.stepsPerMm      = snap.stepsPerMm;
+  axis.maxTravelMm     = snap.maxTravelMm;
+  axis.maxFeedSpeed    = snap.maxFeedSpeed;
+  axis.currentMa       = snap.currentMa;
+  axis.microsteps      = snap.microsteps;
+  axis.moveSensitivity = snap.moveSensitivity;
+  axis.homeSensitivity = snap.homeSensitivity;
+  axis.stepper->setMaxSpeed(axis.maxSpeed);
+  axis.stepper->setAcceleration(axis.acceleration);
+
+  for (int attempt = 0; attempt < 4; attempt++) {
     while (TMCSerial.available()) TMCSerial.read();
+    uint8_t gstat = axis.driver->GSTAT();
+    if (!axis.driver->CRCerror && (gstat & 0x01)) {
+      axis.driver->GSTAT(0x07); // Clear reset / UV flags after any transient droop
+      axis.driver->begin();
+    }
+
     uint8_t ifcntBefore = axis.driver->IFCNT();
-    applyAxisDriverSettings(axis);
-    delay(2);
+    if (snap.hasRegs) {
+      axis.driver->GCONF(snap.gconf);
+      axis.driver->CHOPCONF(snap.chopconf);
+      axis.driver->PWMCONF(snap.pwmconf);
+      axis.driver->IHOLD_IRUN(snap.iholdIrun);
+      axis.driver->TPOWERDOWN(15);
+      axis.driver->TCOOLTHRS(0xFFFFF);
+      axis.driver->TPWMTHRS(0);
+      axis.driver->SGTHRS(axis.moveSensitivity);
+    } else {
+      applyAxisDriverSettings(axis);
+      axis.maxSpeed     = snap.maxSpeed;
+      axis.acceleration = snap.acceleration;
+      axis.stepper->setMaxSpeed(axis.maxSpeed);
+      axis.stepper->setAcceleration(axis.acceleration);
+    }
+    delay(3);
     uint8_t ifcntAfter = axis.driver->IFCNT();
-    if (ifcntAfter != ifcntBefore &&
-        axis.driver->microsteps() == axis.microsteps &&
-        !axis.driver->en_spreadCycle() &&
-        axis.driver->intpol()) {
+
+    if (snap.hasRegs) {
+      uint32_t gNow = axis.driver->GCONF();
+      bool gOk = !axis.driver->CRCerror && (gNow == snap.gconf);
+      uint32_t cNow = axis.driver->CHOPCONF();
+      bool cOk = !axis.driver->CRCerror && (cNow == snap.chopconf);
+      uint32_t pNow = axis.driver->PWMCONF();
+      bool pOk = !axis.driver->CRCerror && (pNow == snap.pwmconf);
+      if (gOk && cOk && pOk && ifcntAfter != ifcntBefore) {
+        return true;
+      }
+    } else if (ifcntAfter != ifcntBefore &&
+               axis.driver->microsteps() == axis.microsteps &&
+               !axis.driver->en_spreadCycle() &&
+               axis.driver->intpol()) {
       return true;
     }
     delay(5);
   }
+
   axis.driver->begin();
   applyAxisDriverSettings(axis);
+  axis.maxSpeed     = snap.maxSpeed;
+  axis.acceleration = snap.acceleration;
+  axis.stepper->setMaxSpeed(axis.maxSpeed);
+  axis.stepper->setAcceleration(axis.acceleration);
   return (axis.driver->microsteps() == axis.microsteps && !axis.driver->en_spreadCycle());
+}
+
+bool restoreAxisFromChime(Axis& axis) {
+  SavedAxisSnapshot fallbackSnap;
+  fallbackSnap.hasRegs         = false;
+  fallbackSnap.maxSpeed        = axis.maxSpeed;
+  fallbackSnap.acceleration    = axis.acceleration;
+  fallbackSnap.stepsPerMm      = axis.stepsPerMm;
+  fallbackSnap.maxTravelMm     = axis.maxTravelMm;
+  fallbackSnap.maxFeedSpeed    = axis.maxFeedSpeed;
+  fallbackSnap.currentMa       = axis.currentMa;
+  fallbackSnap.microsteps      = axis.microsteps;
+  fallbackSnap.moveSensitivity = axis.moveSensitivity;
+  fallbackSnap.homeSensitivity = axis.homeSensitivity;
+  fallbackSnap.stepperPos      = axis.stepper->currentPosition();
+  return restoreAxisSnapshot(axis, fallbackSnap);
 }
 
 bool setupAxis(Axis& axis) {
@@ -1603,8 +1758,8 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
 // ============================================================
 static const int CHIME_MICROSTEPS_XZ = 4;   // Coarser than 16x for stronger acoustic torque ripple
 static const int CHIME_MICROSTEPS_Y  = 8;   // 40 mm/rev belt keeps excursion small at 8x
-static const int CHIME_CURRENT_MA_XZ = 750; // Temporary boost during 1-3 s chime for louder output
-static const int CHIME_CURRENT_MA_Y  = 950;
+static const int CHIME_CURRENT_MA_XZ = 500; // Moderate chime boost (avoids rail droop / UVLO)
+static const int CHIME_CURRENT_MA_Y  = 700; // Keeps Y in vsense=1 matching normal operation
 
 static int chimeMicrostepsFor(const Axis& axis) {
   return (axis.coordCode == 'Y') ? CHIME_MICROSTEPS_Y : CHIME_MICROSTEPS_XZ;
@@ -1711,14 +1866,13 @@ static bool stepChimeSegment(
 }
 
 static bool returnChimeOffsetSilently(long netStepsX, long netStepsY, long netStepsZ) {
-  // Switch back to quiet StealthChop + 256x interpolation while still at chime microstepping,
-  // then unwind any small musical displacement back to the exact starting microstep.
+  // Drop back to normal run currents while keeping chime microsteps so step counts match,
+  // then unwind the musical displacement cleanly back to the exact starting microstep before
+  // StealthChop + regular microstepping/interpolation are restored at standstill.
   for (int i = 0; i < NUM_AXES; i++) {
-    axes[i].driver->en_spreadCycle(false);
-    axes[i].driver->intpol(true);
     axes[i].driver->rms_current(axes[i].currentMa, axisHoldMultiplier(axes[i]));
   }
-  delay(20);
+  delay(10);
 
   long remX = labs(netStepsX);
   long remY = labs(netStepsY);
@@ -1762,6 +1916,13 @@ void handleChimeGcode(String params, bool emitProtocolReply) {
   if (!ensureDriversReady()) {
     if (emitProtocolReply) Serial.println("ERR:TMC_NOT_READY");
     return;
+  }
+
+  // Snapshot exact pre-chime hardware registers and software settings/limits on all 3 axes
+  SavedAxisSnapshot snapshots[NUM_AXES];
+  for (int i = 0; i < NUM_AXES; i++) {
+    captureAxisSnapshot(axes[i], snapshots[i]);
+    axes[i].driver->GSTAT(0x07);
   }
 
   float curXMm = (float)axes[0].stepper->currentPosition() / axes[0].stepsPerMm;
@@ -1840,9 +2001,10 @@ void handleChimeGcode(String params, bool emitProtocolReply) {
   }
 
   for (int i = 0; i < NUM_AXES; i++) {
-    setChimeDriverMode(axes[i], false);
+    restoreAxisSnapshot(axes[i], snapshots[i]);
   }
-  delay(DRIVER_ENABLE_SETTLE_MS);
+  // Allow StealthChop AT#1 to calibrate cleanly at standstill using exact restored settings
+  delay(max(DRIVER_ENABLE_SETTLE_MS, 250UL));
 
   if (emitProtocolReply) {
     Serial.println(cancelled ? "ERR:CANCELLED" : "OK");
