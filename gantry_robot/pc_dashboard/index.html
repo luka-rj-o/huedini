@@ -7,7 +7,7 @@
   <link rel="icon" type="image/png" href="favicon.png?v=2" />
   <link rel="shortcut icon" type="image/png" href="favicon.png?v=2" />
   <link rel="apple-touch-icon" href="favicon.png?v=2" />
-  <link rel="stylesheet" href="styles.css?v=7" />
+  <link rel="stylesheet" href="styles.css?v=8" />
 </head>
 <body>
   <!-- ======================================================================
@@ -44,7 +44,7 @@
 
   <main class="layout">
     <!-- ====================================================================
-         LEFT RAIL — Operation: run sequence + manual motion
+         LEFT RAIL — Run controls, steppers, manual jog, 4-DOF & CAD Layers
          ==================================================================== -->
     <aside class="rail rail-left">
       <section class="panel">
@@ -66,6 +66,11 @@
           <button class="btn btn-secondary btn-block" onclick="sendCmd('HOME_ALL')" title="Full 3-axis homing (Z, X, Y) to physical origin">
             <span class="ico">&#8962;</span> Home All Axes
           </button>
+          <div class="btn-grid-3">
+            <button class="btn btn-ghost btn-xs" onclick="sendCmd('FREE_MOTORS')" title="Cut stepper power to move the gantry by hand">Free</button>
+            <button class="btn btn-ghost btn-xs" onclick="sendCmd('WAKE_MOTORS')" title="Re-enable and set up steppers">Wake</button>
+            <button class="btn btn-ghost btn-xs" onclick="sendCmd('PLAY_CHIME')" title="Play Windows 3.1 Tada! victory chime on X/Z steppers">&#9835; Chime</button>
+          </div>
         </div>
       </section>
 
@@ -106,46 +111,123 @@
               </button>
             </div>
           </div>
-          <p class="hint">Arrows match the map orientation (+Y = forward / up on map).</p>
         </div>
       </section>
 
+      <!-- 4-DOF Local Kinematic Sandbox Preview -->
       <section class="panel">
         <div class="panel-head">
-          <h2>Steppers</h2>
-        </div>
-        <div class="panel-body run-controls">
-          <div class="btn-grid-2">
-            <button class="btn btn-secondary" onclick="sendCmd('FREE_MOTORS')" title="Cut stepper power to move the gantry by hand">Free</button>
-            <button class="btn btn-secondary" onclick="sendCmd('WAKE_MOTORS')" title="Re-enable and set up steppers">Wake</button>
+          <h2>4-DOF Sandbox</h2>
+          <div class="head-actions">
+            <button id="jawToggleBtn" class="btn btn-ghost btn-xs" onclick="toggleJawManual()" title="Preview jaw open/closed in 3D">Jaw: Closed</button>
+            <button id="syncHwPoseBtn" class="btn btn-ghost btn-xs hidden" onclick="syncPoseToHardware()" title="Snap preview back to live Pi telemetry">Sync</button>
           </div>
-          <button class="btn btn-secondary btn-block" onclick="sendCmd('PLAY_CHIME')" title="Play Windows 3.1 Tada! victory chime on X/Z steppers">
-            <span class="ico">&#9835;</span> Tada! Chime
-          </button>
+        </div>
+        <div class="panel-body dof-sliders">
+          <label class="dof-row">
+            <span class="dof-k">X</span>
+            <input id="sliderX" type="range" min="0" max="227" step="0.5" value="0" oninput="onSliderPose()" />
+            <span class="dof-v" id="sliderXVal">0.0</span>
+          </label>
+          <label class="dof-row">
+            <span class="dof-k">Y</span>
+            <input id="sliderY" type="range" min="0" max="128" step="0.5" value="0" oninput="onSliderPose()" />
+            <span class="dof-v" id="sliderYVal">0.0</span>
+          </label>
+          <label class="dof-row">
+            <span class="dof-k">Z&darr;</span>
+            <input id="sliderZ" type="range" min="0" max="70.36" step="0.5" value="0" oninput="onSliderPose()" />
+            <span class="dof-v" id="sliderZVal">0.0</span>
+          </label>
+          <label class="dof-row">
+            <span class="dof-k">&theta;</span>
+            <input id="sliderA" type="range" min="0" max="180" step="1" value="0" oninput="onSliderPose()" />
+            <span class="dof-v" id="sliderAVal">0&deg;</span>
+          </label>
+        </div>
+      </section>
+
+      <!-- CAD Layers & Hot-Swap Inspector -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2>CAD Layers</h2>
+          <button class="btn btn-ghost btn-xs" onclick="openCadImportModal()" title="Load an Onshape .3mf, .stl, or .glb mesh onto a kinematic stage">+ Import CAD</button>
+        </div>
+        <div class="panel-body cad-layers-body">
+          <div class="toggle-grid">
+            <button class="layer-chip active" id="layerFovBtn" onclick="toggleLayer('fov')">FOV Cone</button>
+            <button class="layer-chip active" id="layerTrailBtn" onclick="toggleLayer('trail')">Trail</button>
+            <button class="layer-chip active" id="layerReachBtn" onclick="toggleLayer('reach')">Reach Box</button>
+            <button class="layer-chip" id="layerWireBtn" onclick="toggleLayer('wireframe')">X-Ray CAD</button>
+          </div>
+          <div id="meshStatusText" class="mesh-status">Loading compiled Onshape V3 Gantry CAD…</div>
         </div>
       </section>
     </aside>
 
     <!-- ====================================================================
-         CENTER — Digital twin (hero) + bottom drawer
+         CENTER — Multi-mode 3D CAD Digital Twin + 2D Tactical + Replay
          ==================================================================== -->
     <section class="center">
       <section class="panel twin-panel">
-        <div class="panel-head">
+        <div class="panel-head twin-toolbar">
           <div class="head-title">
             <h2>Digital Twin</h2>
-            <span class="head-sub">XY top view · Z elevation</span>
+            <div class="segmented" role="group" aria-label="View mode">
+              <button class="seg mode-btn active" data-mode="split" onclick="setTwinMode('split')">Split 3D+2D</button>
+              <button class="seg mode-btn" data-mode="3d" onclick="setTwinMode('3d')">3D CAD</button>
+              <button class="seg mode-btn" data-mode="2d" onclick="setTwinMode('2d')">2D Map</button>
+            </div>
           </div>
-          <div class="legend">
-            <span class="lg"><i class="lg-sw lg-ee"></i>End-effector</span>
-            <span class="lg"><i class="lg-sw lg-cam"></i>Camera</span>
-            <span class="lg"><i class="lg-sw lg-carriage"></i>Carriage</span>
-            <span class="lg"><i class="lg-sw lg-zone"></i>Drop zone</span>
+
+          <div class="cam-presets" id="camPresetsBar">
+            <button class="preset-chip active" data-cam="iso" onclick="setCameraPreset('iso')">Iso</button>
+            <button class="preset-chip" data-cam="top" onclick="setCameraPreset('top')">Top</button>
+            <button class="preset-chip" data-cam="front" onclick="setCameraPreset('front')">Front</button>
+            <button class="preset-chip" data-cam="side" onclick="setCameraPreset('side')">Side</button>
+            <button class="preset-chip" data-cam="eyeinhand" onclick="setCameraPreset('eyeinhand')" title="Virtual camera inside the V3 Load Cell Bracket lens">Cam POV</button>
+            <button class="preset-chip" data-cam="follow" onclick="setCameraPreset('follow')" title="Follow the EE_V6 gripper">Follow EE</button>
           </div>
+
           <span class="cursor-readout" id="cursorReadout">— , — mm</span>
         </div>
-        <div class="canvas-wrap" id="canvasWrap">
-          <canvas id="courseCanvas"></canvas>
+
+        <!-- Viewport stage -->
+        <div class="twin-stage" id="twinStage" data-mode="split">
+          <!-- 3D WebGL Viewport -->
+          <div class="viewport-3d" id="viewport3dWrap">
+            <canvas id="twin3dCanvas"></canvas>
+            <div class="hud-3d-top">
+              <span class="hud-badge" id="hudCamLabel">Orbit · V3 Gantry Assembly</span>
+              <span class="hud-badge hud-badge-subtle" id="hudFps">3D WebGL</span>
+            </div>
+            <div class="hud-3d-reticle hidden" id="eyeInHandReticle">
+              <div class="reticle-ring"></div>
+              <span>OPTICAL AXIS · (CAM)</span>
+            </div>
+            <div class="hud-3d-stages" id="stageLegend">
+              <span class="stg stg-0">S0 Base/Course</span>
+              <span class="stg stg-1">S1 X-Slider &amp; Z-Tower</span>
+              <span class="stg stg-2">S2 Y-Boom &amp; Saddle</span>
+              <span class="stg stg-3">S3 Load Cell Bracket</span>
+              <span class="stg stg-4">S4 EE_V6 Gripper</span>
+            </div>
+          </div>
+
+          <!-- 2D Tactical Viewport -->
+          <div class="viewport-2d canvas-wrap" id="canvasWrap">
+            <canvas id="courseCanvas"></canvas>
+          </div>
+        </div>
+
+        <!-- Replay Scrubber Bar (shown when a historical report is loaded) -->
+        <div class="replay-bar hidden" id="replayBar">
+          <span class="pill pill-accent">RUN REPLAY</span>
+          <strong id="replayRunName">—</strong>
+          <button class="btn btn-secondary btn-xs" id="replayPlayBtn" onclick="toggleReplayPlay()">&#9654; Play</button>
+          <input id="replayScrub" type="range" min="0" max="100" value="0" oninput="onReplayScrub(this.value)" />
+          <span class="replay-time" id="replayStepLabel">0 / 0</span>
+          <button class="btn btn-ghost btn-xs" onclick="exitReplayMode()">Exit Replay</button>
         </div>
 
         <!-- Live axis telemetry strip -->
@@ -167,8 +249,8 @@
           </div>
           <div class="strip-divider"></div>
           <div class="kv-stack">
-            <div class="kv"><span class="k k-ee">EE</span><span class="v" id="eePlateReadout">(32.5, -6.0, 97.6)</span></div>
-            <div class="kv"><span class="k k-cam">CAM</span><span class="v" id="camPlateReadout">(32.5, 48.1, 135.4)</span></div>
+            <div class="kv"><span class="k k-ee">EE</span><span class="v" id="eePlateReadout">(31.0, -8.5, 97.6)</span></div>
+            <div class="kv"><span class="k k-cam">CAM</span><span class="v" id="camPlateReadout">(32.5, 33.1, 135.4)</span></div>
           </div>
           <div class="kv-stack">
             <div class="kv"><span class="k">&theta;</span><span class="v"><span id="poseA">0.0</span>&deg;</span></div>
@@ -177,7 +259,7 @@
         </div>
       </section>
 
-      <!-- Bottom drawer: Console · Reports · Calibration -->
+      <!-- Bottom drawer: Console · Reports (with 3D Replay & Inspector) · Calibration -->
       <section class="panel drawer">
         <div class="tabs" role="tablist">
           <button class="tab active" data-tab="console" onclick="selectTab('console')">Console</button>
@@ -189,7 +271,8 @@
           </div>
           <div class="tab-actions hidden" data-for="reports">
             <button class="btn btn-ghost btn-xs" onclick="fetchRecentReports()">&#8635; Refresh</button>
-            <button class="btn btn-ghost btn-xs" onclick="viewLatestReport()">Open latest</button>
+            <button class="btn btn-primary btn-xs" onclick="replayLatestReport()">&#9654; Replay Latest in 3D</button>
+            <button class="btn btn-ghost btn-xs" onclick="viewLatestReport()">Open Latest</button>
             <button class="btn btn-ghost btn-xs" onclick="downloadLatestReport()">Download JSON</button>
           </div>
         </div>
@@ -205,7 +288,7 @@
         </div>
 
         <div class="tab-pane" data-pane="reports">
-          <p id="reportSummaryText" class="report-summary">Run reports are cached automatically after each scan cycle.</p>
+          <p id="reportSummaryText" class="report-summary">Click any recorded run below to inspect telemetry or replay in 3D.</p>
           <div class="recent-reports-list" id="recentReportsList"></div>
         </div>
 
@@ -221,12 +304,12 @@
           <div class="cal-lead">
             <div class="cal-lead-head">
               <span class="k">Lead screw steps/mm (X &amp; Z)</span>
-              <span id="currentSpmTag" class="pill pill-accent">X/Z 50.0 · Y 10.0</span>
+              <span id="currentSpmTag" class="pill pill-accent">X/Z 200.0 · Y 10.0</span>
             </div>
             <div class="segmented segmented-wide">
-              <button class="seg preset-btn active" id="presetT8x8" onclick="applyLeadPreset(8.0, 50.0)" title="4-start T8: 8 mm lead">T8×8 · 50</button>
-              <button class="seg preset-btn" id="presetT8x4" onclick="applyLeadPreset(4.0, 100.0)" title="2-start T8: 4 mm lead">T8×4 · 100</button>
-              <button class="seg preset-btn" id="presetT8x2" onclick="applyLeadPreset(2.0, 200.0)" title="1-start T8: 2 mm lead">T8×2 · 200</button>
+              <button class="seg preset-btn" id="presetT8x8" onclick="applyLeadPreset(8.0, 50.0)" title="4-start T8: 8 mm lead">T8&times;8 · 50</button>
+              <button class="seg preset-btn" id="presetT8x4" onclick="applyLeadPreset(4.0, 100.0)" title="2-start T8: 4 mm lead">T8&times;4 · 100</button>
+              <button class="seg preset-btn active" id="presetT8x2" onclick="applyLeadPreset(2.0, 200.0)" title="1-start T8: 2 mm lead">T8&times;2 · 200</button>
               <button class="seg" onclick="promptCustomSpm()" title="Enter exact calibrated steps/mm">Custom…</button>
             </div>
           </div>
@@ -235,7 +318,7 @@
     </section>
 
     <!-- ====================================================================
-         RIGHT RAIL — Sensing: camera, load cell, block catalog
+         RIGHT RAIL — Live / Synthetic Camera, Load Cell, Block Catalog
          ==================================================================== -->
     <aside class="rail rail-right">
       <section class="panel cam-panel" id="camPanel">
@@ -249,11 +332,8 @@
           </div>
         </div>
         <div class="cam-frame" onclick="toggleCamExpand()">
-          <img id="visionPreviewImg" alt="" />
-          <div id="camOverlayEmpty" class="cam-empty">
-            <span class="cam-empty-icon">&#9673;</span>
-            <span>Waiting for 640×480 stream…</span>
-          </div>
+          <img id="visionPreviewImg" alt="" style="display:none" />
+          <canvas id="synthCamCanvas" width="640" height="480"></canvas>
         </div>
         <div class="cam-hud" id="liveDetectionHud">
           <span id="liveDetectionText">No detections</span>
@@ -275,9 +355,9 @@
             <button class="btn btn-secondary" onclick="sendWeighCmd()" title="Sample load-cell mass">Sample</button>
           </div>
           <div class="mass-bins" id="massBins">
-            <span data-cls="low_infill">Low<small>≤4.75</small></span>
-            <span data-cls="med_infill">Med<small>≤8.40</small></span>
-            <span data-cls="high_infill">High<small>≤15.7</small></span>
+            <span data-cls="low_infill">Low<small>&le;4.75</small></span>
+            <span data-cls="med_infill">Med<small>&le;8.40</small></span>
+            <span data-cls="high_infill">High<small>&le;15.7</small></span>
             <span data-cls="aluminum">Alum<small>&gt;15.7</small></span>
           </div>
         </div>
@@ -311,14 +391,74 @@
       </div>
       <div class="modal-body" id="modalReportBody"></div>
       <div class="modal-foot">
-        <button class="btn btn-secondary" onclick="closeReportModal()">Close</button>
+        <button class="btn btn-secondary" onclick="replayModalReport()">&#9654; Replay in 3D</button>
         <a id="modalDownloadBtn" class="btn btn-primary" href="#" target="_blank">Download JSON</a>
+        <button class="btn btn-ghost" onclick="closeReportModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Hot-Swap CAD Import Modal -->
+  <div id="cadImportModal" class="modal" style="display:none" onclick="if (event.target === this) closeCadImportModal()">
+    <div class="modal-content" style="max-width:660px">
+      <div class="modal-head">
+        <h3>Import Onshape CAD / Bulk Assembly (.3mf / .stl / .glb)</h3>
+        <button class="modal-close" onclick="closeCadImportModal()">&times;</button>
+      </div>
+      <div class="modal-body" style="gap:12px">
+        <p style="color:var(--text-2);font-size:12px">
+          Drop a bulk Onshape assembly export (<strong>V3 Gantry.3mf</strong> / <strong>.glb</strong>) to auto-mate every part into kinematic Stages 0–4 by 3D position &amp; name, or attach a single part to a specific stage.
+        </p>
+        <div class="btn-grid-2">
+          <div class="import-field">
+            <label for="cadStageSelect">Import Mode / Target Stage</label>
+            <select id="cadStageSelect">
+              <option value="auto" selected>Bulk Assembly Auto-Mate (Stages 0–4)</option>
+              <option value="yStage">Stage 3 · Y-Carriage (Moves X, Y, Z)</option>
+              <option value="eeStage">Stage 4 · End-Effector (Moves + Rotates &theta;)</option>
+              <option value="zStage">Stage 2 · Z-Saddle &amp; Y-Boom (Moves X, Z)</option>
+              <option value="xStage">Stage 1 · X-Carriage &amp; Z-Tower (Moves X)</option>
+              <option value="world">Stage 0 · Static Base / Course</option>
+            </select>
+          </div>
+          <div class="import-field">
+            <label for="cadUnitScale">CAD File Units &amp; Up-Axis</label>
+            <select id="cadUnitScale">
+              <option value="1000:zup" selected>Meters, Z-Up (Onshape 3MF default)</option>
+              <option value="1000:yup">Meters, Y-Up (Onshape GLB / GLTF)</option>
+              <option value="1:zup">Millimeters, Z-Up (STL mm export)</option>
+              <option value="1:yup">Millimeters, Y-Up</option>
+            </select>
+          </div>
+        </div>
+        <div class="import-drop" id="cadDropZone">
+          <input id="cadFileInput" type="file" accept=".3mf,.stl,.glb,.gltf" onchange="handleCadFileSelect(event)" />
+          <span>Choose or drop a <strong>.3mf</strong>, <strong>.stl</strong>, or <strong>.glb</strong> file here</span>
+        </div>
+        <div id="cadImportStatus" class="mesh-status"></div>
+        <div id="bulkPartsWrap" class="bulk-parts-wrap hidden">
+          <table class="modal-table">
+            <thead><tr><th>Part / Mesh</th><th>Centroid (mm)</th><th>Assigned Stage</th></tr></thead>
+            <tbody id="bulkPartsBody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-ghost" onclick="clearCustomCadMeshes()">Reset to Default Onshape CAD</button>
+        <button class="btn btn-secondary" onclick="closeCadImportModal()">Done</button>
       </div>
     </div>
   </div>
 
   <div id="camBackdrop" class="cam-backdrop" onclick="toggleCamExpand(false)"></div>
 
-  <script src="app.js?v=10"></script>
+  <!-- Local Vendor Three.js (Zero Internet Dependency on Pi LAN) -->
+  <script src="assets/vendor/fflate.min.js"></script>
+  <script src="assets/vendor/three.min.js"></script>
+  <script src="assets/vendor/OrbitControls.js"></script>
+  <script src="assets/vendor/STLLoader.js"></script>
+  <script src="assets/vendor/GLTFLoader.js"></script>
+  <script src="assets/vendor/3MFLoader.js"></script>
+  <script src="app.js?v=13"></script>
 </body>
 </html>

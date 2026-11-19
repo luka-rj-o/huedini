@@ -1,0 +1,788 @@
+{
+  "source": "V3 Gantry.glb",
+  "cad_motor_x_mm": 14.4,
+  "cad_motor_y_mm": 70.0,
+  "cad_motor_z_mm": 0.0,
+  "ee_pivot_three": [
+    -96.6,
+    106.5,
+    -1.5
+  ],
+  "cam_local_three": [
+    -95.6,
+    120.5,
+    -58.5
+  ],
+  "materials": [
+    {
+      "color": [
+        0.902,
+        0.902,
+        0.902
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.08,
+        0.64,
+        0.92
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.3451,
+        0.3451,
+        0.3451
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.22,
+        0.72,
+        0.96
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        1.0,
+        0.0,
+        0.0
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.9176,
+        0.9176,
+        0.9176
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.0,
+        0.0,
+        1.0
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.86,
+        0.36,
+        0.78
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.0,
+        1.0,
+        0.0
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.6471,
+        0.6471,
+        0.6471
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.7529,
+        0.7529,
+        0.7529
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.498,
+        0.498,
+        0.498
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.1686,
+        0.1686,
+        0.1686
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.7137,
+        0.7608,
+        0.8
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.2275,
+        0.2275,
+        0.2275
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.9765,
+        0.9765,
+        0.9765
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.85,
+        0.85,
+        0.85
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.702,
+        0.6824,
+        0.6235
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.902,
+        0.8784,
+        0.8118
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.2314,
+        0.3804,
+        0.7059
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.851,
+        0.851,
+        0.851
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    },
+    {
+      "color": [
+        0.4863,
+        0.4863,
+        0.4863
+      ],
+      "alpha": 1.0,
+      "metalness": 0.0,
+      "roughness": 0.45
+    }
+  ],
+  "draw_calls": [
+    {
+      "stage": "eeStage",
+      "material": 4,
+      "vertexCount": 34,
+      "triangleCount": 78,
+      "posOffset": 0,
+      "nrmOffset": 408,
+      "idxOffset": 816,
+      "idxCount": 234
+    },
+    {
+      "stage": "eeStage",
+      "material": 5,
+      "vertexCount": 318,
+      "triangleCount": 726,
+      "posOffset": 1752,
+      "nrmOffset": 5568,
+      "idxOffset": 9384,
+      "idxCount": 2178
+    },
+    {
+      "stage": "eeStage",
+      "material": 6,
+      "vertexCount": 53,
+      "triangleCount": 102,
+      "posOffset": 18096,
+      "nrmOffset": 18732,
+      "idxOffset": 19368,
+      "idxCount": 306
+    },
+    {
+      "stage": "eeStage",
+      "material": 8,
+      "vertexCount": 9359,
+      "triangleCount": 9102,
+      "posOffset": 20592,
+      "nrmOffset": 132900,
+      "idxOffset": 245208,
+      "idxCount": 27306
+    },
+    {
+      "stage": "eeStage",
+      "material": 10,
+      "vertexCount": 194,
+      "triangleCount": 400,
+      "posOffset": 354432,
+      "nrmOffset": 356760,
+      "idxOffset": 359088,
+      "idxCount": 1200
+    },
+    {
+      "stage": "eeStage",
+      "material": 12,
+      "vertexCount": 63,
+      "triangleCount": 194,
+      "posOffset": 363888,
+      "nrmOffset": 364644,
+      "idxOffset": 365400,
+      "idxCount": 582
+    },
+    {
+      "stage": "eeStage",
+      "material": 20,
+      "vertexCount": 177,
+      "triangleCount": 354,
+      "posOffset": 367728,
+      "nrmOffset": 369852,
+      "idxOffset": 371976,
+      "idxCount": 1062
+    },
+    {
+      "stage": "eeStage",
+      "material": 21,
+      "vertexCount": 41,
+      "triangleCount": 92,
+      "posOffset": 376224,
+      "nrmOffset": 376716,
+      "idxOffset": 377208,
+      "idxCount": 276
+    },
+    {
+      "stage": "plunger",
+      "material": 12,
+      "vertexCount": 191,
+      "triangleCount": 402,
+      "posOffset": 378312,
+      "nrmOffset": 380604,
+      "idxOffset": 382896,
+      "idxCount": 1206
+    },
+    {
+      "stage": "world",
+      "material": 3,
+      "vertexCount": 2376,
+      "triangleCount": 4916,
+      "posOffset": 387720,
+      "nrmOffset": 416232,
+      "idxOffset": 444744,
+      "idxCount": 14748
+    },
+    {
+      "stage": "world",
+      "material": 4,
+      "vertexCount": 1160,
+      "triangleCount": 1144,
+      "posOffset": 503736,
+      "nrmOffset": 517656,
+      "idxOffset": 531576,
+      "idxCount": 3432
+    },
+    {
+      "stage": "world",
+      "material": 5,
+      "vertexCount": 877,
+      "triangleCount": 695,
+      "posOffset": 545304,
+      "nrmOffset": 555828,
+      "idxOffset": 566352,
+      "idxCount": 2085
+    },
+    {
+      "stage": "world",
+      "material": 6,
+      "vertexCount": 5499,
+      "triangleCount": 8292,
+      "posOffset": 574692,
+      "nrmOffset": 640680,
+      "idxOffset": 706668,
+      "idxCount": 24876
+    },
+    {
+      "stage": "world",
+      "material": 10,
+      "vertexCount": 1464,
+      "triangleCount": 1788,
+      "posOffset": 806172,
+      "nrmOffset": 823740,
+      "idxOffset": 841308,
+      "idxCount": 5364
+    },
+    {
+      "stage": "world",
+      "material": 11,
+      "vertexCount": 28,
+      "triangleCount": 56,
+      "posOffset": 862764,
+      "nrmOffset": 863100,
+      "idxOffset": 863436,
+      "idxCount": 168
+    },
+    {
+      "stage": "world",
+      "material": 12,
+      "vertexCount": 68,
+      "triangleCount": 120,
+      "posOffset": 864108,
+      "nrmOffset": 864924,
+      "idxOffset": 865740,
+      "idxCount": 360
+    },
+    {
+      "stage": "world",
+      "material": 15,
+      "vertexCount": 414,
+      "triangleCount": 1180,
+      "posOffset": 867180,
+      "nrmOffset": 872148,
+      "idxOffset": 877116,
+      "idxCount": 3540
+    },
+    {
+      "stage": "world",
+      "material": 16,
+      "vertexCount": 50,
+      "triangleCount": 104,
+      "posOffset": 891276,
+      "nrmOffset": 891876,
+      "idxOffset": 892476,
+      "idxCount": 312
+    },
+    {
+      "stage": "world",
+      "material": 17,
+      "vertexCount": 213,
+      "triangleCount": 205,
+      "posOffset": 893724,
+      "nrmOffset": 896280,
+      "idxOffset": 898836,
+      "idxCount": 615
+    },
+    {
+      "stage": "world",
+      "material": 18,
+      "vertexCount": 3504,
+      "triangleCount": 3468,
+      "posOffset": 901296,
+      "nrmOffset": 943344,
+      "idxOffset": 985392,
+      "idxCount": 10404
+    },
+    {
+      "stage": "xStage",
+      "material": 4,
+      "vertexCount": 24,
+      "triangleCount": 12,
+      "posOffset": 1027008,
+      "nrmOffset": 1027296,
+      "idxOffset": 1027584,
+      "idxCount": 36
+    },
+    {
+      "stage": "xStage",
+      "material": 5,
+      "vertexCount": 1508,
+      "triangleCount": 1416,
+      "posOffset": 1027728,
+      "nrmOffset": 1045824,
+      "idxOffset": 1063920,
+      "idxCount": 4248
+    },
+    {
+      "stage": "xStage",
+      "material": 6,
+      "vertexCount": 4930,
+      "triangleCount": 5612,
+      "posOffset": 1080912,
+      "nrmOffset": 1140072,
+      "idxOffset": 1199232,
+      "idxCount": 16836
+    },
+    {
+      "stage": "xStage",
+      "material": 7,
+      "vertexCount": 24,
+      "triangleCount": 12,
+      "posOffset": 1266576,
+      "nrmOffset": 1266864,
+      "idxOffset": 1267152,
+      "idxCount": 36
+    },
+    {
+      "stage": "xStage",
+      "material": 8,
+      "vertexCount": 3680,
+      "triangleCount": 3730,
+      "posOffset": 1267296,
+      "nrmOffset": 1311456,
+      "idxOffset": 1355616,
+      "idxCount": 11190
+    },
+    {
+      "stage": "xStage",
+      "material": 9,
+      "vertexCount": 24,
+      "triangleCount": 12,
+      "posOffset": 1400376,
+      "nrmOffset": 1400664,
+      "idxOffset": 1400952,
+      "idxCount": 36
+    },
+    {
+      "stage": "xStage",
+      "material": 10,
+      "vertexCount": 961,
+      "triangleCount": 1014,
+      "posOffset": 1401096,
+      "nrmOffset": 1412628,
+      "idxOffset": 1424160,
+      "idxCount": 3042
+    },
+    {
+      "stage": "xStage",
+      "material": 11,
+      "vertexCount": 28,
+      "triangleCount": 56,
+      "posOffset": 1436328,
+      "nrmOffset": 1436664,
+      "idxOffset": 1437000,
+      "idxCount": 168
+    },
+    {
+      "stage": "xStage",
+      "material": 12,
+      "vertexCount": 64,
+      "triangleCount": 148,
+      "posOffset": 1437672,
+      "nrmOffset": 1438440,
+      "idxOffset": 1439208,
+      "idxCount": 444
+    },
+    {
+      "stage": "xStage",
+      "material": 15,
+      "vertexCount": 348,
+      "triangleCount": 696,
+      "posOffset": 1440984,
+      "nrmOffset": 1445160,
+      "idxOffset": 1449336,
+      "idxCount": 2088
+    },
+    {
+      "stage": "xStage",
+      "material": 16,
+      "vertexCount": 56,
+      "triangleCount": 114,
+      "posOffset": 1457688,
+      "nrmOffset": 1458360,
+      "idxOffset": 1459032,
+      "idxCount": 342
+    },
+    {
+      "stage": "yStage",
+      "material": 3,
+      "vertexCount": 3333,
+      "triangleCount": 3610,
+      "posOffset": 1460400,
+      "nrmOffset": 1500396,
+      "idxOffset": 1540392,
+      "idxCount": 10830
+    },
+    {
+      "stage": "yStage",
+      "material": 5,
+      "vertexCount": 4598,
+      "triangleCount": 4220,
+      "posOffset": 1583712,
+      "nrmOffset": 1638888,
+      "idxOffset": 1694064,
+      "idxCount": 12660
+    },
+    {
+      "stage": "yStage",
+      "material": 10,
+      "vertexCount": 236,
+      "triangleCount": 496,
+      "posOffset": 1744704,
+      "nrmOffset": 1747536,
+      "idxOffset": 1750368,
+      "idxCount": 1488
+    },
+    {
+      "stage": "yStage",
+      "material": 11,
+      "vertexCount": 24,
+      "triangleCount": 44,
+      "posOffset": 1756320,
+      "nrmOffset": 1756608,
+      "idxOffset": 1756896,
+      "idxCount": 132
+    },
+    {
+      "stage": "yStage",
+      "material": 12,
+      "vertexCount": 54,
+      "triangleCount": 120,
+      "posOffset": 1757424,
+      "nrmOffset": 1758072,
+      "idxOffset": 1758720,
+      "idxCount": 360
+    },
+    {
+      "stage": "yStage",
+      "material": 13,
+      "vertexCount": 132,
+      "triangleCount": 452,
+      "posOffset": 1760160,
+      "nrmOffset": 1761744,
+      "idxOffset": 1763328,
+      "idxCount": 1356
+    },
+    {
+      "stage": "yStage",
+      "material": 14,
+      "vertexCount": 104,
+      "triangleCount": 228,
+      "posOffset": 1768752,
+      "nrmOffset": 1770000,
+      "idxOffset": 1771248,
+      "idxCount": 684
+    },
+    {
+      "stage": "yStage",
+      "material": 19,
+      "vertexCount": 2344,
+      "triangleCount": 2332,
+      "posOffset": 1773984,
+      "nrmOffset": 1802112,
+      "idxOffset": 1830240,
+      "idxCount": 6996
+    },
+    {
+      "stage": "yStage",
+      "material": 22,
+      "vertexCount": 181,
+      "triangleCount": 360,
+      "posOffset": 1858224,
+      "nrmOffset": 1860396,
+      "idxOffset": 1862568,
+      "idxCount": 1080
+    },
+    {
+      "stage": "zStage",
+      "material": 0,
+      "vertexCount": 559,
+      "triangleCount": 972,
+      "posOffset": 1866888,
+      "nrmOffset": 1873596,
+      "idxOffset": 1880304,
+      "idxCount": 2916
+    },
+    {
+      "stage": "zStage",
+      "material": 1,
+      "vertexCount": 323,
+      "triangleCount": 107,
+      "posOffset": 1891968,
+      "nrmOffset": 1895844,
+      "idxOffset": 1899720,
+      "idxCount": 323
+    },
+    {
+      "stage": "zStage",
+      "material": 2,
+      "vertexCount": 1753,
+      "triangleCount": 2047,
+      "posOffset": 1901012,
+      "nrmOffset": 1922048,
+      "idxOffset": 1943084,
+      "idxCount": 6141
+    },
+    {
+      "stage": "zStage",
+      "material": 3,
+      "vertexCount": 2722,
+      "triangleCount": 2776,
+      "posOffset": 1967648,
+      "nrmOffset": 2000312,
+      "idxOffset": 2032976,
+      "idxCount": 8328
+    },
+    {
+      "stage": "zStage",
+      "material": 6,
+      "vertexCount": 3131,
+      "triangleCount": 3736,
+      "posOffset": 2066288,
+      "nrmOffset": 2103860,
+      "idxOffset": 2141432,
+      "idxCount": 11208
+    },
+    {
+      "stage": "zStage",
+      "material": 8,
+      "vertexCount": 280,
+      "triangleCount": 578,
+      "posOffset": 2186264,
+      "nrmOffset": 2189624,
+      "idxOffset": 2192984,
+      "idxCount": 1734
+    },
+    {
+      "stage": "zStage",
+      "material": 10,
+      "vertexCount": 1717,
+      "triangleCount": 1986,
+      "posOffset": 2199920,
+      "nrmOffset": 2220524,
+      "idxOffset": 2241128,
+      "idxCount": 5958
+    },
+    {
+      "stage": "zStage",
+      "material": 11,
+      "vertexCount": 62,
+      "triangleCount": 120,
+      "posOffset": 2264960,
+      "nrmOffset": 2265704,
+      "idxOffset": 2266448,
+      "idxCount": 360
+    },
+    {
+      "stage": "zStage",
+      "material": 12,
+      "vertexCount": 127,
+      "triangleCount": 272,
+      "posOffset": 2267888,
+      "nrmOffset": 2269412,
+      "idxOffset": 2270936,
+      "idxCount": 816
+    },
+    {
+      "stage": "zStage",
+      "material": 13,
+      "vertexCount": 114,
+      "triangleCount": 232,
+      "posOffset": 2274200,
+      "nrmOffset": 2275568,
+      "idxOffset": 2276936,
+      "idxCount": 696
+    },
+    {
+      "stage": "zStage",
+      "material": 14,
+      "vertexCount": 182,
+      "triangleCount": 398,
+      "posOffset": 2279720,
+      "nrmOffset": 2281904,
+      "idxOffset": 2284088,
+      "idxCount": 1194
+    },
+    {
+      "stage": "zStage",
+      "material": 15,
+      "vertexCount": 352,
+      "triangleCount": 704,
+      "posOffset": 2288864,
+      "nrmOffset": 2293088,
+      "idxOffset": 2297312,
+      "idxCount": 2112
+    },
+    {
+      "stage": "zStage",
+      "material": 16,
+      "vertexCount": 70,
+      "triangleCount": 142,
+      "posOffset": 2305760,
+      "nrmOffset": 2306600,
+      "idxOffset": 2307440,
+      "idxCount": 426
+    }
+  ],
+  "stats": {
+    "raw_primitives": 8536,
+    "raw_triangles": 3739045,
+    "compiled_draw_calls": 53,
+    "compiled_vertices": 60128,
+    "compiled_triangles": 72172,
+    "bin_bytes": 2309144
+  }
+}

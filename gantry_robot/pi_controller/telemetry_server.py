@@ -7,6 +7,7 @@ Zero-Dependency Non-Blocking WebSocket (RFC 6455) & Static HTTP Telemetry Server
 
 import asyncio
 import base64
+import gzip
 import hashlib
 import json
 import logging
@@ -14,7 +15,7 @@ from pathlib import Path
 import struct
 import threading
 import time
-from typing import Any, Callable, Dict, Optional, Set
+from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 logger = logging.getLogger("gantry.telemetry")
 
@@ -66,6 +67,7 @@ class TelemetryServer:
             "vision_frame_b64": None,
         }
         self._dashboard_dir = Path(__file__).resolve().parent.parent / "pc_dashboard"
+        self._static_cache: Dict[Tuple[str, int, bool], Tuple[bytes, str, str]] = {}
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run_event_loop, daemon=True)
@@ -159,12 +161,27 @@ class TelemetryServer:
             return
 
         # Otherwise serve static HTTP files for pc_dashboard
-        await self._handle_http_request(path, writer)
+        await self._handle_http_request(path, writer, headers)
 
     async def _handle_http_request(
-        self, path: str, writer: asyncio.StreamWriter
+        self, path: str, writer: asyncio.StreamWriter, headers: Optional[Dict[str, str]] = None
     ) -> None:
         clean_path = path.split("?", 1)[0]
+        mime_map = {
+            ".html": "text/html; charset=utf-8",
+            ".css": "text/css; charset=utf-8",
+            ".js": "application/javascript; charset=utf-8",
+            ".json": "application/json; charset=utf-8",
+            ".bin": "application/octet-stream",
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".svg": "image/svg+xml",
+            ".3mf": "application/octet-stream",
+            ".stl": "application/octet-stream",
+            ".glb": "model/gltf-binary",
+        }
+        cache_header = "Cache-Control: no-cache\r\n"
+
         if clean_path in ("/", "/index.html"):
             target = self._dashboard_dir / "index.html"
             ctype = "text/html; charset=utf-8"
@@ -178,6 +195,17 @@ class TelemetryServer:
             fname = "favicon.png" if clean_path == "/favicon.ico" else clean_path.lstrip("/")
             target = self._dashboard_dir / fname
             ctype = "image/png"
+        elif clean_path.startswith("/assets/"):
+            base_dir = self._dashboard_dir.resolve()
+            candidate = (base_dir / clean_path.lstrip("/")).resolve()
+            if not candidate.is_relative_to(base_dir) or not candidate.is_file():
+                writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found")
+                await writer.drain()
+                writer.close()
+                return
+            target = candidate
+            ctype = mime_map.get(candidate.suffix.lower(), "application/octet-stream")
+            cache_header = "Cache-Control: public, max-age=3600\r\n"
         elif clean_path == "/api/state":
             body = json.dumps(self._latest_payload).encode("utf-8")
             resp = (
@@ -265,19 +293,35 @@ class TelemetryServer:
             return
 
         if target.exists():
-            body = target.read_bytes()
-            resp = (
-                "HTTP/1.1 200 OK\r\n"
-                f"Content-Type: {ctype}\r\n"
-                f"Content-Length: {len(body)}\r\n"
-                "Cache-Control: no-cache\r\n"
-                "Connection: close\r\n\r\n"
-            ).encode("ascii") + body
-            writer.write(resp)
+            accept_gzip = "gzip" in (headers or {}).get("accept-encoding", "").lower()
+            cache_key = (str(target), target.stat().st_mtime_ns, accept_gzip)
+            cached = self._static_cache.get(cache_key)
+            if cached is None:
+                body = target.read_bytes()
+                enc_header = ""
+                if accept_gzip and target.suffix.lower() in (".bin", ".js", ".json", ".css", ".html", ".svg", ".stl", ".glb"):
+                    body = gzip.compress(body, compresslevel=6)
+                    enc_header = "Content-Encoding: gzip\r\nVary: Accept-Encoding\r\n"
+                resp_hdr = (
+                    "HTTP/1.1 200 OK\r\n"
+                    f"Content-Type: {ctype}\r\n"
+                    f"Content-Length: {len(body)}\r\n"
+                    f"{enc_header}"
+                    f"{cache_header}"
+                    "Connection: close\r\n\r\n"
+                ).encode("ascii")
+                cached = (resp_hdr + body, ctype, enc_header)
+                self._static_cache[cache_key] = cached
+
+            resp_bytes = cached[0]
+            chunk_size = 65536
+            for off in range(0, len(resp_bytes), chunk_size):
+                writer.write(resp_bytes[off : off + chunk_size])
+                await writer.drain()
         else:
             writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found")
+            await writer.drain()
 
-        await writer.drain()
         writer.close()
 
     async def _handle_websocket_client(
