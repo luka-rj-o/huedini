@@ -2,7 +2,7 @@
   "source": "V3 Gantry.glb",
   "cad_motor_x_mm": 13.7,
   "cad_motor_y_mm": 55.1,
-  "cad_motor_z_mm": 0.0,
+  "cad_motor_z_mm": 4.9,
   "ee_pivot_three": [
     -96.6,
     106.5,

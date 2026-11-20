@@ -116,17 +116,25 @@ class GantryConfig:
     feedrate_travel_mm_s: float = 75.0   # Firmware caps X at 60.0 mm/s, Y at 80.0 mm/s
     feedrate_z_mm_s: float = 35.0
     feedrate_fine_mm_s: float = 40.0
-    feedrate_press_mm_s: float = 8.0     # Controlled downward press (<0.7 mm per HX711 sample)
-    feedrate_pick_guard_mm_s: float = 12.0  # Guarded downward PRESS approach above cube top face
+    feedrate_press_mm_s: float = 8.0     # Controlled downward press (<0.8 mm per HX711 sample)
+    feedrate_pick_guard_mm_s: float = 26.0  # Continuous guarded PICK descent speed (no mid-air stop)
+    feedrate_drop_guard_mm_s: float = 28.0  # Continuous guarded DROP descent speed (no mid-air stop)
     press_approach_offset_mm: float = 0.5  # Fast Z descend stops slightly above surface before PRESS
-    pick_guard_offset_mm: float = 23.0     # Start HX711 force-guarded descent 3.0 mm above 20 mm cube top
+    pick_guard_offset_mm: float = 80.0     # Start HX711 force-guarded PRESS directly from current Z hover
+    drop_guard_offset_mm: float = 80.0     # Start HX711 force-guarded PRESS directly from pre-drop Z hover
+    fine_align_max_radius_mm: float = 18.0  # Max association radius for Phase 5A fine alignment (blocks hijacking)
     pick_press_max_mm: float = 3.0       # Max downward press past nominal pick surface
     drop_press_max_mm: float = 4.0       # Max downward press past nominal drop surface (~2 mm deeper pushdown)
-    press_force_g: float = 65.0          # Upward load-cell delta target during open-jaw PICK press
+    press_force_g: float = 55.0          # Upward load-cell delta target during open-jaw PICK press
+    pick_guard_force_g: float = 35.0     # Early-collision threshold during PICK guarded approach
+    drop_guard_force_g: float = 40.0     # Early-collision threshold (above held mass) during DROP guarded approach
     drop_press_force_g: float = 200.0    # Upward load-cell delta target beyond cube weight before releasing on DROP
-    early_force_z_margin_mm: float = 0.35  # Force trigger above (pick_z_down - margin) flags cube misalignment
-    max_pick_misalign_retries: int = 3   # Consecutive early force-spike retries before aborting
+    early_force_z_margin_mm: float = 3.5  # Force trigger above (target_z_down - margin) flags collision/misalignment
+    max_pick_misalign_retries: int = 3   # Consecutive early force-spike retries on PICK (3 retries = 4 total attempts)
+    max_drop_collision_retries: int = 3  # Consecutive early force-spike retries on DROP (3 retries = 4 total attempts)
     scan_settle_s: float = 0.35
+    tare_settle_s: float = 0.40          # Mechanical + servo settling before HX711 TARE
+    weigh_settle_s: float = 0.20         # Post-lift cantilever settling before HX711 WEIGH
     servo_safe_y_mm: float = 10.0
 
     # --- Eye-in-Hand Camera & Offset Parameters ---
@@ -178,16 +186,16 @@ class GantryConfig:
     calibration_step_y_mm: float = 0.0
 
     # --- Global Scan Grid Coordinates (in motor travel coordinates within 227 x 128 mm envelope) ---
-    # 6-point (3x2) overlapping grid shifted forward to Y=10.0 and Y=70.0 mm after moving camera 15 mm back in Y:
-    # With Cam Y origin ~33.1..45.8 mm, Y=10 covers the back edge cleanly (and clears servo_safe_y_mm=10), Y=70 covers the front edge.
+    # Column-serpentine 6-point (3x2) grid finishes at (196.0, 70.0) right over the laydown zones so
+    # shortest-path planning spans outward immediately without deadhead return from home.
     scan_grid_points_mm: List[Tuple[float, float]] = field(
         default_factory=lambda: [
+            (20.0, 10.0),
             (20.0, 70.0),
             (108.0, 70.0),
-            (196.0, 70.0),
-            (196.0, 10.0),
             (108.0, 10.0),
-            (20.0, 10.0),
+            (196.0, 10.0),
+            (196.0, 70.0),
         ]
     )
 

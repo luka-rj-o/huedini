@@ -180,7 +180,7 @@ class TelemetryServer:
             ".stl": "application/octet-stream",
             ".glb": "model/gltf-binary",
         }
-        cache_header = "Cache-Control: no-cache\r\n"
+        cache_header = "Cache-Control: no-store, no-cache, must-revalidate\r\nPragma: no-cache\r\n"
 
         if clean_path in ("/", "/index.html"):
             target = self._dashboard_dir / "index.html"

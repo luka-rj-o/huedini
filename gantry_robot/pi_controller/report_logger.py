@@ -47,6 +47,7 @@ class CalibrationRecord:
     cam_origin_y_mm: float = 33.1
     offset_x_mm: float = -1.5
     offset_y_mm: float = -41.6
+    plate_transform: Optional[Dict[str, float]] = None
 
 
 @dataclass
@@ -91,6 +92,8 @@ class PickActionRecord:
     drop_plate_y: float = 0.0
     drop_z_down_mm: float = 0.0
     stack_zone: str = ""
+    pick_retries: int = 0
+    drop_retries: int = 0
     status: str = "PENDING"  # PENDING, SUCCESS, FAILED
     error: Optional[str] = None
 
@@ -118,7 +121,7 @@ class RunReportRecorder:
         except Exception as exc:
             logger.warning("Could not create reports directory %s: %exc", self.reports_dir, exc)
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._current_report: Optional[Dict[str, Any]] = None
         self._history_cache: List[Dict[str, Any]] = []
         self._reload_history()
@@ -192,6 +195,7 @@ class RunReportRecorder:
         residual_rms_mm: Optional[float] = None,
         residual_max_mm: Optional[float] = None,
         corner_residuals_mm: Optional[Dict[int, float]] = None,
+        plate_transform: Optional[Dict[str, float]] = None,
     ) -> None:
         with self._lock:
             if not self._current_report:
@@ -225,6 +229,7 @@ class RunReportRecorder:
                 cam_origin_y_mm=round(cam_origin_y, 2),
                 offset_x_mm=round(offset_x, 2),
                 offset_y_mm=round(offset_y, 2),
+                plate_transform=dict(plate_transform) if plate_transform else None,
             )
             self._current_report["calibration"] = asdict(rec)
 
@@ -413,10 +418,12 @@ class RunReportRecorder:
             return None
 
     def get_latest_report(self) -> Optional[Dict[str, Any]]:
+        latest_id: Optional[str] = None
         with self._lock:
             if self._current_report:
                 return dict(self._current_report)
             if self._history_cache:
                 latest_id = self._history_cache[0]["run_id"]
-                return self.get_report(latest_id)
-            return None
+        if latest_id:
+            return self.get_report(latest_id)
+        return None

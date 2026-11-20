@@ -483,23 +483,53 @@ function getCamHomedOrigin() {
   return { x: ox, y: oy, calibrated: !!cal.origin_calibrated };
 }
 
-function motorCamToPlate(cx_m, cy_m) {
-  const pt = latestState.calibration?.plate_transform;
+function getEeOffset() {
+  const cal = latestState.calibration || {};
+  return {
+    x: cal.offset_x_mm !== undefined && cal.offset_x_mm !== null ? Number(cal.offset_x_mm) : EE_OFFSET_X,
+    y: cal.offset_y_mm !== undefined && cal.offset_y_mm !== null ? Number(cal.offset_y_mm) : EE_OFFSET_Y,
+  };
+}
+
+function motorCamToPlate(cx_m, cy_m, calOverride = null) {
+  const cal = calOverride || latestState.calibration || {};
+  const pt = cal.plate_transform;
   if (pt && pt.a00 !== undefined) {
     return {
       x: pt.a00 * cx_m + pt.a01 * cy_m + pt.tx,
       y: pt.a10 * cx_m + pt.a11 * cy_m + pt.ty,
     };
   }
-  const o = getCamHomedOrigin();
-  return { x: o.x + cx_m, y: o.y + cy_m };
+  const ox = cal.cam_origin_x_mm !== undefined && cal.cam_origin_x_mm !== null ? Number(cal.cam_origin_x_mm) : CAM_HOMED_X;
+  const oy = cal.cam_origin_y_mm !== undefined && cal.cam_origin_y_mm !== null ? Number(cal.cam_origin_y_mm) : CAM_HOMED_Y;
+  return { x: ox + cx_m, y: oy + cy_m };
+}
+
+function plateToCamMotorWithCal(px, py, calOverride = null) {
+  const cal = calOverride || latestState.calibration || {};
+  const pt = cal.plate_transform;
+  if (pt && pt.a00 !== undefined) {
+    const det = pt.a00 * pt.a11 - pt.a01 * pt.a10;
+    if (Math.abs(det) > 1e-8) {
+      const dx = px - pt.tx;
+      const dy = py - pt.ty;
+      return {
+        x: (pt.a11 * dx - pt.a01 * dy) / det,
+        y: (-pt.a10 * dx + pt.a00 * dy) / det,
+      };
+    }
+  }
+  const ox = cal.cam_origin_x_mm !== undefined && cal.cam_origin_x_mm !== null ? Number(cal.cam_origin_x_mm) : CAM_HOMED_X;
+  const oy = cal.cam_origin_y_mm !== undefined && cal.cam_origin_y_mm !== null ? Number(cal.cam_origin_y_mm) : CAM_HOMED_Y;
+  return { x: px - ox, y: py - oy };
 }
 
 function updateReadoutsFromMotor() {
   const o = getCamHomedOrigin();
+  const off = getEeOffset();
   const camP = motorCamToPlate(motorX, motorY);
-  const eeP = motorCamToPlate(motorX + EE_OFFSET_X, motorY + EE_OFFSET_Y);
-  const eeH = motorCamToPlate(EE_OFFSET_X, EE_OFFSET_Y);
+  const eeP = motorCamToPlate(motorX + off.x, motorY + off.y);
+  const eeH = motorCamToPlate(off.x, off.y);
 
   setText("camPlateReadout", fmt3(camP.x, camP.y, CAM_HOMED_Z - motorZDown));
   setText("eePlateReadout", fmt3(eeP.x, eeP.y, EE_HOMED_Z - motorZDown));
@@ -614,6 +644,7 @@ function updateUI(data, prevState) {
   const rmsStr = cal.residual_rms_mm != null ? `${Number(cal.residual_rms_mm).toFixed(3)} mm` : "— mm";
   setText("calPlateFitReadout", `${plateYaw >= 0 ? "+" : ""}${plateYaw.toFixed(2)}° · ${rmsStr}`);
   if (data.steps_per_mm) setSpmTag(data.steps_per_mm.x, data.steps_per_mm.y);
+  if (typeof update3DReachBounds === "function") update3DReachBounds();
 
   if (data.live_cv_enabled !== undefined) {
     liveCvEnabled = !!data.live_cv_enabled;
@@ -815,6 +846,11 @@ let eeStageGroup = null;
 // Sub-parts for animation & inspection
 let fovConeGroup = null;
 let reachBoundsGroup = null;
+let eeReachBox3d = null;
+let camReachBox3d = null;
+let lastCalSig3d = "";
+let eePlumbLine3d = null;
+let eeFloorReticle3d = null;
 let trailLine = null;
 let trailPoints = [];
 let blockMeshPool = new Map();
@@ -827,6 +863,7 @@ let compiledCadActive = false;
 let compiledCadMeta = {
   cad_motor_x_mm: 13.7,
   cad_motor_y_mm: 55.1,
+  cad_motor_z_mm: 4.9,
   ee_pivot_three: [-96.6, 106.5, -1.5],
   cam_local_three: [-95.63, 120.86, -40.73],
 };
@@ -838,6 +875,46 @@ const stageGroupsMap = {};
 // Plate (X, Y, Z) -> Three.js World (X, Y_up, Z_back)
 function plateToThree(px, py, pz) {
   return new THREE.Vector3(px - 142.0, pz, -(py - 60.0));
+}
+
+function buildCalibratedBoxGeometry(zLow, zHigh, offX, offY) {
+  const c00 = motorCamToPlate(offX, offY);
+  const c10 = motorCamToPlate(offX + STROKE_X, offY);
+  const c11 = motorCamToPlate(offX + STROKE_X, offY + STROKE_Y);
+  const c01 = motorCamToPlate(offX, offY + STROKE_Y);
+  const b = [
+    plateToThree(c00.x, c00.y, zLow),
+    plateToThree(c10.x, c10.y, zLow),
+    plateToThree(c11.x, c11.y, zLow),
+    plateToThree(c01.x, c01.y, zLow),
+  ];
+  const t = [
+    plateToThree(c00.x, c00.y, zHigh),
+    plateToThree(c10.x, c10.y, zHigh),
+    plateToThree(c11.x, c11.y, zHigh),
+    plateToThree(c01.x, c01.y, zHigh),
+  ];
+  const pts = [
+    b[0], b[1], b[1], b[2], b[2], b[3], b[3], b[0],
+    t[0], t[1], t[1], t[2], t[2], t[3], t[3], t[0],
+    b[0], t[0], b[1], t[1], b[2], t[2], b[3], t[3],
+  ];
+  return new THREE.BufferGeometry().setFromPoints(pts);
+}
+
+function update3DReachBounds() {
+  if (!eeReachBox3d || !camReachBox3d) return;
+  const cal = latestState.calibration || {};
+  const off = getEeOffset();
+  const sig = JSON.stringify([cal.cam_origin_x_mm, cal.cam_origin_y_mm, cal.plate_transform, off.x, off.y]);
+  if (sig === lastCalSig3d) return;
+  lastCalSig3d = sig;
+
+  if (eeReachBox3d.geometry) eeReachBox3d.geometry.dispose();
+  eeReachBox3d.geometry = buildCalibratedBoxGeometry(COURSE_FLOOR_Z, COURSE_FLOOR_Z + STROKE_Z_BOTTOM, off.x, off.y);
+
+  if (camReachBox3d.geometry) camReachBox3d.geometry.dispose();
+  camReachBox3d.geometry = buildCalibratedBoxGeometry(COURSE_FLOOR_Z, COURSE_FLOOR_Z + 2.0, 0.0, 0.0);
 }
 
 function createBlockTopTexture(id, colorName) {
@@ -922,18 +999,48 @@ function init3DScene() {
   scene3d.add(worldGroup);
   stageGroupsMap.world = worldGroup;
 
-  // Reach Envelopes (EE + Cam 3D wireframes)
+  // Reach Envelopes (EE + Cam 3D wireframes dynamically matched to calibrated plate transform)
   reachBoundsGroup = new THREE.Group();
-  const eeReachGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(STROKE_X, STROKE_Z_BOTTOM, STROKE_Y));
-  const eeReachBox = new THREE.LineSegments(eeReachGeo, new THREE.LineBasicMaterial({ color: "#3ccf91", transparent: true, opacity: 0.35 }));
-  eeReachBox.position.copy(plateToThree(EE_HOMED_X + STROKE_X / 2, EE_HOMED_Y + STROKE_Y / 2, COURSE_FLOOR_Z + STROKE_Z_BOTTOM / 2));
-  reachBoundsGroup.add(eeReachBox);
+  const off0 = getEeOffset();
+  eeReachBox3d = new THREE.LineSegments(
+    buildCalibratedBoxGeometry(COURSE_FLOOR_Z, COURSE_FLOOR_Z + STROKE_Z_BOTTOM, off0.x, off0.y),
+    new THREE.LineBasicMaterial({ color: "#3ccf91", transparent: true, opacity: 0.35 })
+  );
+  reachBoundsGroup.add(eeReachBox3d);
 
-  const camReachGeo = new THREE.EdgesGeometry(new THREE.BoxGeometry(STROKE_X, 2, STROKE_Y));
-  const camReachBox = new THREE.LineSegments(camReachGeo, new THREE.LineBasicMaterial({ color: "#4f9cf9", transparent: true, opacity: 0.35 }));
-  camReachBox.position.copy(plateToThree(CAM_HOMED_X + STROKE_X / 2, CAM_HOMED_Y + STROKE_Y / 2, COURSE_FLOOR_Z + 1));
-  reachBoundsGroup.add(camReachBox);
+  camReachBox3d = new THREE.LineSegments(
+    buildCalibratedBoxGeometry(COURSE_FLOOR_Z, COURSE_FLOOR_Z + 2.0, 0.0, 0.0),
+    new THREE.LineBasicMaterial({ color: "#4f9cf9", transparent: true, opacity: 0.35 })
+  );
+  reachBoundsGroup.add(camReachBox3d);
   worldGroup.add(reachBoundsGroup);
+
+  // EE Floor Alignment Reticle + Vertical Plumb Line (eliminates Iso perspective height parallax)
+  eeFloorReticle3d = new THREE.Group();
+  const retHalf = BLOCK_SIZE / 2.0;
+  const retPts = [
+    new THREE.Vector3(-retHalf, 0, -retHalf), new THREE.Vector3(retHalf, 0, -retHalf),
+    new THREE.Vector3(retHalf, 0, -retHalf), new THREE.Vector3(retHalf, 0, retHalf),
+    new THREE.Vector3(retHalf, 0, retHalf), new THREE.Vector3(-retHalf, 0, retHalf),
+    new THREE.Vector3(-retHalf, 0, retHalf), new THREE.Vector3(-retHalf, 0, -retHalf),
+    new THREE.Vector3(-4, 0, 0), new THREE.Vector3(4, 0, 0),
+    new THREE.Vector3(0, 0, -4), new THREE.Vector3(0, 0, 4),
+  ];
+  eeFloorReticle3d.add(
+    new THREE.LineSegments(
+      new THREE.BufferGeometry().setFromPoints(retPts),
+      new THREE.LineBasicMaterial({ color: "#3ccf91", transparent: true, opacity: 0.85 })
+    )
+  );
+  worldGroup.add(eeFloorReticle3d);
+
+  const plumbGeo = new THREE.BufferGeometry();
+  plumbGeo.setAttribute("position", new THREE.Float32BufferAttribute([0, COURSE_FLOOR_Z + 0.35, 0, 0, 76.71, 0], 3));
+  eePlumbLine3d = new THREE.Line(
+    plumbGeo,
+    new THREE.LineBasicMaterial({ color: "#3ccf91", transparent: true, opacity: 0.65 })
+  );
+  worldGroup.add(eePlumbLine3d);
 
   // Toolpath 3D trail line
   const trailGeo = new THREE.BufferGeometry();
@@ -944,7 +1051,7 @@ function init3DScene() {
   //  STAGES 1-4: X-SLIDER/Z-TOWER -> Z-SADDLE/Y-BOOM -> Y-CARRIAGE -> EE_V6
   // ==========================================================================
   const piv = compiledCadMeta.ee_pivot_three || [-96.6, 106.5, -1.5];
-  const eeP0 = motorCamToPlate(EE_OFFSET_X, EE_OFFSET_Y);
+  const eeP0 = motorCamToPlate(off0.x, off0.y);
 
   xStageGroup = new THREE.Group();
   xStageGroup.position.set((eeP0.x - 142.0) - piv[0], 0, 0);
@@ -952,6 +1059,7 @@ function init3DScene() {
   stageGroupsMap.xStage = xStageGroup;
 
   zStageGroup = new THREE.Group();
+  zStageGroup.position.set(0, compiledCadMeta.cad_motor_z_mm ?? 4.9, 0);
   xStageGroup.add(zStageGroup);
   stageGroupsMap.zStage = zStageGroup;
 
@@ -997,11 +1105,12 @@ function applyCadModeTransforms() {
   if (!yStageGroup || !eeStageGroup || !eyeCam || !fovConeGroup) return;
   for (const g of Object.values(compiledStageGroups)) g.visible = compiledCadActive;
   const camPos = compiledCadMeta.cam_local_three || [-95.63, 120.86, -40.73];
+  const cadZ = compiledCadMeta.cad_motor_z_mm ?? 4.9;
   eyeCam.position.set(camPos[0], camPos[1] - 0.5, camPos[2]);
   eyeCam.up.set(0, 0, -1);
   eyeCam.lookAt(camPos[0], 0, camPos[2]);
   fovConeGroup.position.set(camPos[0], camPos[1], camPos[2]);
-  rebuildFovCone(camPos[1] - drawZ);
+  rebuildFovCone(camPos[1] + cadZ - drawZ);
   const piv = compiledCadMeta.ee_pivot_three || [-96.6, 106.5, -1.5];
   eeStageGroup.position.set(piv[0], piv[1], piv[2]);
 }
@@ -1009,8 +1118,8 @@ function applyCadModeTransforms() {
 async function loadCompiledGantryCad() {
   try {
     const [metaRes, binRes] = await Promise.all([
-      fetch("assets/v3_gantry_compiled.json?v=4"),
-      fetch("assets/v3_gantry_compiled.bin?v=4"),
+      fetch("assets/v3_gantry_compiled.json?v=5"),
+      fetch("assets/v3_gantry_compiled.bin?v=5"),
     ]);
     if (!metaRes.ok || !binRes.ok) throw new Error("Compiled CAD not found");
     const manifest = await metaRes.json();
@@ -1160,7 +1269,7 @@ function sync3DBlocks(data) {
       if (mesh.parent !== eeStageGroup) {
         eeStageGroup.add(mesh);
       }
-      mesh.position.set(0, -19.8, 0);
+      mesh.position.set(0, -24.69, 0);
       mesh.rotation.set(0, 0, 0);
     } else {
       if (mesh.parent !== worldGroup) {
@@ -1260,7 +1369,8 @@ function clearTrail() {
 
 function updateTrail() {
   if (!trailLine || !layers.trail) return;
-  const eeP = motorCamToPlate(drawX + EE_OFFSET_X, drawY + EE_OFFSET_Y);
+  const off = getEeOffset();
+  const eeP = motorCamToPlate(drawX + off.x, drawY + off.y);
   const eeZ = EE_HOMED_Z - drawZ;
   const p = plateToThree(eeP.x, eeP.y, eeZ);
   const last = trailPoints[trailPoints.length - 1];
@@ -1679,11 +1789,12 @@ function drawXYView() {
   }
 
   // Reach envelopes
+  const off = getEeOffset();
   const eeCorners = [
-    motorCamToPlate(EE_OFFSET_X, EE_OFFSET_Y),
-    motorCamToPlate(EE_OFFSET_X + STROKE_X, EE_OFFSET_Y),
-    motorCamToPlate(EE_OFFSET_X + STROKE_X, EE_OFFSET_Y + STROKE_Y),
-    motorCamToPlate(EE_OFFSET_X, EE_OFFSET_Y + STROKE_Y),
+    motorCamToPlate(off.x, off.y),
+    motorCamToPlate(off.x + STROKE_X, off.y),
+    motorCamToPlate(off.x + STROKE_X, off.y + STROKE_Y),
+    motorCamToPlate(off.x, off.y + STROKE_Y),
   ].map((p) => mmToCanvas(p.x, p.y));
   ctx.beginPath();
   eeCorners.forEach((c, i) => (i ? ctx.lineTo(c.cx, c.cy) : ctx.moveTo(c.cx, c.cy)));
@@ -1786,9 +1897,10 @@ function drawXYView() {
   }
 
   // Gantry skeleton: carriage datum -> end-effector -> camera
+  const offG = getEeOffset();
   const homeDatum = mmToCanvas(DATUM_X, DATUM_Y);
   const datum = mmToCanvas(DATUM_X + mX, DATUM_Y + mY);
-  const eePlate = motorCamToPlate(mX + EE_OFFSET_X, mY + EE_OFFSET_Y);
+  const eePlate = motorCamToPlate(mX + offG.x, mY + offG.y);
   const camPlate = motorCamToPlate(mX, mY);
   const ee = mmToCanvas(eePlate.x, eePlate.y);
   const cam = mmToCanvas(camPlate.x, camPlate.y);
@@ -2200,6 +2312,7 @@ function startReportReplay(report) {
     });
   }
 
+  const repStackCounts = {};
   for (const p of (report.pick_actions || [])) {
     const blk = simBlocks.find((b) => b.id === p.block_id);
     if (blk && p.refined_plate_x != null && p.refined_plate_y != null) {
@@ -2223,7 +2336,7 @@ function startReportReplay(report) {
       world_blocks: cloneBlocks(simBlocks),
       blocks: cloneBlocks(simBlocks),
       held_block_id: p.block_id,
-      current_mass_g: 65.0,
+      current_mass_g: 55.0,
       mass_class: null,
     });
     if (blk) {
@@ -2241,8 +2354,11 @@ function startReportReplay(report) {
       current_mass_g: p.measured_mass_g,
       mass_class: p.mass_class,
     });
-    const dropMx = clamp(p.drop_plate_x - (repOx + EE_OFFSET_X), 0, STROKE_X);
-    const dropMy = clamp(p.drop_plate_y - (repOy + EE_OFFSET_Y), 0, STROKE_Y);
+    const repOffX = repCal.offset_x_mm ?? EE_OFFSET_X;
+    const repOffY = repCal.offset_y_mm ?? EE_OFFSET_Y;
+    const camDrop = plateToCamMotorWithCal(p.drop_plate_x, p.drop_plate_y, repCal);
+    const dropMx = clamp(camDrop.x - repOffX, 0, STROKE_X);
+    const dropMy = clamp(camDrop.y - repOffY, 0, STROKE_Y);
     frames.push({
       state: "STACKING",
       calibration: repCal,
@@ -2256,9 +2372,21 @@ function startReportReplay(report) {
     if (blk) {
       blk.x_mm = p.drop_plate_x;
       blk.y_mm = p.drop_plate_y;
-      blk.z_mm = p.mass_class === "aluminum" ? DROPOFF_Z_UP : COURSE_FLOOR_Z;
+      const isStaged = p.status === "STAGED" || String(p.stack_zone || "").startsWith("STAGE");
+      if (isStaged) {
+        blk.z_mm = Math.abs(p.drop_plate_x - DROPOFF_X) <= ALUM_PLATFORM_SIZE / 2 && Math.abs(p.drop_plate_y - DROPOFF_Y) <= ALUM_PLATFORM_SIZE / 2
+          ? DROPOFF_Z_UP
+          : COURSE_FLOOR_Z;
+        blk.status = "QUEUED";
+      } else {
+        const zKey = p.mass_class === "aluminum" ? "aluminum" : (blk.color || "red");
+        const count = repStackCounts[zKey] || 0;
+        repStackCounts[zKey] = count + 1;
+        const baseZ = zKey === "aluminum" ? DROPOFF_Z_UP : COURSE_FLOOR_Z;
+        blk.z_mm = baseZ + count * BLOCK_SIZE;
+        blk.status = "STACKED";
+      }
       blk.angle_deg = 0;
-      blk.status = "STACKED";
     }
     frames.push({
       state: "STACKING",
@@ -2392,9 +2520,11 @@ function animate() {
   // Apply to 5-Stage 3D Kinematic Hierarchy (Compiled Onshape CAD aligned to calibrated plate coords)
   if (xStageGroup && zStageGroup && yStageGroup && eeStageGroup) {
     const piv = compiledCadMeta.ee_pivot_three || [-96.6, 106.5, -1.5];
-    const eeP = motorCamToPlate(drawX + EE_OFFSET_X, drawY + EE_OFFSET_Y);
+    const cadZ = compiledCadMeta.cad_motor_z_mm ?? 4.9;
+    const off = getEeOffset();
+    const eeP = motorCamToPlate(drawX + off.x, drawY + off.y);
     xStageGroup.position.set((eeP.x - 142.0) - piv[0], 0, 0);
-    zStageGroup.position.set(0, -drawZ, 0);
+    zStageGroup.position.set(0, cadZ - drawZ, 0);
     yStageGroup.position.set(0, 0, -(eeP.y - 60.0) - piv[2]);
     eeStageGroup.position.set(piv[0], piv[1], piv[2]);
     eeStageGroup.rotation.y = (drawAngle * Math.PI) / 180.0;
@@ -2403,9 +2533,21 @@ function animate() {
       compiledPlungerGroup.position.set(ret * 0.707, 0, -ret * 0.707);
     }
 
+    if (eeFloorReticle3d && eePlumbLine3d) {
+      const floorThree = plateToThree(eeP.x, eeP.y, COURSE_FLOOR_Z + 0.35);
+      const jawBottomY = piv[1] - 34.69 + cadZ - drawZ;
+      eeFloorReticle3d.position.copy(floorThree);
+      eeFloorReticle3d.rotation.y = (drawAngle * Math.PI) / 180.0;
+      const posAttr = eePlumbLine3d.geometry.getAttribute("position");
+      posAttr.setXYZ(0, floorThree.x, floorThree.y, floorThree.z);
+      posAttr.setXYZ(1, floorThree.x, Math.max(floorThree.y + 0.2, jawBottomY), floorThree.z);
+      posAttr.needsUpdate = true;
+      eePlumbLine3d.visible = jawBottomY > floorThree.y + 1.5;
+    }
+
     if (Math.abs(drawZ - prevDrawZ) > 0.15) {
       const camHomeY = compiledCadMeta?.cam_local_three?.[1] ?? 120.86;
-      rebuildFovCone(camHomeY - drawZ);
+      rebuildFovCone(camHomeY + cadZ - drawZ);
     }
 
     sync3DBlocks(latestState);

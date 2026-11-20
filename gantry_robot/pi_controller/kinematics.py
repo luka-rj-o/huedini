@@ -19,9 +19,10 @@ class BlockRecord:
     mass_class: str = "unknown"  # aluminum, high_infill, med_infill, low_infill
     status: str = "DETECTED"     # DETECTED, QUEUED, PICKING, WEIGHED, STACKED
     confidence_views: int = 1
+    z_mm: Optional[float] = None
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "id": self.id,
             "color": self.color,
             "x_mm": round(self.x_mm, 2),
@@ -31,6 +32,9 @@ class BlockRecord:
             "mass_class": self.mass_class,
             "status": self.status,
         }
+        if self.z_mm is not None:
+            data["z_mm"] = round(self.z_mm, 2)
+        return data
 
 
 class EyeInHandKinematics:
@@ -532,6 +536,27 @@ class EyeInHandKinematics:
             cam_my - self.offset_y_mm,
         )
 
+    def gripper_motor_to_plate(self, motor_x_mm: float, motor_y_mm: float) -> Tuple[float, float]:
+        """Inverse of plate_to_gripper_motor: returns current EE plate (X, Y) from motor (X, Y)."""
+        cam_mx = float(motor_x_mm) + self.offset_x_mm
+        cam_my = float(motor_y_mm) + self.offset_y_mm
+        if self._plate_A is not None and self._plate_t is not None:
+            px = (
+                float(self._plate_A[0, 0]) * cam_mx
+                + float(self._plate_A[0, 1]) * cam_my
+                + float(self._plate_t[0])
+            )
+            py = (
+                float(self._plate_A[1, 0]) * cam_mx
+                + float(self._plate_A[1, 1]) * cam_my
+                + float(self._plate_t[1])
+            )
+            return px, py
+        return (
+            self.cam_origin_x_mm + cam_mx,
+            self.cam_origin_y_mm + cam_my,
+        )
+
     def gripper_target_for_block(self, block_plate_x: float, block_plate_y: float) -> Tuple[float, float]:
         """Convenience alias for plate_to_gripper_motor."""
         return self.plate_to_gripper_motor(block_plate_x, block_plate_y)
@@ -611,6 +636,128 @@ class WorldCatalogAndPlanner:
         self.blocks.append(new_block)
         return new_block
 
+    # Exact Onshape V3 Gantry moving-stage CAD clearance parameters (mm)
+    _CAD_PRESS_OVERTRAVEL_MM: float = 3.5
+    _CAD_CLEARANCE_MARGIN_MM: float = 5.0
+
+    @staticmethod
+    def _surface_z_up_at(
+        x_mm: float,
+        y_mm: float,
+        stack_zones_mm: Optional[Dict[str, Tuple[float, float, float]]],
+        course_elevation_mm: float = 6.35,
+        aluminum_platform_size_mm: float = 76.2,
+    ) -> float:
+        """Returns resting surface Z_up (15.9 on raised aluminum pedestal, else 6.35)."""
+        if stack_zones_mm and "aluminum" in stack_zones_mm and aluminum_platform_size_mm > 0.0:
+            ax, ay, az = stack_zones_mm["aluminum"]
+            half = aluminum_platform_size_mm / 2.0
+            if abs(x_mm - ax) <= half and abs(y_mm - ay) <= half:
+                return az
+        return course_elevation_mm
+
+    @staticmethod
+    def _min_cad_z0_over_zone(
+        ee_x_mm: float,
+        ee_y_mm: float,
+        zone_x_mm: float,
+        zone_y_mm: float,
+    ) -> Optional[float]:
+        """
+        Returns the lowest CAD stage Z_up (at motor Z_down=0) overlapping the 24x24 mm
+        footprint around a zone stack (zone_x +/- 12, zone_y +/- 12), or None if disjoint.
+        Measured from v3_gantry_compiled.bin (cad_motor_z_mm = 4.9).
+        """
+        bx0, bx1 = zone_x_mm - 12.0, zone_x_mm + 12.0
+        by0, by1 = zone_y_mm - 12.0, zone_y_mm + 12.0
+        z0: Optional[float] = None
+
+        def _upd(val: float) -> None:
+            nonlocal z0
+            z0 = val if z0 is None or val < z0 else z0
+
+        # 1. zStage main Y-boom & linear rail over playable plate (plateY in [10.0, 146.0])
+        if min(ee_x_mm - 33.5, bx1) > max(ee_x_mm - 62.0, bx0) and min(146.0, by1) > max(10.0, by0):
+            _upd(118.9)
+        # 2. zStage front boom end-cap (plateY in [146.0, 171.5])
+        if min(ee_x_mm - 41.0, bx1) > max(ee_x_mm - 64.0, bx0) and min(171.5, by1) > max(146.0, by0):
+            _upd(114.9)
+        # 3. yStage boom clamp & low carriage plate (dY in [-18.0, +22.0])
+        if min(ee_x_mm - 10.0, bx1) > max(ee_x_mm - 57.0, bx0) and min(ee_y_mm + 22.0, by1) > max(ee_y_mm - 18.0, by0):
+            _upd(111.4)
+        # 4. yStage upper camera arm & guide (dY in [+22.0, +68.0])
+        if min(ee_x_mm + 13.0, bx1) > max(ee_x_mm - 24.0, bx0) and min(ee_y_mm + 68.0, by1) > max(ee_y_mm + 22.0, by0):
+            _upd(125.8)
+        # 5. eeStage radial body guard (prevents picking blocks tightly adjacent to existing stack)
+        if math.hypot(ee_x_mm - zone_x_mm, ee_y_mm - zone_y_mm) < 33.0:
+            _upd(92.7)
+
+        return z0
+
+    def max_safe_stack_count_for_pose(
+        self,
+        ee_x_mm: float,
+        ee_y_mm: float,
+        z_down_mm: float,
+        zone_x_mm: float,
+        zone_y_mm: float,
+        zone_z_up_mm: float,
+        clearance_margin_mm: float = _CAD_CLEARANCE_MARGIN_MM,
+    ) -> int:
+        """Maximum cube count allowed on `zone` without colliding with an action at (ee_x, ee_y, z_down)."""
+        z0 = self._min_cad_z0_over_zone(ee_x_mm, ee_y_mm, zone_x_mm, zone_y_mm)
+        if z0 is None:
+            return 99
+        avail_mm = z0 - (z_down_mm + self._CAD_PRESS_OVERTRAVEL_MM) - clearance_margin_mm - zone_z_up_mm
+        return max(0, int(math.floor(avail_mm / self.block_height_mm)))
+
+    def is_pose_boom_safe(
+        self,
+        ee_x_mm: float,
+        ee_y_mm: float,
+        z_down_mm: float,
+        stack_zones_mm: Dict[str, Tuple[float, float, float]],
+        stack_counts: Optional[Dict[str, int]] = None,
+        ignore_zone: Optional[str] = None,
+        clearance_margin_mm: float = _CAD_CLEARANCE_MARGIN_MM,
+    ) -> bool:
+        """Checks whether an EE action at (ee_x, ee_y, z_down) clears all existing zone stacks."""
+        counts = self.stack_counts if stack_counts is None else stack_counts
+        for zk, cnt in counts.items():
+            if cnt <= 0 or zk == ignore_zone or zk not in stack_zones_mm:
+                continue
+            zx, zy, zz = stack_zones_mm[zk]
+            max_cnt = self.max_safe_stack_count_for_pose(
+                ee_x_mm,
+                ee_y_mm,
+                z_down_mm,
+                zx,
+                zy,
+                zz,
+                clearance_margin_mm=clearance_margin_mm,
+            )
+            if cnt > max_cnt:
+                return False
+        return True
+
+    @staticmethod
+    def _predict_transit_z_down(
+        counts: Tuple[int, ...],
+        z_coords: List[Tuple[float, float, float]],
+        block_height_mm: float,
+        base_plate_z_down_mm: float,
+        z_hover_mm: float,
+    ) -> float:
+        max_top = 0.0
+        for zi, c in enumerate(counts):
+            if c > 0:
+                top = z_coords[zi][2] + c * block_height_mm
+                if top > max_top:
+                    max_top = top
+        if max_top <= 48.0:
+            return z_hover_mm
+        return max(4.0, min(z_hover_mm, base_plate_z_down_mm - (max_top + 6.0)))
+
     def compute_pick_sequence(
         self,
         current_x_mm: float,
@@ -619,68 +766,389 @@ class WorldCatalogAndPlanner:
         zone_clear_radius_mm: float = 38.0,
         priority_block_id: Optional[int] = None,
         deferred_block_ids: Optional[Set[int]] = None,
+        boom_x_min_offset_mm: float = -64.0,
+        boom_x_max_offset_mm: float = -33.0,
+        base_plate_z_down_mm: float = 76.71,
+        course_elevation_mm: float = 6.35,
+        aluminum_platform_size_mm: float = 76.2,
+        z_hover_mm: float = 25.0,
+        clearance_margin_mm: float = _CAD_CLEARANCE_MARGIN_MM,
+        beam_width: int = 24,
     ) -> List[BlockRecord]:
         """
-        Orders detected/queued blocks:
-        1) First clear any block sitting inside/on top of a laydown area so later
-           placements never stack onto an obstructing block (preferring a requested
-           priority blocker first, then blockers whose nominal color zone is free).
-        2) Then pick remaining blocks sequentially by nearest distance (respecting
-           neighbor clearance and pushing recently staged blocks after blockers).
+        Precomputes a collision-free, minimum-cost 3D (XY + Z) pick-and-stack sequence
+        using a lightweight 2.5D CAD twin beam search:
+        1) Evaluates exact Onshape moving-stage envelopes (zStage Y-boom/rail, yStage
+           clamp/arm/camera, eeStage radial guard) on every pick AND every drop layer.
+        2) Minimizes total tour cost (XY travel + weighted Z stroke) starting from the
+           gantry's current pose and spanning outward smoothly across all colors,
+           pulling zone blockers cleanly forward when they unlock destinations.
+        3) Prunes dead-end stack states where raising a left-side stack would block a
+           remaining pick or drop layer, falling back to minimum-staging transitions
+           only when no zero-staging sequence exists.
         """
+        del boom_x_min_offset_mm, boom_x_max_offset_mm  # Superseded by exact CAD envelope model
         candidates = [b for b in self.blocks if b.status in ("DETECTED", "QUEUED")]
         if not candidates:
             return []
 
         zones = stack_zones_mm or {}
         deferred = deferred_block_ids or set()
+        if not zones:
+            remaining = list(candidates)
+            ordered: List[BlockRecord] = []
+            cx, cy = current_x_mm, current_y_mm
+            while remaining:
+                remaining.sort(
+                    key=lambda b: (
+                        0 if (priority_block_id is not None and b.id == priority_block_id and not ordered) else 1,
+                        1 if b.id in deferred else 0,
+                        math.hypot(b.x_mm - cx, b.y_mm - cy),
+                        b.id,
+                    )
+                )
+                nxt = remaining.pop(0)
+                nxt.status = "QUEUED"
+                ordered.append(nxt)
+                cx, cy = nxt.x_mm, nxt.y_mm
+            return ordered
 
-        def obstructing_zone(target: BlockRecord) -> Optional[str]:
-            for zk, (zx, zy, _zz) in zones.items():
-                if math.hypot(target.x_mm - zx, target.y_mm - zy) <= zone_clear_radius_mm:
-                    return zk
-            return None
+        n = len(candidates)
+        zone_keys = tuple(zones.keys())
+        nz = len(zone_keys)
+        zk_idx = {k: i for i, k in enumerate(zone_keys)}
+        z_coords = [zones[k] for k in zone_keys]
+        init_counts = tuple(self.stack_counts.get(k, 0) for k in zone_keys)
+        max_layers = [init_counts[zi] + n for zi in range(nz)]
 
-        def min_neighbor_clearance(target: BlockRecord, pool: List[BlockRecord]) -> float:
-            dists = [
-                math.hypot(target.x_mm - other.x_mm, target.y_mm - other.y_mm)
-                for other in pool
-                if other.id != target.id
+        default_non_rgb = "aluminum" if "aluminum" in zk_idx else zone_keys[0]
+        b_xy = [(b.x_mm, b.y_mm) for b in candidates]
+        b_dest = [zk_idx[b.color if b.color in zk_idx else default_non_rgb] for b in candidates]
+        b_pz = [
+            max(
+                0.0,
+                base_plate_z_down_mm
+                - self._surface_z_up_at(
+                    x,
+                    y,
+                    zones,
+                    course_elevation_mm=course_elevation_mm,
+                    aluminum_platform_size_mm=aluminum_platform_size_mm,
+                ),
+            )
+            for x, y in b_xy
+        ]
+        b_drop_dist = [
+            math.hypot(z_coords[b_dest[i]][0] - b_xy[i][0], z_coords[b_dest[i]][1] - b_xy[i][1])
+            for i in range(n)
+        ]
+        b_laydown_dist = [
+            min(math.hypot(x - zx, y - zy) for zx, zy, _zz in z_coords)
+            for x, y in b_xy
+        ]
+
+        # Obstruction bitmasks & close-neighbor bitmasks
+        obs_mask = [0] * nz
+        is_any_blocker = [False] * n
+        for i, (x, y) in enumerate(b_xy):
+            for zi, (zx, zy, _zz) in enumerate(z_coords):
+                if math.hypot(x - zx, y - zy) <= zone_clear_radius_mm:
+                    obs_mask[zi] |= 1 << i
+                    is_any_blocker[i] = True
+
+        close_nb = [0] * n
+        for i in range(n):
+            for j in range(i + 1, n):
+                if math.hypot(b_xy[i][0] - b_xy[j][0], b_xy[i][1] - b_xy[j][1]) < 34.0:
+                    close_nb[i] |= 1 << j
+                    close_nb[j] |= 1 << i
+
+        # Precompute integer CAD safety tables
+        pick_max = [
+            tuple(
+                self.max_safe_stack_count_for_pose(
+                    b_xy[i][0],
+                    b_xy[i][1],
+                    b_pz[i],
+                    z_coords[zi][0],
+                    z_coords[zi][1],
+                    z_coords[zi][2],
+                    clearance_margin_mm=clearance_margin_mm,
+                )
+                for zi in range(nz)
+            )
+            for i in range(n)
+        ]
+        drop_z_table = [
+            [
+                max(0.0, (base_plate_z_down_mm - z_coords[zi][2]) - layer * self.block_height_mm)
+                for layer in range(max_layers[zi] + 1)
             ]
-            return min(dists) if dists else 999.0
+            for zi in range(nz)
+        ]
+        drop_max = [
+            [
+                tuple(
+                    99
+                    if ozi == zi
+                    else self.max_safe_stack_count_for_pose(
+                        z_coords[zi][0],
+                        z_coords[zi][1],
+                        drop_z_table[zi][layer],
+                        z_coords[ozi][0],
+                        z_coords[ozi][1],
+                        z_coords[ozi][2],
+                        clearance_margin_mm=clearance_margin_mm,
+                    )
+                    for ozi in range(nz)
+                )
+                for layer in range(max_layers[zi] + 1)
+            ]
+            for zi in range(nz)
+        ]
+
+        is_boom_shadowed = [any(pick_max[i][zi] < 3 for zi in range(nz)) for i in range(n)]
+
+        # Hard step-0 enforcement for priority_block_id / deferred_block_ids so a
+        # just-staged block never re-triggers immediately before clearing blockers.
+        safe_step0 = [
+            i for i in range(n) if all(init_counts[zi] <= pick_max[i][zi] for zi in range(nz))
+        ]
+        step0_allowed: Optional[Set[int]] = None
+        if priority_block_id is not None:
+            prio_matches = [i for i in safe_step0 if candidates[i].id == priority_block_id]
+            if prio_matches:
+                step0_allowed = set(prio_matches)
+        if step0_allowed is None and deferred:
+            non_def = [i for i in safe_step0 if candidates[i].id not in deferred]
+            if non_def:
+                step0_allowed = set(non_def)
+
+        full_mask = (1 << n) - 1
+        # State tuple: (cost, last_x, last_y, counts_tuple, rem_mask, path_tuple)
+        beam = [(0.0, float(current_x_mm), float(current_y_mm), init_counts, full_mask, ())]
+
+        for step in range(n):
+            next_states: Dict[Tuple[int, int, Tuple[int, ...]], Tuple[float, float, float, Tuple[int, ...], int, Tuple[int, ...]]] = {}
+            outward_mult = 0.06 * (n - step)
+            for cost, cx, cy, counts, rem_mask, path in beam:
+                tz = self._predict_transit_z_down(
+                    counts, z_coords, self.block_height_mm, base_plate_z_down_mm, z_hover_mm
+                )
+                for i in range(n):
+                    if step == 0 and step0_allowed is not None and i not in step0_allowed:
+                        continue
+                    bit = 1 << i
+                    if not (rem_mask & bit):
+                        continue
+
+                    pick_safe = True
+                    for zi in range(nz):
+                        if counts[zi] > pick_max[i][zi]:
+                            pick_safe = False
+                            break
+                    if not pick_safe:
+                        continue
+
+                    di = b_dest[i]
+                    other_rem = rem_mask ^ bit
+                    dest_blocked = bool(obs_mask[di] & other_rem)
+
+                    can_stack_now = not dest_blocked
+                    layer = counts[di]
+                    if can_stack_now:
+                        dm = drop_max[di][layer]
+                        for zi in range(nz):
+                            if counts[zi] > dm[zi]:
+                                can_stack_now = False
+                                break
+                    if can_stack_now:
+                        nc = list(counts)
+                        new_c = layer + 1
+                        nc[di] = new_c
+                        candidate_counts = tuple(nc)
+                        needed_zones = 0
+                        for j in range(n):
+                            if other_rem & (1 << j):
+                                if new_c > pick_max[j][di]:
+                                    can_stack_now = False
+                                    break
+                                needed_zones |= 1 << b_dest[j]
+                        if can_stack_now:
+                            for zi in range(nz):
+                                if (needed_zones & (1 << zi)) and zi != di:
+                                    if new_c > drop_max[zi][candidate_counts[zi]][di]:
+                                        can_stack_now = False
+                                        break
+                    else:
+                        candidate_counts = counts
+
+                    if can_stack_now:
+                        next_counts = candidate_counts
+                        drop_z = drop_z_table[di][layer]
+                        end_x, end_y = z_coords[di][0], z_coords[di][1]
+                        step_pen = 0.0
+                        dedup_zi = di
+                    else:
+                        # Staging fallback: useful stage (blocker or boom-shadowed) vs futile no-op stage
+                        next_counts = counts
+                        drop_z = b_pz[i]
+                        end_x, end_y = b_xy[i]
+                        step_pen = 5000.0 if (is_any_blocker[i] or is_boom_shadowed[i]) else 50000.0
+                        dedup_zi = -1
+
+                    next_tz = self._predict_transit_z_down(
+                        next_counts, z_coords, self.block_height_mm, base_plate_z_down_mm, z_hover_mm
+                    )
+                    d_xy = math.hypot(b_xy[i][0] - cx, b_xy[i][1] - cy) + math.hypot(
+                        end_x - b_xy[i][0], end_y - b_xy[i][1]
+                    )
+                    d_z = 2.0 * abs(b_pz[i] - tz) + abs(drop_z - tz) + abs(drop_z - next_tz)
+                    nb_count = bin(close_nb[i] & other_rem).count("1")
+                    nb_pen = 22.0 * nb_count
+                    blk_bonus = -18.0 if is_any_blocker[i] else 0.0
+                    out_pen = outward_mult * b_laydown_dist[i]
+                    prio_bonus = (
+                        -3000.0
+                        if (step == 0 and priority_block_id is not None and candidates[i].id == priority_block_id)
+                        else 0.0
+                    )
+                    def_pen = 800.0 / (step + 1) if candidates[i].id in deferred else 0.0
+
+                    new_cost = (
+                        cost
+                        + d_xy
+                        + 1.8 * d_z
+                        + step_pen
+                        + nb_pen
+                        + blk_bonus
+                        + out_pen
+                        + prio_bonus
+                        + def_pen
+                    )
+                    key = (other_rem, dedup_zi, next_counts)
+                    prev = next_states.get(key)
+                    if prev is None or new_cost < prev[0]:
+                        next_states[key] = (
+                            new_cost,
+                            end_x,
+                            end_y,
+                            next_counts,
+                            other_rem,
+                            path + (i,),
+                        )
+
+            if not next_states:
+                break
+            beam = sorted(next_states.values(), key=lambda s: s[0])[:beam_width]
+
+        chosen_indices: List[int] = []
+        if beam:
+            best = min(beam, key=lambda s: s[0] + math.hypot(51.7 - s[1], 36.4 - s[2]))
+            chosen_indices = list(best[5])
 
         ordered: List[BlockRecord] = []
-        remaining = list(candidates)
-        cx, cy = current_x_mm, current_y_mm
+        used = set(chosen_indices)
+        for idx in chosen_indices:
+            blk = candidates[idx]
+            blk.status = "QUEUED"
+            ordered.append(blk)
 
-        while remaining:
-            pool = list(remaining)
-
-            def pick_key(b: BlockRecord) -> Tuple[int, int, int, int, int, float, int]:
-                obs = obstructing_zone(b)
-                is_blocker = 0 if obs is not None else 1
-                is_priority = 0 if (priority_block_id is not None and b.id == priority_block_id and not ordered) else 1
-                is_deferred = 1 if b.id in deferred else 0
-                # If clearing an obstacle, prefer blocks whose nominal color zone is not itself blocked
-                dest_blocked = 0
-                if obs is not None and b.color in zones:
-                    dzx, dzy, _dzz = zones[b.color]
-                    if any(
-                        other.id != b.id
-                        and math.hypot(other.x_mm - dzx, other.y_mm - dzy) <= zone_clear_radius_mm
-                        for other in pool
-                    ):
-                        dest_blocked = 1
-                clearance_tier = 0 if min_neighbor_clearance(b, pool) >= 35.0 else 1
-                return (is_blocker, is_priority, is_deferred, dest_blocked, clearance_tier, math.hypot(b.x_mm - cx, b.y_mm - cy), b.id)
-
-            remaining = sorted(pool, key=pick_key)
-            nxt = remaining.pop(0)
-            nxt.status = "QUEUED"
-            ordered.append(nxt)
-            cx, cy = nxt.x_mm, nxt.y_mm
+        # Defensive tail-fill if any caller invokes from an impossible pre-stacked state
+        if len(ordered) < n:
+            tail = [candidates[i] for i in range(n) if i not in used]
+            cx = ordered[-1].x_mm if ordered else current_x_mm
+            cy = ordered[-1].y_mm if ordered else current_y_mm
+            while tail:
+                tail.sort(
+                    key=lambda b: (
+                        0 if (priority_block_id is not None and b.id == priority_block_id and not ordered) else 1,
+                        1 if b.id in deferred else 0,
+                        math.hypot(b.x_mm - cx, b.y_mm - cy),
+                        b.id,
+                    )
+                )
+                nxt = tail.pop(0)
+                nxt.status = "QUEUED"
+                ordered.append(nxt)
+                cx, cy = nxt.x_mm, nxt.y_mm
 
         return ordered
+
+    def would_stack_create_boom_hazard(
+        self,
+        zone_key: str,
+        stack_zones_mm: Dict[str, Tuple[float, float, float]],
+        exclude_block_id: Optional[int] = None,
+        boom_x_min_offset_mm: float = -64.0,
+        boom_x_max_offset_mm: float = -33.0,
+        base_plate_z_down_mm: float = 76.71,
+        course_elevation_mm: float = 6.35,
+        aluminum_platform_size_mm: float = 76.2,
+        clearance_margin_mm: float = _CAD_CLEARANCE_MARGIN_MM,
+    ) -> Optional[BlockRecord]:
+        """
+        Defense-in-depth CAD boom check: if committing onto `zone_key` would cause any
+        remaining unstacked block's pick OR its next nominal stack-layer drop to collide
+        with the gantry's moving CAD structures (zStage boom/rail, yStage clamp/arm/cam,
+        eeStage body), returns the highest-priority conflicting unstacked block, else None.
+        """
+        del boom_x_min_offset_mm, boom_x_max_offset_mm
+        if zone_key not in stack_zones_mm:
+            return None
+
+        hypothetical_counts = dict(self.stack_counts)
+        hypothetical_counts[zone_key] = hypothetical_counts.get(zone_key, 0) + 1
+
+        sorted_zones = sorted(stack_zones_mm.items(), key=lambda kv: -kv[1][0])
+        zone_rank: Dict[str, int] = {zk: idx for idx, (zk, _coords) in enumerate(sorted_zones)}
+        default_non_rgb = "aluminum" if "aluminum" in stack_zones_mm else sorted_zones[0][0]
+
+        hazards: List[Tuple[int, int, int, BlockRecord]] = []
+        for other in self.blocks:
+            if other.status not in ("DETECTED", "QUEUED") or other.id == exclude_block_id:
+                continue
+
+            pick_z = max(
+                0.0,
+                base_plate_z_down_mm
+                - self._surface_z_up_at(
+                    other.x_mm,
+                    other.y_mm,
+                    stack_zones_mm,
+                    course_elevation_mm=course_elevation_mm,
+                    aluminum_platform_size_mm=aluminum_platform_size_mm,
+                ),
+            )
+            pick_bad = not self.is_pose_boom_safe(
+                other.x_mm,
+                other.y_mm,
+                pick_z,
+                stack_zones_mm,
+                stack_counts=hypothetical_counts,
+                clearance_margin_mm=clearance_margin_mm,
+            )
+
+            dz = other.color if other.color in stack_zones_mm else default_non_rgb
+            nxt_layer = hypothetical_counts.get(dz, 0)
+            dzx, dzy, dzz = stack_zones_mm[dz]
+            nxt_drop_z = max(0.0, (base_plate_z_down_mm - dzz) - nxt_layer * self.block_height_mm)
+            drop_bad = (dz != zone_key) and not self.is_pose_boom_safe(
+                dzx,
+                dzy,
+                nxt_drop_z,
+                stack_zones_mm,
+                stack_counts=hypothetical_counts,
+                ignore_zone=dz,
+                clearance_margin_mm=clearance_margin_mm,
+            )
+
+            if pick_bad or drop_bad:
+                hazards.append((0 if pick_bad else 1, zone_rank.get(dz, 0), other.id, other))
+
+        if not hazards:
+            return None
+        return min(hazards, key=lambda item: (item[0], item[1], item[2]))[3]
 
     def find_zone_obstruction(
         self,
@@ -803,7 +1271,29 @@ class WorldCatalogAndPlanner:
 
                     min_obs = min(min_zone, min_blk)
                     dist_ref = math.hypot(px - ref_x_mm, py - ref_y_mm)
-                    score = min(min_obs, 70.0) - 0.15 * dist_ref
+                    surface_z = self._surface_z_up_at(
+                        px,
+                        py,
+                        stack_zones_mm,
+                        course_elevation_mm=6.35,
+                        aluminum_platform_size_mm=aluminum_platform_size_mm,
+                    )
+                    pick_z_down = max(0.0, 76.71 - surface_z)
+                    min_safe = min(
+                        (
+                            self.max_safe_stack_count_for_pose(
+                                px, py, pick_z_down, zx, zy, zz
+                            )
+                            for zx, zy, zz in stack_zones_mm.values()
+                        ),
+                        default=99,
+                    )
+                    shadow_pen = 0.0
+                    if min_safe < 2:
+                        shadow_pen = 45.0
+                    elif min_safe < 3:
+                        shadow_pen = 20.0
+                    score = min(min_obs, 70.0) - 0.15 * dist_ref - shadow_pen
                     if best_score is None or score > best_score:
                         best_score = score
                         best_pt = (px, py)

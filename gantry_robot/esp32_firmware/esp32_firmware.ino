@@ -41,6 +41,7 @@
 #include <HX711.h>
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
+#include "soc/gpio_struct.h"
 
 // ============================================================
 //  PIN DEFINITIONS
@@ -81,24 +82,25 @@ const int SETUP_CURRENT_MA_Y  = 700; // Optimal 700mA for Y-axis carrying X+Z ga
 const int SETUP_MICROSTEPS    = 2;   // Y & Z keep tuned 2x; X uses 8x for smooth, quiet motion
 const int SETUP_MICROSTEPS_X  = 8;
 // Crash (stall) detection SGTHRS used during MOVE / manual jogs.
-// Defaults reuse the homing thresholds because MOVE speeds are capped near the calibrated homing speed
-// (see MAX_FEED_SPEED_*), and the check is gated to cruise speed + settle time + debounce (see isStalled()).
+// Tuned per-axis at cruise speed + settle time + debounce (see isStalled()) so fast S-curve
+// moves maintain strong StallGuard headroom while catching real collisions.
 // Set to 0 with "s1 s0" (etc.) to disable crash detection on an axis.
-const int SETUP_STALL_SENS_XZ = 60;  // == DEFAULT_HOME_SENS
-const int SETUP_STALL_SENS_Y  = 2;   // Avoid false stalls on Y MOVE decel/cruise (free-air SG dips to 6)
+const int SETUP_STALL_SENS_X  = 50;  // Triggers at SG_RESULT <= 100 (X cruise avg ~290)
+const int SETUP_STALL_SENS_Y  = 2;   // Triggers at SG_RESULT <= 4 (Y cruise min ~10 at 75-80 mm/s)
+const int SETUP_STALL_SENS_Z  = 40;  // Triggers at SG_RESULT <= 80 (Z UP cruise min ~228 at 35 mm/s)
 
-// Per-axis defaults (speeds in microsteps/s, acceleration in microsteps/s^2)
-const float DEFAULT_MAX_SPEED_X   = 5000.0f;  // 25.0 mm/s on 8mm-lead screw @ 8x (200 steps/mm)
-const float DEFAULT_ACCEL_X       = 10000.0f; // 50.0 mm/s^2 on 8mm-lead screw @ 8x
+// Per-axis defaults (speeds in microsteps/s, peak S-curve acceleration in microsteps/s^2)
+const float DEFAULT_MAX_SPEED_X   = 12000.0f; // 60.0 mm/s on 8mm-lead screw @ 8x (200 steps/mm)
+const float DEFAULT_ACCEL_X       = 40000.0f; // 200.0 mm/s^2 peak S-curve accel on 8mm-lead screw @ 8x
 const float DEFAULT_HOME_SPEED_X  = 3200.0f;  // 16.0 mm/s @ 8x (same physical speed & StallGuard4 back-EMF)
 
-const float DEFAULT_MAX_SPEED_XZ  = 1250.0f; // 25.0 mm/s on 8mm-lead screw @ 2x (50 steps/mm)
-const float DEFAULT_ACCEL_XZ      = 2500.0f; // 50.0 mm/s^2 on 8mm-lead screw @ 2x
-const float DEFAULT_HOME_SPEED_XZ = 800.0f;  // 16.0 mm/s @ 2x (calibrated for healthy back-EMF)
+const float DEFAULT_MAX_SPEED_Z   = 1750.0f;  // 35.0 mm/s on 8mm-lead screw @ 2x (50 steps/mm)
+const float DEFAULT_ACCEL_Z       = 6000.0f;  // 120.0 mm/s^2 peak S-curve accel on 8mm-lead screw @ 2x
+const float DEFAULT_HOME_SPEED_XZ = 800.0f;   // 16.0 mm/s @ 2x (calibrated for healthy back-EMF)
 
-const float DEFAULT_MAX_SPEED_Y   = 700.0f;  // 70.0 mm/s on 40mm/rev GT2 20T belt
-const float DEFAULT_ACCEL_Y       = 1000.0f; // 100.0 mm/s^2 on 40mm/rev GT2 20T belt
-const float DEFAULT_HOME_SPEED_Y  = 700.0f;  // 70.0 mm/s (1.75 rev/s for healthy back-EMF)
+const float DEFAULT_MAX_SPEED_Y   = 800.0f;   // 80.0 mm/s on 40mm/rev GT2 20T belt
+const float DEFAULT_ACCEL_Y       = 2400.0f;  // 240.0 mm/s^2 peak S-curve accel on 40mm/rev GT2 20T belt
+const float DEFAULT_HOME_SPEED_Y  = 700.0f;   // 70.0 mm/s (1.75 rev/s for healthy back-EMF)
 
 const int   DEFAULT_HOME_SENS     = 60;      // Homing sensitivity threshold for X and Z lead screws (SGTHRS=60)
 const int   DEFAULT_HOME_SENS_Y   = 3;       // Homing sensitivity threshold for Y belt pulley (SGTHRS=3)
@@ -159,11 +161,11 @@ const float HOME_BACKOFF_MM_XZ = 5.0f;
 const float HOME_BACKOFF_MM_Y  = 25.0f;
 const unsigned long HOME_PRE_SETTLE_MS = 50;
 
-// Per-axis cap applied to MOVE feedrates (microsteps/s). StallGuard thresholds are only valid near the speed they
-// were calibrated at; the old firmware let F15 drive X/Z at 3000 steps/s (3.75x the calibrated 800 steps/s).
-const float MAX_FEED_SPEED_X  = DEFAULT_MAX_SPEED_X;  // 5000 steps/s = 25.0 mm/s @ 8x
-const float MAX_FEED_SPEED_XZ = DEFAULT_MAX_SPEED_XZ; // 1250 steps/s = 25.0 mm/s @ 2x
-const float MAX_FEED_SPEED_Y  = DEFAULT_MAX_SPEED_Y;  // 700 steps/s = 70 mm/s
+// Per-axis cap applied to MOVE feedrates (microsteps/s) so each axis stays inside its verified
+// S-curve + StallGuard operating envelope.
+const float MAX_FEED_SPEED_X  = DEFAULT_MAX_SPEED_X;  // 12000 steps/s = 60.0 mm/s @ 8x
+const float MAX_FEED_SPEED_Z  = DEFAULT_MAX_SPEED_Z;  // 1750 steps/s = 35.0 mm/s @ 2x
+const float MAX_FEED_SPEED_Y  = DEFAULT_MAX_SPEED_Y;  // 800 steps/s = 80.0 mm/s @ 2x
 
 // Stall detection during moves only runs near full (cruise) speed
 const float STALL_CHECK_SPEED_RATIO = 0.9f;
@@ -203,6 +205,8 @@ HX711 scale;
 struct Axis {
   const char*     name;
   char            coordCode;        // 'X', 'Y', or 'Z'
+  int             stepPin;
+  int             dirPin;
   int             diagPin;
   AccelStepper*   stepper;
   TMC2209Stepper* driver;
@@ -229,11 +233,45 @@ struct Axis {
   unsigned long   diagFirstHighMs = 0;     // First DIAG HIGH sample in the current confirm window (0 = none)
 };
 
+// Phase-locked hardware-timer DDS S-curve velocity profile state per axis
+struct SCurveAxis {
+  Axis*  axis = nullptr;
+  long   curPos = 0;
+  long   targetPos = 0;
+  int    dir = 1;
+  float  vPeak = 0.0f;
+  float  vFloor = 0.0f;
+  float  lastCmdSpeed = -1.0f;
+  float  tRampSec = 0.0f;
+  float  decelDist = 0.0f;
+  bool   active = false;
+  bool   managed = false;
+};
+
+struct IsrStepAxis {
+  volatile bool     active;
+  volatile int      stepPin;
+  volatile int      dir;
+  volatile long     curPos;
+  volatile long     targetPos;
+  volatile uint32_t ddsPhase;
+  volatile uint32_t ddsInc;
+};
+
+static const uint32_t STEP_ISR_HZ = 62500UL; // 16 us hardware timer tick -> jitter-free stepping
+static portMUX_TYPE stepMux = portMUX_INITIALIZER_UNLOCKED;
+static volatile IsrStepAxis isrAxes[3] = {
+  { false, -1, 1, 0, 0, 0, 0 },
+  { false, -1, 1, 0, 0, 0, 0 },
+  { false, -1, 1, 0, 0, 0, 0 },
+};
+static hw_timer_t* stepTimer = nullptr;
+
 const int NUM_AXES = 3;
 Axis axes[NUM_AXES] = {
-  { "S1", 'X', PIN_DIAG_1, &stepper1, &driver1, false, DEFAULT_MAX_SPEED_X,  DEFAULT_ACCEL_X,  DEFAULT_HOME_SPEED_X,  SETUP_STALL_SENS_XZ, DEFAULT_HOME_SENS,   DEFAULT_STEPS_PER_MM_X, LEAD_SCREW_LEAD_MM,   DEFAULT_HOME_DIR_REVERSE_X, INVERT_DIR_X, SETUP_CURRENT_MA_XZ, TRAVEL_X_MM, HOME_BACKOFF_MM_XZ, MAX_FEED_SPEED_X,  STALL_SETTLE_MS_XZ, SETUP_MICROSTEPS_X },
-  { "S2", 'Y', PIN_DIAG_2, &stepper2, &driver2, false, DEFAULT_MAX_SPEED_Y,  DEFAULT_ACCEL_Y,  DEFAULT_HOME_SPEED_Y,  SETUP_STALL_SENS_Y,  DEFAULT_HOME_SENS_Y, DEFAULT_STEPS_PER_MM_Y, BELT_PULLEY_MM_REV_Y, DEFAULT_HOME_DIR_REVERSE_Y, INVERT_DIR_Y, SETUP_CURRENT_MA_Y,  TRAVEL_Y_MM, HOME_BACKOFF_MM_Y,  MAX_FEED_SPEED_Y,  STALL_SETTLE_MS_Y,  SETUP_MICROSTEPS },
-  { "S3", 'Z', PIN_DIAG_3, &stepper3, &driver3, false, DEFAULT_MAX_SPEED_XZ, DEFAULT_ACCEL_XZ, DEFAULT_HOME_SPEED_XZ, SETUP_STALL_SENS_XZ, DEFAULT_HOME_SENS,   DEFAULT_STEPS_PER_MM_Z, LEAD_SCREW_LEAD_MM,   DEFAULT_HOME_DIR_REVERSE_Z, INVERT_DIR_Z, SETUP_CURRENT_MA_XZ, TRAVEL_Z_MM, HOME_BACKOFF_MM_XZ, MAX_FEED_SPEED_XZ, STALL_SETTLE_MS_XZ, SETUP_MICROSTEPS },
+  { "S1", 'X', PIN_STEP_1, PIN_DIR_1, PIN_DIAG_1, &stepper1, &driver1, false, DEFAULT_MAX_SPEED_X, DEFAULT_ACCEL_X, DEFAULT_HOME_SPEED_X,  SETUP_STALL_SENS_X, DEFAULT_HOME_SENS,   DEFAULT_STEPS_PER_MM_X, LEAD_SCREW_LEAD_MM,   DEFAULT_HOME_DIR_REVERSE_X, INVERT_DIR_X, SETUP_CURRENT_MA_XZ, TRAVEL_X_MM, HOME_BACKOFF_MM_XZ, MAX_FEED_SPEED_X, STALL_SETTLE_MS_XZ, SETUP_MICROSTEPS_X },
+  { "S2", 'Y', PIN_STEP_2, PIN_DIR_2, PIN_DIAG_2, &stepper2, &driver2, false, DEFAULT_MAX_SPEED_Y, DEFAULT_ACCEL_Y, DEFAULT_HOME_SPEED_Y,  SETUP_STALL_SENS_Y, DEFAULT_HOME_SENS_Y, DEFAULT_STEPS_PER_MM_Y, BELT_PULLEY_MM_REV_Y, DEFAULT_HOME_DIR_REVERSE_Y, INVERT_DIR_Y, SETUP_CURRENT_MA_Y,  TRAVEL_Y_MM, HOME_BACKOFF_MM_Y,  MAX_FEED_SPEED_Y, STALL_SETTLE_MS_Y,  SETUP_MICROSTEPS },
+  { "S3", 'Z', PIN_STEP_3, PIN_DIR_3, PIN_DIAG_3, &stepper3, &driver3, false, DEFAULT_MAX_SPEED_Z, DEFAULT_ACCEL_Z, DEFAULT_HOME_SPEED_XZ, SETUP_STALL_SENS_Z, DEFAULT_HOME_SENS,   DEFAULT_STEPS_PER_MM_Z, LEAD_SCREW_LEAD_MM,   DEFAULT_HOME_DIR_REVERSE_Z, INVERT_DIR_Z, SETUP_CURRENT_MA_XZ, TRAVEL_Z_MM, HOME_BACKOFF_MM_XZ, MAX_FEED_SPEED_Z, STALL_SETTLE_MS_XZ, SETUP_MICROSTEPS },
 };
 
 // Set when an ESTOP line or hardware E-STOP switch triggers
@@ -311,15 +349,20 @@ void resetStallMonitor(Axis& axis);
 bool pollCancelInput();
 unsigned long homingTimeoutMs(Axis& axis, bool knownDistance);
 MotionResult runAxisTo(Axis& axis, long target);
+void initSCurveLuts();
+void initStepTimer();
 void handleMoveGcode(String params);
+void handlePressGcode(String params);
 void handleHomeAllGcode();
 void handleGripGcode(String params);
 void handleTareGcode();
 void handleWeighGcode();
+bool sampleLoadCellFilteredRaw(long& outRaw, float& outSpreadG, int numSamples = 11, int flushCount = 2, bool* outEstop = nullptr);
 void handleStatusGcode();
 void handleRegsGcode();
 void handleStepsGcode(String params);
 void handleChimeGcode(String params, bool emitProtocolReply = true);
+void handleTuneGcode(String params);
 void applyAxisDriverSettings(Axis& axis);
 bool restoreAxisFromChime(Axis& axis);
 void captureAxisSnapshot(Axis& axis, SavedAxisSnapshot& snap);
@@ -355,6 +398,8 @@ void setup() {
 
   // Disable loop task watchdog timer so long homing strokes never panic reset
   disableLoopWDT();
+  initSCurveLuts();
+  initStepTimer();
 
   Serial.begin(115200);
   delay(500);
@@ -372,14 +417,20 @@ void setup() {
 
   TMCSerial.begin(115200, SERIAL_8N1, PIN_TMC_RX, PIN_TMC_TX);
 
-  // Initialize HX711 load cell amplifier
+  // Initialize HX711 load cell amplifier with a fast single-sample boot zero
   scale.begin(PIN_HX711_DT, PIN_HX711_SCK);
   scale.set_scale(hx711ScaleFactor);
+  if (scale.wait_ready_timeout(120)) {
+    scale.set_offset(scale.read());
+  }
 
   for (int i = 0; i < NUM_AXES; i++) {
     pinMode(axes[i].diagPin, INPUT_PULLDOWN);
     axes[i].stepper->setMaxSpeed(axes[i].maxSpeed);
     axes[i].stepper->setAcceleration(axes[i].acceleration);
+    isrAxes[i].curPos = 0;
+    isrAxes[i].targetPos = 0;
+    isrAxes[i].active = false;
   }
 
   Serial.println("READY");
@@ -533,6 +584,10 @@ void handleCommand(String rawCommand) {
     handleMoveGcode(upper.substring(4));
     return;
   }
+  if (upper.startsWith("PRESS ") || upper == "PRESS") {
+    handlePressGcode(upper.length() > 5 ? upper.substring(6) : "");
+    return;
+  }
   if (upper.startsWith("GRIP ")) {
     handleGripGcode(upper.substring(5));
     return;
@@ -561,6 +616,10 @@ void handleCommand(String rawCommand) {
     handleChimeGcode(upper.length() > 5 ? upper.substring(6) : "");
     return;
   }
+  if (upper == "TUNE" || upper.startsWith("TUNE ")) {
+    handleTuneGcode(upper.length() > 4 ? upper.substring(5) : "");
+    return;
+  }
   if (upper == "ESTOP") {
     sleepAll();
     setRelayOutput(false);
@@ -587,6 +646,7 @@ void handleCommand(String rawCommand) {
   else if (command == "help")            { printHelp(); Serial.println("OK"); }
   else if (command == "l")               { handleLoadCellCommand(); Serial.println("OK"); }
   else if (command == "chime" || command.startsWith("chime ")) { handleChimeGcode(command.length() > 5 ? command.substring(6) : ""); }
+  else if (command == "tune" || command.startsWith("tune "))   { handleTuneGcode(command.length() > 4 ? command.substring(5) : ""); }
   else if (command.startsWith("home ") || command == "home")  { handleHomeCommand(command.length() > 5 ? command.substring(5) : ""); Serial.println("OK"); }
   else if (command.startsWith("servo ")) { handleServoCommand(command.substring(6)); Serial.println("OK"); }
   else if (command.startsWith("relay ")) { handleRelayCommand(command.substring(6)); Serial.println("OK"); }
@@ -673,6 +733,261 @@ bool parseCoordToken(const String& params, char key, float& outVal) {
   return true;
 }
 
+static bool pollMoveEstop() {
+  if (checkHardwareEstop()) return true;
+  if (Serial.available() > 0) {
+    String inCmd = Serial.readStringUntil('\n');
+    inCmd.trim();
+    String up = inCmd;
+    up.toUpperCase();
+    if (up == "ESTOP" || up == "X" || up == "SLEEP") {
+      return true;
+    }
+    if (inCmd.length() > 0 && pendingSerialCommand.length() == 0) {
+      pendingSerialCommand = inCmd;
+    }
+  }
+  return false;
+}
+
+static const int SCURVE_LUT_N = 64;
+static float sCurveAccelLut[SCURVE_LUT_N + 1];
+static float sCurveDecelLut[SCURVE_LUT_N + 1];
+static bool sCurveLutsReady = false;
+
+void initSCurveLuts() {
+  if (sCurveLutsReady) return;
+  for (int i = 0; i <= SCURVE_LUT_N; i++) {
+    float x = (float)i / (float)SCURVE_LUT_N;
+    sCurveAccelLut[i] = 0.5f * (1.0f - cosf(M_PI * x));
+    if (i == 0) {
+      sCurveDecelLut[i] = 0.0f;
+    } else {
+      float tau = constrain(cbrtf((6.0f * x) / (M_PI * M_PI)), 0.0f, 1.0f);
+      for (int it = 0; it < 12; it++) {
+        float f = tau - sinf(M_PI * tau) / M_PI - x;
+        float df = max(1e-6f, 1.0f - cosf(M_PI * tau));
+        tau = constrain(tau - f / df, 0.0f, 1.0f);
+      }
+      sCurveDecelLut[i] = 0.5f * (1.0f - cosf(M_PI * tau));
+    }
+  }
+  sCurveLutsReady = true;
+}
+
+static inline float lookupSCurveLut(const float* lut, float x) {
+  float clamped = constrain(x, 0.0f, 1.0f) * (float)SCURVE_LUT_N;
+  int idx = (int)clamped;
+  if (idx >= SCURVE_LUT_N) return lut[SCURVE_LUT_N];
+  float frac = clamped - (float)idx;
+  return lut[idx] + frac * (lut[idx + 1] - lut[idx]);
+}
+
+static inline uint32_t speedToDdsInc(float stepsPerSec) {
+  double inc = ((double)max(1.0f, stepsPerSec) * 4294967296.0) / (double)STEP_ISR_HZ;
+  if (inc >= 4294967295.0) return 0xFFFFFFFFUL;
+  return (uint32_t)(inc + 0.5);
+}
+
+static void IRAM_ATTR onStepTimer() {
+  uint32_t stepMask = 0;
+  portENTER_CRITICAL_ISR(&stepMux);
+  for (int i = 0; i < NUM_AXES; i++) {
+    volatile IsrStepAxis& ax = isrAxes[i];
+    if (!ax.active) continue;
+    long cur = ax.curPos;
+    long tgt = ax.targetPos;
+    if (cur == tgt) {
+      ax.active = false;
+      continue;
+    }
+    uint32_t prev = ax.ddsPhase;
+    uint32_t next = prev + ax.ddsInc;
+    ax.ddsPhase = next;
+    if (next < prev) {
+      if (ax.stepPin >= 0 && ax.stepPin < 32) {
+        stepMask |= (1UL << ax.stepPin);
+      }
+      cur += ax.dir;
+      ax.curPos = cur;
+      if (cur == tgt) {
+        ax.active = false;
+      }
+    }
+  }
+  portEXIT_CRITICAL_ISR(&stepMux);
+
+  if (stepMask != 0) {
+    GPIO.out_w1ts = stepMask;
+    delayMicroseconds(1); // ARDUINO_ISR_ATTR; 10x TMC2209 100 ns t_SWH min
+    GPIO.out_w1tc = stepMask;
+  }
+}
+
+void initStepTimer() {
+  if (stepTimer != nullptr) return;
+  stepTimer = timerBegin(1000000UL); // 1 MHz base clock (1 us/tick)
+  if (stepTimer != nullptr) {
+    timerAttachInterrupt(stepTimer, &onStepTimer);
+    timerAlarm(stepTimer, 1000000UL / STEP_ISR_HZ, true, 0); // 16 us = 62.5 kHz auto-reload
+    timerStop(stepTimer);
+  }
+}
+
+// Keeps AccelStepper and the hardware-timer ISR position mirror identical across
+// homing, sleep, zero-delta moves, and S-curve completion.
+static void syncAxisPosition(Axis& axis, long pos) {
+  int idx = (int)(&axis - axes);
+  if (idx >= 0 && idx < NUM_AXES) {
+    portENTER_CRITICAL(&stepMux);
+    isrAxes[idx].curPos = pos;
+    isrAxes[idx].targetPos = pos;
+    isrAxes[idx].active = false;
+    portEXIT_CRITICAL(&stepMux);
+  }
+  if (axis.stepper != nullptr) {
+    axis.stepper->setCurrentPosition(pos);
+  }
+}
+
+static void initSCurveAxis(SCurveAxis& sc, Axis& axis, long targetPos) {
+  initSCurveLuts();
+  long curPos = axis.stepper->currentPosition();
+  long delta = targetPos - curPos;
+  sc.axis = &axis;
+  sc.curPos = curPos;
+  sc.targetPos = targetPos;
+  resetStallMonitor(axis);
+
+  if (delta == 0) {
+    syncAxisPosition(axis, curPos);
+    sc.managed = false;
+    sc.active = false;
+    return;
+  }
+
+  long totalSteps = labs(delta);
+  sc.dir = (delta > 0) ? 1 : -1;
+  float vmax = max(10.0f, axis.maxSpeed);
+  float apeak = max(10.0f, axis.acceleration);
+  float dRampFull = (PI * vmax * vmax) / (2.0f * apeak);
+  sc.vPeak = ((float)totalSteps >= dRampFull)
+      ? vmax
+      : sqrtf((2.0f * apeak * (float)totalSteps) / PI);
+  sc.tRampSec = (PI * sc.vPeak) / (2.0f * apeak);
+  sc.decelDist = 0.5f * sc.vPeak * sc.tRampSec;
+  sc.vFloor = min(sc.vPeak, max(15.0f, 0.5f * axis.stepsPerMm));
+  sc.lastCmdSpeed = sc.vFloor;
+  sc.managed = true;
+  sc.active = true;
+
+  axis.stepper->setMaxSpeed(vmax);
+  axis.stepper->setSpeed((float)sc.dir * sc.vFloor);
+  digitalWrite(axis.dirPin, (sc.dir > 0) ? HIGH : LOW);
+  delayMicroseconds(2);
+}
+
+static void startStepEngine(SCurveAxis* scList, int count) {
+  initStepTimer();
+  portENTER_CRITICAL(&stepMux);
+  for (int i = 0; i < NUM_AXES; i++) {
+    isrAxes[i].active = false;
+  }
+  for (int j = 0; j < count; j++) {
+    if (scList[j].axis != nullptr) {
+      int idx = (int)(scList[j].axis - axes);
+      isrAxes[idx].curPos    = scList[j].curPos;
+      isrAxes[idx].targetPos = scList[j].targetPos;
+      if (scList[j].active) {
+        isrAxes[idx].stepPin  = scList[j].axis->stepPin;
+        isrAxes[idx].dir      = scList[j].dir;
+        isrAxes[idx].ddsPhase = 0xFFFFFFFFUL; // Trigger step #1 on first tick
+        isrAxes[idx].ddsInc   = speedToDdsInc(scList[j].vFloor);
+        isrAxes[idx].active   = true;
+      } else {
+        isrAxes[idx].active   = false;
+      }
+    }
+  }
+  portEXIT_CRITICAL(&stepMux);
+  if (stepTimer != nullptr) {
+    timerRestart(stepTimer);
+    timerStart(stepTimer);
+  }
+}
+
+static void stopStepEngine(SCurveAxis* scList, int count) {
+  if (stepTimer != nullptr) {
+    timerStop(stepTimer);
+  }
+  portENTER_CRITICAL(&stepMux);
+  for (int i = 0; i < NUM_AXES; i++) {
+    isrAxes[i].active = false;
+  }
+  for (int j = 0; j < count; j++) {
+    if (scList[j].axis != nullptr && scList[j].managed) {
+      int idx = (int)(scList[j].axis - axes);
+      scList[j].curPos = isrAxes[idx].curPos;
+      scList[j].active = false;
+    }
+  }
+  portEXIT_CRITICAL(&stepMux);
+  for (int j = 0; j < count; j++) {
+    if (scList[j].axis != nullptr && scList[j].managed) {
+      scList[j].axis->stepper->setCurrentPosition(scList[j].curPos);
+      scList[j].managed = false;
+    }
+  }
+}
+
+// Syncs ISR step counts and updates S-curve DDS frequencies; returns true while any axis moves.
+static bool tickStepEngine(SCurveAxis* scList, int count, unsigned long moveStartUs) {
+  unsigned long nowUs = micros();
+  float tSec = (float)((unsigned long)(nowUs - moveStartUs)) * 1e-6f;
+  bool anyActive = false;
+
+  for (int j = 0; j < count; j++) {
+    SCurveAxis& sc = scList[j];
+    if (!sc.active || sc.axis == nullptr) continue;
+    int idx = (int)(sc.axis - axes);
+
+    portENTER_CRITICAL(&stepMux);
+    sc.curPos = isrAxes[idx].curPos;
+    sc.active = isrAxes[idx].active;
+    portEXIT_CRITICAL(&stepMux);
+
+    if (!sc.active) {
+      syncAxisPosition(*sc.axis, sc.curPos);
+      sc.managed = false;
+      continue;
+    }
+    anyActive = true;
+
+    long rem = (sc.dir > 0) ? (sc.targetPos - sc.curPos) : (sc.curPos - sc.targetPos);
+    if (rem <= 0) continue;
+
+    float va = (tSec < sc.tRampSec && sc.tRampSec > 1e-6f)
+        ? (sc.vFloor + (sc.vPeak - sc.vFloor) * lookupSCurveLut(sCurveAccelLut, tSec / sc.tRampSec))
+        : sc.vPeak;
+
+    float vd = sc.vPeak;
+    if ((float)rem < sc.decelDist && sc.decelDist > 1e-6f) {
+      vd = max(sc.vFloor, sc.vPeak * lookupSCurveLut(sCurveDecelLut, (float)rem / sc.decelDist));
+    }
+
+    float vCmd = max(sc.vFloor, min(va, vd));
+    if (fabsf(vCmd - sc.lastCmdSpeed) >= 1.0f) {
+      sc.lastCmdSpeed = vCmd;
+      sc.axis->stepper->setSpeed((float)sc.dir * vCmd);
+      uint32_t newInc = speedToDdsInc(vCmd);
+      portENTER_CRITICAL(&stepMux);
+      isrAxes[idx].ddsInc = newInc;
+      portEXIT_CRITICAL(&stepMux);
+    }
+  }
+  return anyActive;
+}
+
 void handleMoveGcode(String params) {
   if (checkHardwareEstop()) {
     setRelayOutput(false, "hardware estop");
@@ -687,9 +1002,7 @@ void handleMoveGcode(String params) {
   float feedrateMmPerSec = 0.0f;
   if (parseCoordToken(params, 'F', feedrateMmPerSec) && feedrateMmPerSec > 0.0f) {
     for (int i = 0; i < NUM_AXES; i++) {
-      // Per-axis cap: F is in mm/s for every axis, but X/Z (200 steps/mm) and Y (10 steps/mm) differ 20x, so an
-      // uncapped F15 asked for 3000 steps/s on X/Z (step loss risk, StallGuard uncalibrated) and 150 steps/s on Y
-      // (too slow for StallGuard to work at all).
+      // Per-axis cap keeps X/Y/Z within empirically verified torque and StallGuard headroom.
       float spdSteps = constrain(feedrateMmPerSec * axes[i].stepsPerMm, 10.0f, axes[i].maxFeedSpeed);
       axes[i].maxSpeed = spdSteps;
       axes[i].stepper->setMaxSpeed(spdSteps);
@@ -710,73 +1023,52 @@ void handleMoveGcode(String params) {
     }
   }
 
-  // Set target positions for X (S1), Y (S2), Z (S3) with soft-limit safety clamping
+  // Initialize hardware-timer DDS S-curve profiles for X (S1), Y (S2), Z (S3)
+  SCurveAxis scAxes[NUM_AXES];
   for (int i = 0; i < NUM_AXES; i++) {
     float targetMm = 0.0f;
+    long targetSteps = axes[i].stepper->currentPosition();
     if (parseCoordToken(params, axes[i].coordCode, targetMm)) {
       targetMm = constrain(targetMm, 0.0f, axes[i].maxTravelMm);
-      long targetSteps = lroundf(targetMm * axes[i].stepsPerMm);
-      axes[i].stepper->moveTo(targetSteps);
-    } else {
-      axes[i].stepper->moveTo(axes[i].stepper->currentPosition());
+      targetSteps = lroundf(targetMm * axes[i].stepsPerMm);
     }
-    resetStallMonitor(axes[i]);
+    initSCurveAxis(scAxes[i], axes[i], targetSteps);
   }
 
-  // Coordinated multi-axis step loop with StallGuard monitoring and responsive ESTOP
   unsigned long lastWdtYieldMs = millis();
-  while (axes[0].stepper->distanceToGo() != 0 ||
-         axes[1].stepper->distanceToGo() != 0 ||
-         axes[2].stepper->distanceToGo() != 0) {
+  unsigned long moveStartUs = micros();
+  startStepEngine(scAxes, NUM_AXES);
+  while (tickStepEngine(scAxes, NUM_AXES, moveStartUs)) {
     yieldWdt(lastWdtYieldMs);
+
     if (hasPendingAngle) {
-      float curYmm = (float)axes[1].stepper->currentPosition() / axes[1].stepsPerMm;
+      float curYmm = (float)scAxes[1].curPos / axes[1].stepsPerMm;
       if (curYmm >= SERVO_SAFE_Y_MM) {
         writeServoLogicalAngle(targetAngle);
         hasPendingAngle = false;
       }
     }
-    if (checkHardwareEstop()) {
-      for (int j = 0; j < NUM_AXES; j++) {
-        axes[j].stepper->setCurrentPosition(axes[j].stepper->currentPosition());
-      }
+    if (pollMoveEstop()) {
+      stopStepEngine(scAxes, NUM_AXES);
       sleepAll();
       setRelayOutput(false);
       Serial.println("ERR:ESTOP");
       return;
     }
-    if (Serial.available() > 0) {
-      String inCmd = Serial.readStringUntil('\n');
-      inCmd.trim();
-      inCmd.toUpperCase();
-      if (inCmd == "ESTOP" || inCmd == "X" || inCmd == "SLEEP") {
-        for (int j = 0; j < NUM_AXES; j++) {
-          axes[j].stepper->setCurrentPosition(axes[j].stepper->currentPosition());
-        }
+
+    for (int i = 0; i < NUM_AXES; i++) {
+      if (scAxes[i].active && isStalled(axes[i])) {
+        stopStepEngine(scAxes, NUM_AXES);
+        // Immediately cut power to steppers so motor does not sustain power against the stop!
         sleepAll();
-        setRelayOutput(false);
-        Serial.println("ERR:ESTOP");
+        Serial.print("ERR:STALL_");
+        Serial.println(axes[i].coordCode);
         return;
       }
     }
-
-    for (int i = 0; i < NUM_AXES; i++) {
-      if (axes[i].stepper->distanceToGo() != 0) {
-        axes[i].stepper->run();
-        if (isStalled(axes[i])) {
-          for (int j = 0; j < NUM_AXES; j++) {
-            axes[j].stepper->setCurrentPosition(axes[j].stepper->currentPosition());
-          }
-          // Immediately cut power to steppers so motor does not sustain power against the stop!
-          // (sleepAll() also invalidates the homed reference: the axis has lost steps.)
-          sleepAll();
-          Serial.print("ERR:STALL_");
-          Serial.println(axes[i].coordCode);
-          return;
-        }
-      }
-    }
+    delayMicroseconds(250);
   }
+  stopStepEngine(scAxes, NUM_AXES);
 
   if (hasPendingAngle) {
     float endYmm = (float)axes[1].stepper->currentPosition() / axes[1].stepsPerMm;
@@ -787,6 +1079,218 @@ void handleMoveGcode(String params) {
     }
   }
 
+  Serial.println("OK");
+}
+
+// Flushes stale/in-motion HX711 samples, polls N fresh samples with E-stop & WDT checks,
+// and computes a trimmed mean (outlier rejection) + spread in grams.
+bool sampleLoadCellFilteredRaw(long& outRaw, float& outSpreadG, int numSamples, int flushCount, bool* outEstop) {
+  if (outEstop) *outEstop = false;
+  numSamples = constrain(numSamples, 1, 15);
+  flushCount = constrain(flushCount, 0, 4);
+  unsigned long lastWdtYieldMs = millis();
+
+  // Flush stale/in-flight ADC conversions taken during deceleration or servo ringing
+  for (int f = 0; f < flushCount; f++) {
+    unsigned long waitStart = millis();
+    while (!scale.is_ready()) {
+      yieldWdt(lastWdtYieldMs);
+      if (pollMoveEstop()) {
+        if (outEstop) *outEstop = true;
+        return false;
+      }
+      if (millis() - waitStart > 250UL) {
+        return false;
+      }
+      delay(2);
+    }
+    (void)scale.read();
+  }
+
+  long vals[15];
+  for (int i = 0; i < numSamples; i++) {
+    unsigned long waitStart = millis();
+    while (!scale.is_ready()) {
+      yieldWdt(lastWdtYieldMs);
+      if (pollMoveEstop()) {
+        if (outEstop) *outEstop = true;
+        return false;
+      }
+      if (millis() - waitStart > 250UL) {
+        return false;
+      }
+      delay(2);
+    }
+    vals[i] = scale.read();
+  }
+
+  // Insertion sort for trimmed-mean outlier rejection
+  for (int i = 1; i < numSamples; i++) {
+    long key = vals[i];
+    int j = i - 1;
+    while (j >= 0 && vals[j] > key) {
+      vals[j + 1] = vals[j];
+      j--;
+    }
+    vals[j + 1] = key;
+  }
+
+  int trim = (numSamples >= 5) ? (numSamples / 4) : 0;
+  long long sum = 0;
+  int count = 0;
+  for (int i = trim; i < numSamples - trim; i++) {
+    sum += (long long)vals[i];
+    count++;
+  }
+  outRaw = (count > 0) ? (long)(sum / count) : vals[numSamples / 2];
+
+  if (fabsf(hx711ScaleFactor) > 1e-3f) {
+    long lo = vals[trim];
+    long hi = vals[numSamples - 1 - trim];
+    outSpreadG = fabsf((float)(hi - lo) / hx711ScaleFactor);
+  } else {
+    outSpreadG = 0.0f;
+  }
+  return true;
+}
+
+// Bounded downward floor/surface press using HX711 compressive force feedback capped at Z<=maxZ:
+//   PRESS Z<max_z_mm> D<seat_force_g> F<mm_s> [G<guard_force_g> S<guard_limit_z_mm>]
+void handlePressGcode(String params) {
+  if (checkHardwareEstop()) {
+    setRelayOutput(false, "hardware estop");
+    Serial.println("ERR:ESTOP");
+    return;
+  }
+  if (!ensureDriversReady()) {
+    Serial.println("ERR:TMC_NOT_READY");
+    return;
+  }
+
+  Axis& zAx = axes[2];
+  float curZmm = (float)zAx.stepper->currentPosition() / zAx.stepsPerMm;
+  float maxZmm = curZmm;
+  parseCoordToken(params, 'Z', maxZmm);
+  maxZmm = constrain(maxZmm, curZmm, zAx.maxTravelMm);
+
+  float targetDeltaG = 0.0f;
+  parseCoordToken(params, 'D', targetDeltaG);
+  targetDeltaG = max(0.0f, targetDeltaG);
+
+  float pressSpeedMmS = 8.0f;
+  parseCoordToken(params, 'F', pressSpeedMmS);
+  pressSpeedMmS = constrain(pressSpeedMmS, 1.0f, 35.0f);
+
+  float guardDeltaG = targetDeltaG;
+  float guardLimitZmm = curZmm;
+  bool hasGuard = parseCoordToken(params, 'G', guardDeltaG) && parseCoordToken(params, 'S', guardLimitZmm);
+  if (hasGuard) {
+    guardDeltaG = max(0.0f, guardDeltaG);
+    guardLimitZmm = constrain(guardLimitZmm, curZmm, maxZmm);
+  }
+
+  unsigned long lastWdtYieldMs = millis();
+
+  // Brief settle after prior move, flush stale ADC reading, and sample fresh HX711 baseline
+  long baseRaw = 0;
+  float baseSpread = 0.0f;
+  bool hasBaseline = false;
+  float lastDeltaG = 0.0f;
+  if ((targetDeltaG > 0.5f || (hasGuard && guardDeltaG > 0.5f)) && fabsf(hx711ScaleFactor) > 1e-3f) {
+    for (int w = 0; w < 4; w++) {
+      yieldWdt(lastWdtYieldMs);
+      if (pollMoveEstop()) {
+        sleepAll();
+        setRelayOutput(false);
+        Serial.println("ERR:ESTOP");
+        return;
+      }
+      delay(10);
+    }
+    bool estopAborted = false;
+    if (sampleLoadCellFilteredRaw(baseRaw, baseSpread, 1, 1, &estopAborted)) {
+      hasBaseline = true;
+    } else if (estopAborted) {
+      sleepAll();
+      setRelayOutput(false);
+      Serial.println("ERR:ESTOP");
+      return;
+    }
+  }
+
+  float savedMaxSpeed = zAx.maxSpeed;
+  zAx.maxSpeed = constrain(pressSpeedMmS * zAx.stepsPerMm, 10.0f, zAx.maxFeedSpeed);
+  SCurveAxis scZ;
+  initSCurveAxis(scZ, zAx, lroundf(maxZmm * zAx.stepsPerMm));
+
+  unsigned long moveStartUs = micros();
+  bool forceReached = false;
+  bool guardTripped = false;
+  startStepEngine(&scZ, 1);
+  while (tickStepEngine(&scZ, 1, moveStartUs)) {
+    yieldWdt(lastWdtYieldMs);
+    if (pollMoveEstop()) {
+      stopStepEngine(&scZ, 1);
+      zAx.maxSpeed = savedMaxSpeed;
+      zAx.stepper->setMaxSpeed(savedMaxSpeed);
+      sleepAll();
+      setRelayOutput(false);
+      Serial.println("ERR:ESTOP");
+      return;
+    }
+
+    if (hasBaseline && !forceReached && (unsigned long)(micros() - moveStartUs) >= 40000UL && scale.is_ready()) {
+      long raw = scale.read();
+      // Hanging load reads +grams; upward contact/floor press reads negative deltaG
+      lastDeltaG = (float)(raw - baseRaw) / hx711ScaleFactor;
+
+      long liveCur = 0;
+      portENTER_CRITICAL(&stepMux);
+      liveCur = isrAxes[2].curPos;
+      portEXIT_CRITICAL(&stepMux);
+      float liveZmm = (float)liveCur / zAx.stepsPerMm;
+
+      bool inGuardZone = hasGuard && (liveZmm < guardLimitZmm);
+      float activeThreshG = inGuardZone ? guardDeltaG : targetDeltaG;
+
+      if (activeThreshG > 0.5f && lastDeltaG <= -activeThreshG) {
+        forceReached = true;
+        guardTripped = inGuardZone;
+        portENTER_CRITICAL(&stepMux);
+        liveCur = isrAxes[2].curPos;
+        long rem = scZ.targetPos - liveCur;
+        long stopSteps = (rem > 0) ? min(rem, 3L) : 0L;
+        long newTarget = liveCur + stopSteps;
+        isrAxes[2].targetPos = newTarget;
+        if (stopSteps == 0L) isrAxes[2].active = false;
+        scZ.curPos = liveCur;
+        scZ.targetPos = newTarget;
+        scZ.decelDist = max(1.0f, (float)stopSteps);
+        scZ.active = (stopSteps > 0L);
+        portEXIT_CRITICAL(&stepMux);
+      }
+    }
+
+    if (scZ.active && isStalled(zAx)) {
+      stopStepEngine(&scZ, 1);
+      zAx.maxSpeed = savedMaxSpeed;
+      zAx.stepper->setMaxSpeed(savedMaxSpeed);
+      sleepAll();
+      Serial.println("ERR:STALL_Z");
+      return;
+    }
+    delayMicroseconds(250);
+  }
+  stopStepEngine(&scZ, 1);
+
+  zAx.maxSpeed = savedMaxSpeed;
+  zAx.stepper->setMaxSpeed(savedMaxSpeed);
+
+  float actualZmm = (float)zAx.stepper->currentPosition() / zAx.stepsPerMm;
+  char replyBuf[80];
+  snprintf(replyBuf, sizeof(replyBuf), "PRESSED Z:%.2f DF:%.2f HIT:%d GUARD:%d",
+           actualZmm, lastDeltaG, forceReached ? 1 : 0, guardTripped ? 1 : 0);
+  Serial.println(replyBuf);
   Serial.println("OK");
 }
 
@@ -812,23 +1316,108 @@ void handleGripGcode(String params) {
 }
 
 void handleTareGcode() {
-  if (scale.wait_ready_timeout(500)) {
-    scale.tare(10);
-    Serial.println("OK");
-  } else {
-    Serial.println("ERR:HX711_NOT_READY");
+  if (checkHardwareEstop()) {
+    sleepAll();
+    setRelayOutput(false, "hardware estop");
+    Serial.println("ERR:ESTOP");
+    return;
   }
+  long baseRaw = 0;
+  float spreadG = 0.0f;
+  bool estopAborted = false;
+  if (!sampleLoadCellFilteredRaw(baseRaw, spreadG, 11, 2, &estopAborted)) {
+    if (estopAborted) {
+      sleepAll();
+      setRelayOutput(false);
+      Serial.println("ERR:ESTOP");
+    } else {
+      Serial.println("ERR:HX711_NOT_READY");
+    }
+    return;
+  }
+
+  // If spread exceeds 1.2 g due to transient vibration, settle 150 ms and re-sample once
+  if (spreadG > 1.2f) {
+    unsigned long lastWdtYieldMs = millis();
+    for (int w = 0; w < 15; w++) {
+      yieldWdt(lastWdtYieldMs);
+      if (pollMoveEstop()) {
+        sleepAll();
+        setRelayOutput(false);
+        Serial.println("ERR:ESTOP");
+        return;
+      }
+      delay(10);
+    }
+    if (!sampleLoadCellFilteredRaw(baseRaw, spreadG, 11, 1, &estopAborted)) {
+      if (estopAborted) {
+        sleepAll();
+        setRelayOutput(false);
+        Serial.println("ERR:ESTOP");
+      } else {
+        Serial.println("ERR:HX711_NOT_READY");
+      }
+      return;
+    }
+  }
+
+  scale.set_offset(baseRaw);
+
+  // Verify zero residual across 3 fresh samples and re-center if drift > 0.8 g
+  long chkRaw = baseRaw;
+  float chkSpread = 0.0f;
+  float checkG = 0.0f;
+  if (sampleLoadCellFilteredRaw(chkRaw, chkSpread, 3, 0, &estopAborted)) {
+    if (fabsf(hx711ScaleFactor) > 1e-3f) {
+      checkG = (float)(chkRaw - baseRaw) / hx711ScaleFactor;
+    }
+    if (fabsf(checkG) > 0.8f) {
+      baseRaw = (baseRaw + chkRaw) / 2;
+      scale.set_offset(baseRaw);
+      checkG *= 0.5f;
+    }
+  } else if (estopAborted) {
+    sleepAll();
+    setRelayOutput(false);
+    Serial.println("ERR:ESTOP");
+    return;
+  }
+
+  Serial.print("TARED OFFSET:");
+  Serial.print(baseRaw);
+  Serial.print(" CHECK:");
+  Serial.print(checkG, 2);
+  Serial.print(" SPREAD:");
+  Serial.println(spreadG, 2);
+  Serial.println("OK");
 }
 
 void handleWeighGcode() {
-  if (scale.wait_ready_timeout(500)) {
-    float massGrams = scale.get_units(10);
-    Serial.print("WEIGHT:");
-    Serial.println(massGrams, 2);
-    Serial.println("OK");
-  } else {
-    Serial.println("ERR:HX711_NOT_READY");
+  if (checkHardwareEstop()) {
+    sleepAll();
+    setRelayOutput(false, "hardware estop");
+    Serial.println("ERR:ESTOP");
+    return;
   }
+  long raw = 0;
+  float spreadG = 0.0f;
+  bool estopAborted = false;
+  if (!sampleLoadCellFilteredRaw(raw, spreadG, 5, 1, &estopAborted)) {
+    if (estopAborted) {
+      sleepAll();
+      setRelayOutput(false);
+      Serial.println("ERR:ESTOP");
+    } else {
+      Serial.println("ERR:HX711_NOT_READY");
+    }
+    return;
+  }
+  float massGrams = (fabsf(hx711ScaleFactor) > 1e-3f)
+      ? (float)(raw - scale.get_offset()) / hx711ScaleFactor
+      : 0.0f;
+  Serial.print("WEIGHT:");
+  Serial.println(massGrams, 2);
+  Serial.println("OK");
 }
 
 void handleStatusGcode() {
@@ -900,8 +1489,8 @@ void handleStepsGcode(String params) {
 void printHelp() {
   Serial.println("\n--- HUE-DINI ESP32 Controller ---");
   Serial.println("Automated Pi Zero Protocol:");
-  Serial.println("  SETUP | HOME | MOVE X<mm> Y<mm> Z<mm> A<deg> F<mm_s>");
-  Serial.println("  GRIP <0|1> | TARE | WEIGH | STATUS | STEPS X<f> Y<f> Z<f> | CHIME [TADA|WIN95] | ESTOP");
+  Serial.println("  SETUP | HOME | MOVE X<mm> Y<mm> Z<mm> A<deg> F<mm_s> | PRESS Z<mm> D<g> F<mm_s>");
+  Serial.println("  GRIP <0|1> | TARE | WEIGH | STATUS | STEPS X<f> Y<f> Z<f> | CHIME [TADA|WIN95] | TUNE <X|Y|Z|ALL> <Hz> [ms] [ms_div] [mA] | ESTOP");
   Serial.println("Interactive Manual Commands (s1=X, s2=Y, s3=Z):");
   Serial.println("  setup       -> Enable all steppers, test UART, apply defaults");
   Serial.println("  sleep       -> Disable all steppers (run 'setup' to wake)");
@@ -1155,9 +1744,9 @@ void applyAxisDriverSettings(Axis& axis) {
 
   // Restore default maxSpeed and acceleration so prior MOVE feedrate caps never taint SETUP/HOME
   axis.maxSpeed     = (axis.coordCode == 'Y') ? DEFAULT_MAX_SPEED_Y :
-                      (axis.coordCode == 'X') ? DEFAULT_MAX_SPEED_X : DEFAULT_MAX_SPEED_XZ;
+                      (axis.coordCode == 'X') ? DEFAULT_MAX_SPEED_X : DEFAULT_MAX_SPEED_Z;
   axis.acceleration = (axis.coordCode == 'Y') ? DEFAULT_ACCEL_Y :
-                      (axis.coordCode == 'X') ? DEFAULT_ACCEL_X : DEFAULT_ACCEL_XZ;
+                      (axis.coordCode == 'X') ? DEFAULT_ACCEL_X : DEFAULT_ACCEL_Z;
   axis.stepper->setMaxSpeed(axis.maxSpeed);
   axis.stepper->setAcceleration(axis.acceleration);
 
@@ -1338,9 +1927,17 @@ void checkRelayWatchdog() {
 }
 
 void sleepAll() {
+  if (stepTimer != nullptr) {
+    timerStop(stepTimer);
+  }
+  portENTER_CRITICAL(&stepMux);
+  for (int i = 0; i < NUM_AXES; i++) {
+    isrAxes[i].active = false;
+  }
+  portEXIT_CRITICAL(&stepMux);
   for (int i = 0; i < NUM_AXES; i++) {
     AccelStepper* s = axes[i].stepper;
-    s->setCurrentPosition(s->currentPosition());
+    syncAxisPosition(axes[i], s->currentPosition());
     axes[i].ready = false;
     axes[i].homed = false;   // unpowered axes can be back-driven / may have lost steps
   }
@@ -1416,30 +2013,32 @@ bool moveAxis(Axis& axis, long steps) {
   Serial.print(" moving "); Serial.print(steps); Serial.println(" steps...");
 
   AccelStepper* stepper = axis.stepper;
-  stepper->move(steps);
-  resetStallMonitor(axis);
+  SCurveAxis sc;
+  initSCurveAxis(sc, axis, stepper->currentPosition() + steps);
 
   unsigned long lastWdtYieldMs = millis();
-  while (stepper->distanceToGo() != 0) {
+  unsigned long moveStartUs = micros();
+  startStepEngine(&sc, 1);
+  while (tickStepEngine(&sc, 1, moveStartUs)) {
     yieldWdt(lastWdtYieldMs);
     if (checkHardwareEstop()) {
-      stepper->setCurrentPosition(stepper->currentPosition());
+      stopStepEngine(&sc, 1);
       sleepAll();
       setRelayOutput(false);
       Serial.println("[ALERT] Hardware E-STOP triggered. Steppers disabled.");
       return false;
     }
-    stepper->run();
-
-    if (isStalled(axis)) {
-      stepper->setCurrentPosition(stepper->currentPosition());
+    if (sc.active && isStalled(axis)) {
+      stopStepEngine(&sc, 1);
       sleepAll(); // Cut power immediately!
       Serial.print("[ALERT] "); Serial.print(axis.name);
       Serial.print(" stall detected (SG_RESULT="); Serial.print(axis.driver->SG_RESULT());
       Serial.println("). Steppers disabled (asleep). Position may be inaccurate.");
       return false;
     }
+    delayMicroseconds(250);
   }
+  stopStepEngine(&sc, 1);
 
   Serial.print("-> "); Serial.print(axis.name); Serial.println(" move complete.");
   return true;
@@ -1469,14 +2068,26 @@ bool isStalled(Axis& axis) {
   }
   if (nowMs - axis.cruiseSinceMs < axis.stallSettleMs) return false;
 
-  if (digitalRead(axis.diagPin) != HIGH) return false;
+  if (digitalRead(axis.diagPin) != HIGH) {
+    if (axis.coordCode == 'Y') axis.diagFirstHighMs = 0;
+    return false;
+  }
 
-  // Require a second DIAG HIGH sample >= 1 ms after the first one, within STALL_CONFIRM_WINDOW_MS
+  // Y belt pulley emits a periodic ~5.3 ms DIAG square wave during normal fast travel; require
+  // continuous HIGH >= 10 ms on Y (matching homeAxis) while X/Z keep 15 ms dual-sample confirm.
+  if (axis.coordCode == 'Y') {
+    if (axis.diagFirstHighMs == 0) {
+      axis.diagFirstHighMs = (nowMs == 0) ? 1UL : nowMs;
+      return false;
+    }
+    return (nowMs - axis.diagFirstHighMs) >= 10UL;
+  }
+
   if (axis.diagFirstHighMs == 0 || nowMs - axis.diagFirstHighMs > STALL_CONFIRM_WINDOW_MS) {
     axis.diagFirstHighMs = (nowMs == 0) ? 1UL : nowMs;
     return false;
   }
-  return (nowMs - axis.diagFirstHighMs) >= 1;
+  return (nowMs - axis.diagFirstHighMs) >= 1UL;
 }
 
 // Polls the hardware E-STOP switch and host link inside blocking loops.
@@ -1504,22 +2115,24 @@ unsigned long homingTimeoutMs(Axis& axis, bool knownDistance) {
 
 // Single-axis move used for the pre-home pull-away. Does NOT sleep the drivers on a stall.
 MotionResult runAxisTo(Axis& axis, long target) {
-  AccelStepper* s = axis.stepper;
-  s->moveTo(target);
-  resetStallMonitor(axis);
+  SCurveAxis sc;
+  initSCurveAxis(sc, axis, target);
   unsigned long lastWdtYieldMs = millis();
-  while (s->distanceToGo() != 0) {
+  unsigned long moveStartUs = micros();
+  startStepEngine(&sc, 1);
+  while (tickStepEngine(&sc, 1, moveStartUs)) {
     yieldWdt(lastWdtYieldMs);
-    s->run();
-    if (isStalled(axis)) {
-      s->setCurrentPosition(s->currentPosition());
+    if (sc.active && isStalled(axis)) {
+      stopStepEngine(&sc, 1);
       return MOTION_STALLED;
     }
     if (pollCancelInput()) {
-      s->setCurrentPosition(s->currentPosition());
+      stopStepEngine(&sc, 1);
       return MOTION_CANCELLED;
     }
+    delayMicroseconds(250);
   }
+  stopStepEngine(&sc, 1);
   return MOTION_DONE;
 }
 
@@ -1728,7 +2341,7 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
       // every MOVE drove further into the far stop.
       long homePos = towardOrigin ? 0 : (long)(dirSign * lroundf(axis.maxTravelMm * axis.stepsPerMm));
       if (!axis.homeReverse) homePos = -homePos;
-      stepper->setCurrentPosition(homePos);
+      syncAxisPosition(axis, homePos);
       axis.homed = true;
       Serial.print("-> "); Serial.print(axis.name);
       Serial.print(" homed (SG_RESULT="); Serial.print(stallSg);
@@ -1738,13 +2351,13 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
       return true;
     }
     case TIMED_OUT:
-      stepper->setCurrentPosition(stepper->currentPosition());
+      syncAxisPosition(axis, stepper->currentPosition());
       setRelayOutput(false, "homing timeout");
       Serial.print("[ERROR] "); Serial.print(axis.name);
       Serial.println(" homing timed out with no stall detected.");
       return false;
     default:
-      stepper->setCurrentPosition(stepper->currentPosition());
+      syncAxisPosition(axis, stepper->currentPosition());
       if (estopLatched) { sleepAll(); setRelayOutput(false); }
       else { setRelayOutput(false, "homing cancelled"); }
       Serial.print("-> "); Serial.print(axis.name);
@@ -1754,31 +2367,60 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
 }
 
 // ============================================================
-//  STEPPER CHIMES (TADA & WIN95 via high-torque SpreadCycle)
+//  STEPPER CHIMES (TADA & WIN95 via verified SpreadCycle + DDS)
 // ============================================================
-static const int CHIME_MICROSTEPS_XZ = 4;   // Coarser than 16x for stronger acoustic torque ripple
-static const int CHIME_MICROSTEPS_Y  = 8;   // 40 mm/rev belt keeps excursion small at 8x
+static const int CHIME_MICROSTEPS_X  = 4;   // Verified 1:1 fundamental pitch (A4=440, Eb5=622.25)
+static const int CHIME_MICROSTEPS_Y  = 8;   // Unused in 2-voice chimes (belt damps tone)
+static const int CHIME_MICROSTEPS_Z  = 1;   // Verified 1:1 clean bass/harmony (C4=261.63, A4=440)
 static const int CHIME_CURRENT_MA_XZ = 500; // Moderate chime boost (avoids rail droop / UVLO)
 static const int CHIME_CURRENT_MA_Y  = 700; // Keeps Y in vsense=1 matching normal operation
 
 static int chimeMicrostepsFor(const Axis& axis) {
-  return (axis.coordCode == 'Y') ? CHIME_MICROSTEPS_Y : CHIME_MICROSTEPS_XZ;
+  if (axis.coordCode == 'X') return CHIME_MICROSTEPS_X;
+  if (axis.coordCode == 'Y') return CHIME_MICROSTEPS_Y;
+  return CHIME_MICROSTEPS_Z;
 }
 
 static int chimeCurrentMaFor(const Axis& axis) {
   return (axis.coordCode == 'Y') ? CHIME_CURRENT_MA_Y : CHIME_CURRENT_MA_XZ;
 }
 
-static void setChimeDriverMode(Axis& axis, bool chimeActive) {
-  if (chimeActive) {
+static bool isValidMicrostepDiv(int ms) {
+  return ms >= 1 && ms <= 256 && (ms & (ms - 1)) == 0;
+}
+
+static bool enterChimeDriverMode(Axis& axis, int microstepsOverride = -1, int currentMaOverride = -1) {
+  int ms = isValidMicrostepDiv(microstepsOverride) ? microstepsOverride : chimeMicrostepsFor(axis);
+  // TMCStepper::microsteps() maps 0 -> mres(8) (1x full step); microsteps(1) is a no-op!
+  uint16_t tmcMs = (ms <= 1) ? 0 : (uint16_t)ms;
+  int currMa = (currentMaOverride > 0) ? constrain(currentMaOverride, 100, 950) : chimeCurrentMaFor(axis);
+
+  for (int attempt = 0; attempt < 4; attempt++) {
+    while (TMCSerial.available()) TMCSerial.read();
+    uint8_t gstat = axis.driver->GSTAT();
+    if (!axis.driver->CRCerror && (gstat & 0x01)) {
+      axis.driver->GSTAT(0x07);
+      axis.driver->begin();
+    }
+
+    uint8_t ifcntBefore = axis.driver->IFCNT();
     axis.driver->SGTHRS(0);
     axis.driver->en_spreadCycle(true);   // Crisp hysteresis current chopping for audible tones
     axis.driver->intpol(false);          // Disable 256x interpolation so step edges ring cleanly
-    axis.driver->microsteps(chimeMicrostepsFor(axis));
-    axis.driver->rms_current(chimeCurrentMaFor(axis), 1.0f); // Boost current + keep full hold across rests
-  } else {
-    restoreAxisFromChime(axis);
+    axis.driver->microsteps(tmcMs);
+    axis.driver->rms_current(currMa, 1.0f); // Boost current + keep full hold across rests
+    delay(3);
+
+    uint8_t ifcntAfter = axis.driver->IFCNT();
+    bool spreadOk = axis.driver->en_spreadCycle() && !axis.driver->CRCerror;
+    bool intpolOk = !axis.driver->intpol() && !axis.driver->CRCerror;
+    bool msOk     = (axis.driver->microsteps() == tmcMs) && !axis.driver->CRCerror;
+    if (ifcntAfter != ifcntBefore && spreadOk && intpolOk && msOk) {
+      return true;
+    }
+    delay(5);
   }
+  return false;
 }
 
 static bool pollChimeCancelOrQueue() {
@@ -1798,15 +2440,64 @@ static bool pollChimeCancelOrQueue() {
   return true;
 }
 
-static int chooseChimeSegmentDir(int awayDir, long netSteps, float freqHz, unsigned long durationMs) {
-  if (freqHz <= 1.0f) return awayDir;
-  long segSteps = lroundf(freqHz * ((float)durationMs / 1000.0f));
-  // Only reverse back toward the origin stop if we have >= segSteps of headroom,
-  // guaranteeing netSteps never crosses 0 into a mechanical stop.
-  if (awayDir > 0) {
-    return (netSteps >= segSteps) ? -1 : 1;
+static float chimeSegFreqForAxis(const ChimeSegment& seg, int axisIdx) {
+  if (axisIdx == 0) return seg.freqXHz;
+  if (axisIdx == 1) return seg.freqYHz;
+  return seg.freqZHz;
+}
+
+static long chimePhraseSteps(
+    const ChimeSegment* seq,
+    unsigned int count,
+    unsigned int startIdx,
+    int axisIdx
+) {
+  float prevF = chimeSegFreqForAxis(seq[startIdx], axisIdx);
+  if (prevF <= 1.0f) return 0;
+  unsigned long prevMs = seq[startIdx].durationMs;
+  long total = lroundf(prevF * ((float)prevMs / 1000.0f));
+  for (unsigned int j = startIdx + 1; j < count; j++) {
+    float fj = chimeSegFreqForAxis(seq[j], axisIdx);
+    unsigned long mj = seq[j].durationMs;
+    if (fj <= 1.0f) break;
+    bool isScoopFollow = (prevMs <= 30UL && prevF > 1.0f);
+    bool isSameFreq = (fabsf(fj - prevF) < 0.5f);
+    if (!isScoopFollow && !isSameFreq) break;
+    total += lroundf(fj * ((float)mj / 1000.0f));
+    prevF = fj;
+    prevMs = mj;
   }
-  return (-netSteps >= segSteps) ? 1 : -1;
+  return total;
+}
+
+static int resolveChimeAxisDir(
+    const ChimeSegment* seq,
+    unsigned int count,
+    unsigned int idx,
+    int axisIdx,
+    int awayDir,
+    long netSteps,
+    int lastDir,
+    float prevFreq,
+    unsigned long prevDurMs,
+    long maxSafeOffsetSteps
+) {
+  float f = chimeSegFreqForAxis(seq[idx], axisIdx);
+  if (f <= 1.0f) return awayDir;
+  bool isScoopFollow = (prevDurMs <= 30UL && prevFreq > 1.0f);
+  if (isScoopFollow) return lastDir;
+
+  // Include grouped continuations when checking headroom so netSteps never crosses 0.
+  long groupSteps = chimePhraseSteps(seq, count, idx, axisIdx);
+  long awayProgress = netSteps * (long)awayDir;
+  bool isSameFreq = (fabsf(f - prevFreq) < 0.5f);
+  if (isSameFreq) {
+    if (labs(netSteps + (long)lastDir * groupSteps) > maxSafeOffsetSteps && awayProgress >= groupSteps) {
+      return -awayDir;
+    }
+    return lastDir;
+  }
+  return (awayProgress >= groupSteps) ? -awayDir : awayDir;
 }
 
 static void pulseChimeStep(int stepPin) {
@@ -1822,61 +2513,127 @@ static bool stepChimeSegment(
     long& netStepsZ,
     bool& cancelled
 ) {
-  digitalWrite(PIN_DIR_1, seg.dirX >= 0 ? HIGH : LOW);
-  digitalWrite(PIN_DIR_2, seg.dirY >= 0 ? HIGH : LOW);
-  digitalWrite(PIN_DIR_3, seg.dirZ >= 0 ? HIGH : LOW);
+  initStepTimer();
+  if (stepTimer != nullptr) {
+    timerStop(stepTimer);
+  }
+
+  const float freqs[NUM_AXES] = { seg.freqXHz, seg.freqYHz, seg.freqZHz };
+  const int   dirs[NUM_AXES]  = { seg.dirX,    seg.dirY,    seg.dirZ };
+
+  bool anyActive = false;
+  for (int i = 0; i < NUM_AXES; i++) {
+    digitalWrite(axes[i].dirPin, (dirs[i] >= 0) ? HIGH : LOW);
+    if (freqs[i] > 1.0f) anyActive = true;
+  }
   delayMicroseconds(5);
 
-  unsigned long periodXUs = (seg.freqXHz > 1.0f) ? (unsigned long)lroundf(1000000.0f / seg.freqXHz) : 0UL;
-  unsigned long periodYUs = (seg.freqYHz > 1.0f) ? (unsigned long)lroundf(1000000.0f / seg.freqYHz) : 0UL;
-  unsigned long periodZUs = (seg.freqZHz > 1.0f) ? (unsigned long)lroundf(1000000.0f / seg.freqZHz) : 0UL;
+  portENTER_CRITICAL(&stepMux);
+  for (int i = 0; i < NUM_AXES; i++) {
+    isrAxes[i].curPos    = 0;
+    isrAxes[i].dir       = (dirs[i] >= 0) ? 1 : -1;
+    isrAxes[i].targetPos = (long)isrAxes[i].dir * 2000000L;
+    isrAxes[i].stepPin   = axes[i].stepPin;
+    isrAxes[i].ddsPhase  = 0xFFFFFFFFUL;
+    isrAxes[i].ddsInc    = (freqs[i] > 1.0f) ? speedToDdsInc(freqs[i]) : 0UL;
+    isrAxes[i].active    = (freqs[i] > 1.0f);
+  }
+  portEXIT_CRITICAL(&stepMux);
 
-  unsigned long startMs = millis();
-  unsigned long nowUs = micros();
-  unsigned long nextXUs = nowUs;
-  unsigned long nextYUs = nowUs;
-  unsigned long nextZUs = nowUs;
-  unsigned long lastWdtYieldMs = startMs;
+  unsigned long startUs = micros();
+  unsigned long durUs = seg.durationMs * 1000UL;
+  unsigned long lastWdtYieldMs = millis();
 
-  while (millis() - startMs < seg.durationMs) {
+  if (anyActive && stepTimer != nullptr) {
+    timerRestart(stepTimer);
+    timerStart(stepTimer);
+  }
+
+  while ((unsigned long)(micros() - startUs) < durUs) {
     yieldWdt(lastWdtYieldMs);
     if (pollChimeCancelOrQueue()) {
       cancelled = true;
-      return false;
+      break;
     }
-
-    nowUs = micros();
-    if (periodXUs > 0 && (long)(nowUs - nextXUs) >= 0) {
-      pulseChimeStep(PIN_STEP_1);
-      netStepsX += (seg.dirX >= 0) ? 1L : -1L;
-      nextXUs += periodXUs;
-    }
-    if (periodYUs > 0 && (long)(nowUs - nextYUs) >= 0) {
-      pulseChimeStep(PIN_STEP_2);
-      netStepsY += (seg.dirY >= 0) ? 1L : -1L;
-      nextYUs += periodYUs;
-    }
-    if (periodZUs > 0 && (long)(nowUs - nextZUs) >= 0) {
-      pulseChimeStep(PIN_STEP_3);
-      netStepsZ += (seg.dirZ >= 0) ? 1L : -1L;
-      nextZUs += periodZUs;
-    }
+    delayMicroseconds(250);
   }
-  return true;
+
+  if (stepTimer != nullptr) {
+    timerStop(stepTimer);
+  }
+  portENTER_CRITICAL(&stepMux);
+  for (int i = 0; i < NUM_AXES; i++) {
+    isrAxes[i].active = false;
+  }
+  long dx = isrAxes[0].curPos;
+  long dy = isrAxes[1].curPos;
+  long dz = isrAxes[2].curPos;
+  isrAxes[0].curPos = 0;
+  isrAxes[1].curPos = 0;
+  isrAxes[2].curPos = 0;
+  portEXIT_CRITICAL(&stepMux);
+
+  netStepsX += dx;
+  netStepsY += dy;
+  netStepsZ += dz;
+  return !cancelled;
 }
 
-static bool returnChimeOffsetSilently(long netStepsX, long netStepsY, long netStepsZ) {
-  // Drop back to normal run currents while keeping chime microsteps so step counts match,
-  // then unwind the musical displacement cleanly back to the exact starting microstep before
-  // StealthChop + regular microstepping/interpolation are restored at standstill.
-  for (int i = 0; i < NUM_AXES; i++) {
-    axes[i].driver->rms_current(axes[i].currentMa, axisHoldMultiplier(axes[i]));
-  }
-  delay(10);
+static bool enterSilentUnwindMode(Axis& axis, const SavedAxisSnapshot& snap, int chimeMs) {
+  uint16_t tmcMs = (chimeMs <= 1) ? 0 : (uint16_t)chimeMs;
+  for (int attempt = 0; attempt < 4; attempt++) {
+    while (TMCSerial.available()) TMCSerial.read();
+    uint8_t gstat = axis.driver->GSTAT();
+    if (!axis.driver->CRCerror && (gstat & 0x01)) {
+      axis.driver->GSTAT(0x07);
+      axis.driver->begin();
+    }
 
+    uint8_t ifcntBefore = axis.driver->IFCNT();
+    if (snap.hasRegs) {
+      axis.driver->GCONF(snap.gconf);      // Restores StealthChop (en_spreadCycle=0), shaft, etc.
+      axis.driver->PWMCONF(snap.pwmconf);  // Restores StealthChop autotuned PWM settings
+    } else {
+      axis.driver->en_spreadCycle(false);
+    }
+    axis.driver->intpol(true);             // 256x MicroPlyer smoothing during silent unwind
+    axis.driver->microsteps(tmcMs);        // Keep chime step size so netSteps unwinds 1:1
+    axis.driver->rms_current(axis.currentMa, axisHoldMultiplier(axis));
+    delay(3);
+
+    uint8_t ifcntAfter = axis.driver->IFCNT();
+    bool stealthOk = !axis.driver->en_spreadCycle() && !axis.driver->CRCerror;
+    bool intpolOk  = axis.driver->intpol() && !axis.driver->CRCerror;
+    bool msOk      = (axis.driver->microsteps() == tmcMs) && !axis.driver->CRCerror;
+    if (ifcntAfter != ifcntBefore && stealthOk && intpolOk && msOk) {
+      return true;
+    }
+    delay(5);
+  }
+  return false;
+}
+
+static bool returnChimeOffsetSilently(
+    long netStepsX,
+    long netStepsY,
+    long netStepsZ,
+    const SavedAxisSnapshot snapshots[NUM_AXES],
+    const int chimeMs[NUM_AXES]
+) {
   long remX = labs(netStepsX);
   long remY = labs(netStepsY);
   long remZ = labs(netStepsZ);
+  if (remX == 0 && remY == 0 && remZ == 0) {
+    return true;
+  }
+
+  // Revert to quiet StealthChop + 256x interpolation and normal run current BEFORE jogging back,
+  // while keeping chime microstep resolution so netSteps unwinds to the exact starting microstep.
+  if (remX > 0) enterSilentUnwindMode(axes[0], snapshots[0], chimeMs[0]);
+  if (remY > 0) enterSilentUnwindMode(axes[1], snapshots[1], chimeMs[1]);
+  if (remZ > 0) enterSilentUnwindMode(axes[2], snapshots[2], chimeMs[2]);
+  delay(15);
+
   digitalWrite(PIN_DIR_1, (netStepsX > 0) ? LOW : HIGH);
   digitalWrite(PIN_DIR_2, (netStepsY > 0) ? LOW : HIGH);
   digitalWrite(PIN_DIR_3, (netStepsZ > 0) ? LOW : HIGH);
@@ -1900,9 +2657,214 @@ static bool returnChimeOffsetSilently(long netStepsX, long netStepsY, long netSt
       pulseChimeStep(PIN_STEP_3);
       remZ--;
     }
-    delayMicroseconds(2000);
+    delayMicroseconds(3000);
   }
   return true;
+}
+
+void handleTuneGcode(String params) {
+  params.trim();
+  params.toUpperCase();
+  if (checkHardwareEstop()) {
+    setRelayOutput(false, "hardware estop");
+    Serial.println("ERR:ESTOP");
+    return;
+  }
+  if (!ensureDriversReady()) {
+    Serial.println("ERR:TMC_NOT_READY");
+    return;
+  }
+
+  // Parse positional whitespace tokens: TUNE <X|Y|Z|ALL> <Hz> [ms] [ms_div] [current_mA]
+  String toks[5];
+  int tokCount = 0;
+  int pos = 0;
+  while (pos < (int)params.length() && tokCount < 5) {
+    while (pos < (int)params.length() && isSpace(params.charAt(pos))) pos++;
+    if (pos >= (int)params.length()) break;
+    int end = pos;
+    while (end < (int)params.length() && !isSpace(params.charAt(end))) end++;
+    toks[tokCount++] = params.substring(pos, end);
+    pos = end;
+  }
+
+  if (tokCount < 2) {
+    Serial.println("ERR:USAGE_TUNE_<X|Y|Z|ALL>_<HZ>_[MS]_[MS_DIV]_[MA]");
+    return;
+  }
+
+  bool activeMask[NUM_AXES] = { false, false, false };
+  if (toks[0] == "X" || toks[0] == "S1")      activeMask[0] = true;
+  else if (toks[0] == "Y" || toks[0] == "S2") activeMask[1] = true;
+  else if (toks[0] == "Z" || toks[0] == "S3") activeMask[2] = true;
+  else if (toks[0] == "ALL") {
+    activeMask[0] = activeMask[1] = activeMask[2] = true;
+  } else {
+    Serial.println("ERR:BAD_AXIS");
+    return;
+  }
+
+  float freqHz = constrain(toks[1].toFloat(), 50.0f, 3000.0f);
+  unsigned long durationMs = (tokCount >= 3) ? (unsigned long)constrain(toks[2].toInt(), 100L, 8000L) : 2000UL;
+  int reqMsDiv = (tokCount >= 4) ? toks[3].toInt() : -1;
+  if (reqMsDiv > 0 && !isValidMicrostepDiv(reqMsDiv)) {
+    Serial.println("ERR:BAD_MICROSTEPS");
+    return;
+  }
+  int reqCurrMa = (tokCount >= 5) ? toks[4].toInt() : -1;
+
+  SavedAxisSnapshot snapshots[NUM_AXES];
+  for (int i = 0; i < NUM_AXES; i++) {
+    captureAxisSnapshot(axes[i], snapshots[i]);
+    axes[i].driver->GSTAT(0x07);
+  }
+
+  estopLatched = false;
+  for (int i = 0; i < NUM_AXES; i++) {
+    if (activeMask[i]) {
+      enterChimeDriverMode(axes[i], reqMsDiv, reqCurrMa);
+    }
+  }
+  delay(10);
+
+  long netSteps[NUM_AXES] = { 0, 0, 0 };
+  int tuneMs[NUM_AXES] = { chimeMicrostepsFor(axes[0]), chimeMicrostepsFor(axes[1]), chimeMicrostepsFor(axes[2]) };
+  int awayDir[NUM_AXES] = { 1, 1, 1 };
+  int curDir[NUM_AXES] = { 1, 1, 1 };
+  long maxExcursionSteps[NUM_AXES] = { 0, 0, 0 };
+  for (int i = 0; i < NUM_AXES; i++) {
+    if (!activeMask[i]) continue;
+    int effMs = (reqMsDiv > 0) ? reqMsDiv : chimeMicrostepsFor(axes[i]);
+    tuneMs[i] = effMs;
+    float tuneStepsPerMm = (MOTOR_FULL_STEPS_REV * (float)effMs) / axes[i].mmPerRev;
+    float curMm = (float)snapshots[i].stepperPos / axes[i].stepsPerMm;
+    float safeExcursionMm = (i == 1) ? 16.0f : 10.0f;
+    if (axes[i].homed) {
+      float headPlus  = max(0.0f, axes[i].maxTravelMm - curMm - 5.0f);
+      float headMinus = max(0.0f, curMm - 5.0f);
+      if (headPlus >= headMinus) {
+        awayDir[i] = 1;
+        safeExcursionMm = min(30.0f, max(4.0f, headPlus));
+      } else {
+        awayDir[i] = -1;
+        safeExcursionMm = min(30.0f, max(4.0f, headMinus));
+      }
+    } else {
+      awayDir[i] = (curMm > axes[i].maxTravelMm - 8.0f) ? -1 : 1;
+    }
+    curDir[i] = awayDir[i];
+    maxExcursionSteps[i] = max(20L, lroundf(safeExcursionMm * tuneStepsPerMm));
+    digitalWrite(axes[i].dirPin, (curDir[i] >= 0) ? HIGH : LOW);
+  }
+  delayMicroseconds(5);
+
+  initStepTimer();
+  if (stepTimer != nullptr) timerStop(stepTimer);
+  uint32_t ddsInc = speedToDdsInc(freqHz);
+  portENTER_CRITICAL(&stepMux);
+  for (int i = 0; i < NUM_AXES; i++) {
+    isrAxes[i].curPos    = 0;
+    isrAxes[i].dir       = curDir[i];
+    isrAxes[i].targetPos = (long)curDir[i] * maxExcursionSteps[i];
+    isrAxes[i].stepPin   = axes[i].stepPin;
+    isrAxes[i].ddsPhase  = 0xFFFFFFFFUL;
+    isrAxes[i].ddsInc    = ddsInc;
+    isrAxes[i].active    = activeMask[i];
+  }
+  portEXIT_CRITICAL(&stepMux);
+
+  bool cancelled = false;
+  unsigned long startUs = micros();
+  unsigned long durUs = durationMs * 1000UL;
+  unsigned long lastWdtYieldMs = millis();
+
+  if (stepTimer != nullptr) {
+    timerRestart(stepTimer);
+    timerStart(stepTimer);
+  }
+
+  while ((unsigned long)(micros() - startUs) < durUs) {
+    yieldWdt(lastWdtYieldMs);
+    if (pollChimeCancelOrQueue()) {
+      cancelled = true;
+      break;
+    }
+
+    // Safely bounce direction only if single-sweep excursion limit is reached
+    for (int i = 0; i < NUM_AXES; i++) {
+      if (!activeMask[i]) continue;
+      bool hitLimit = false;
+      long stepDelta = 0;
+      portENTER_CRITICAL(&stepMux);
+      if (!isrAxes[i].active && isrAxes[i].curPos == isrAxes[i].targetPos) {
+        stepDelta = isrAxes[i].curPos;
+        isrAxes[i].curPos = 0;
+        hitLimit = true;
+      }
+      portEXIT_CRITICAL(&stepMux);
+
+      if (hitLimit) {
+        netSteps[i] += stepDelta;
+        curDir[i] = -curDir[i];
+        digitalWrite(axes[i].dirPin, (curDir[i] >= 0) ? HIGH : LOW);
+        delayMicroseconds(5);
+        long nextTarget = (curDir[i] == awayDir[i])
+            ? ((long)awayDir[i] * maxExcursionSteps[i] - netSteps[i])
+            : -netSteps[i];
+        if (nextTarget == 0) nextTarget = (long)curDir[i] * maxExcursionSteps[i];
+        portENTER_CRITICAL(&stepMux);
+        isrAxes[i].dir       = curDir[i];
+        isrAxes[i].targetPos = nextTarget;
+        isrAxes[i].active    = true;
+        portEXIT_CRITICAL(&stepMux);
+      }
+    }
+    delayMicroseconds(250);
+  }
+
+  if (stepTimer != nullptr) timerStop(stepTimer);
+  portENTER_CRITICAL(&stepMux);
+  for (int i = 0; i < NUM_AXES; i++) {
+    isrAxes[i].active = false;
+    netSteps[i] += isrAxes[i].curPos;
+    isrAxes[i].curPos = 0;
+  }
+  portEXIT_CRITICAL(&stepMux);
+
+  if (cancelled && estopLatched) {
+    sleepAll();
+    setRelayOutput(false);
+    Serial.println("ERR:ESTOP");
+    return;
+  }
+
+  for (int i = 0; i < NUM_AXES; i++) {
+    if (!activeMask[i]) continue;
+    uint16_t msRead = axes[i].driver->microsteps();
+    Serial.print("TUNE "); Serial.print(axes[i].coordCode);
+    Serial.print(" HZ:"); Serial.print(freqHz, 2);
+    Serial.print(" MS:"); Serial.print(msRead == 0 ? 1 : (int)msRead);
+    Serial.print(" SPREAD:"); Serial.print(axes[i].driver->en_spreadCycle());
+    Serial.print(" INTPOL:"); Serial.print(axes[i].driver->intpol());
+    Serial.print(" IRUN:"); Serial.print(axes[i].driver->irun());
+    Serial.print(" VSENSE:"); Serial.print(axes[i].driver->vsense());
+    Serial.print(" NET:"); Serial.println(netSteps[i]);
+  }
+
+  if (!returnChimeOffsetSilently(netSteps[0], netSteps[1], netSteps[2], snapshots, tuneMs)) {
+    sleepAll();
+    setRelayOutput(false);
+    Serial.println("ERR:ESTOP");
+    return;
+  }
+
+  for (int i = 0; i < NUM_AXES; i++) {
+    if (!activeMask[i]) continue;
+    syncAxisPosition(axes[i], snapshots[i].stepperPos);
+    restoreAxisSnapshot(axes[i], snapshots[i]);
+  }
+  delay(max(DRIVER_ENABLE_SETTLE_MS, 250UL));
+  Serial.println(cancelled ? "ERR:CANCELLED" : "OK");
 }
 
 void handleChimeGcode(String params, bool emitProtocolReply) {
@@ -1929,45 +2891,34 @@ void handleChimeGcode(String params, bool emitProtocolReply) {
   float curYMm = (float)axes[1].stepper->currentPosition() / axes[1].stepsPerMm;
   float curZMm = (float)axes[2].stepper->currentPosition() / axes[2].stepsPerMm;
 
-  // Safe directions pointing away from the nearest mechanical stop
-  int awayX = (curXMm > TRAVEL_X_MM - 8.0f) ? -1 : 1;
-  int awayY = (curYMm > TRAVEL_Y_MM - 8.0f) ? -1 : 1;
-  int awayZ = (curZMm > TRAVEL_Z_MM - 8.0f) ? -1 : 1;
+  // Safe directions pointing away from the closer mechanical stop
+  int awayX = (curXMm > TRAVEL_X_MM * 0.5f) ? -1 : 1;
+  int awayY = (curYMm > TRAVEL_Y_MM * 0.5f) ? -1 : 1;
+  int awayZ = (curZMm > TRAVEL_Z_MM * 0.5f) ? -1 : 1;
 
-  estopLatched = false;
-  for (int i = 0; i < NUM_AXES; i++) {
-    setChimeDriverMode(axes[i], true);
-  }
-  delay(10);
-
-  long netStepsX = 0;
-  long netStepsY = 0;
-  long netStepsZ = 0;
-  bool cancelled = false;
-
-  // Windows 3.1 "Tada!" (3-voice: X + Z upper dyad, Y octave/root bass)
+  // Calibrated 2-voice arrangements (X @ 4x = 1:1 treble/melody, Z @ 1x = 1:1 bass/harmony, Y muted):
+  // Windows 3.1 "Tada!" (same C6+E4 brass chord repeated twice with 22ms lip-up attack, second sustains longer)
   const ChimeSegment tada[] = {
-    { 392.00f, 196.00f,   0.00f, 130UL, 0, 0, 0 }, // "Ta-" (G4 + G3)
-    {   0.00f,   0.00f,   0.00f,  25UL, 0, 0, 0 }, // crisp rest
-    { 523.25f, 261.63f, 659.25f, 560UL, 0, 0, 0 }, // "-DAAA!" (C5 + C4 + E5)
+    {  995.00f, 0.00f, 314.00f,   22UL, 0, 0, 0 }, // brass attack scoop into C6+E4
+    { 1046.50f, 0.00f, 329.63f,   73UL, 0, 0, 0 }, // "Ta-" (C6 + E4 short burst)
+    {    0.00f, 0.00f,   0.00f,   30UL, 0, 0, 0 }, // crisp articulation breath
+    {  995.00f, 0.00f, 314.00f,   22UL, 0, 0, 0 }, // matching brass attack scoop into C6+E4
+    { 1046.50f, 0.00f, 329.63f, 1020UL, 0, 0, 0 }, // "-DAAA!" (C6 + E4 sustained burst)
   };
 
-  // Windows 95 Startup Theme ("The Microsoft Sound", Eb major / Abmaj9 -> Eb)
+  // Windows 95 Startup Theme ("The Microsoft Sound", spectral transcription at original A4=428.5Hz pitch)
   const ChimeSegment win95[] = {
-    { 622.25f, 311.13f, 466.16f, 200UL, 0, 0, 0 }, // Eb5 + Eb4 + Bb4
-    {   0.00f,   0.00f,   0.00f,  20UL, 0, 0, 0 },
-    { 466.16f, 311.13f, 392.00f, 175UL, 0, 0, 0 }, // Bb4 + Eb4 + G4
-    {   0.00f,   0.00f,   0.00f,  20UL, 0, 0, 0 },
-    { 415.30f, 207.65f, 622.25f, 175UL, 0, 0, 0 }, // Ab4 + Ab3 + Eb5
-    {   0.00f,   0.00f,   0.00f,  20UL, 0, 0, 0 },
-    { 622.25f, 207.65f, 523.25f, 460UL, 0, 0, 0 }, // Eb5 + Ab3 + C5 (Abmaj9)
-    {   0.00f,   0.00f,   0.00f,  25UL, 0, 0, 0 },
-    { 466.16f, 233.08f, 349.23f, 190UL, 0, 0, 0 }, // Bb4 + Bb3 + F4
-    {   0.00f,   0.00f,   0.00f,  20UL, 0, 0, 0 },
-    { 698.46f, 233.08f, 466.16f, 320UL, 0, 0, 0 }, // F5 + Bb3 + Bb4 (Bbsus)
-    {   0.00f,   0.00f,   0.00f,  20UL, 0, 0, 0 },
-    { 622.25f, 311.13f, 392.00f, 525UL, 0, 0, 0 }, // Eb5 + Eb4 + G4 (hold pt 1)
-    { 622.25f, 311.13f, 392.00f, 525UL, 0, 0, 0 }, // Eb5 + Eb4 + G4 (hold pt 2)
+    {  764.40f, 0.00f, 169.50f,  880UL, 0, 0, 0 }, // G5 bell + F3 bass drone (0.00-0.88s)
+    { 1145.00f, 0.00f, 254.50f,  100UL, 0, 0, 0 }, // D6 bell leap + C4 chord swell
+    { 1145.00f, 0.00f, 301.50f,  100UL, 0, 0, 0 }, // D6 (cont) + Eb4 chord bloom
+    { 1145.00f, 0.00f, 340.30f,  910UL, 0, 0, 0 }, // D6 (cont) + F4 warm hold
+    { 1018.50f, 0.00f, 340.30f,  330UL, 0, 0, 0 }, // C6 echo ping 1 + F4 sustain
+    {    0.00f, 0.00f, 254.50f,  510UL, 0, 0, 0 }, // C4 pad sustain between pings
+    { 1018.50f, 0.00f, 340.30f,  330UL, 0, 0, 0 }, // C6 echo ping 2 + F4 sustain
+    {    0.00f, 0.00f, 254.50f,  510UL, 0, 0, 0 }, // C4 pad sustain between pings
+    { 1018.50f, 0.00f, 340.30f,  330UL, 0, 0, 0 }, // C6 echo ping 3 + F4 sustain
+    {    0.00f, 0.00f, 254.50f,  510UL, 0, 0, 0 }, // C4 pad sustain between pings
+    { 1018.50f, 0.00f, 340.30f,  850UL, 0, 0, 0 }, // C6 echo ping 4 + F4 (longer final ring)
   };
 
   const bool isWin95 = (params == "WIN95" || params == "95");
@@ -1976,11 +2927,40 @@ void handleChimeGcode(String params, bool emitProtocolReply) {
       ? (sizeof(win95) / sizeof(win95[0]))
       : (sizeof(tada) / sizeof(tada[0]));
 
+  bool usedMask[NUM_AXES] = { false, false, false };
+  for (unsigned int i = 0; i < count; i++) {
+    if (seq[i].freqXHz > 1.0f) usedMask[0] = true;
+    if (seq[i].freqYHz > 1.0f) usedMask[1] = true;
+    if (seq[i].freqZHz > 1.0f) usedMask[2] = true;
+  }
+
+  estopLatched = false;
+  for (int i = 0; i < NUM_AXES; i++) {
+    if (usedMask[i]) {
+      enterChimeDriverMode(axes[i]);
+    }
+  }
+  delay(10);
+
+  long netStepsX = 0;
+  long netStepsY = 0;
+  long netStepsZ = 0;
+  bool cancelled = false;
+
+  int lastDirX = awayX, lastDirY = awayY, lastDirZ = awayZ;
+  float prevFreqX = -1.0f, prevFreqY = -1.0f, prevFreqZ = -1.0f;
+  unsigned long prevDurMs = 0;
+  const long MAX_CHIME_OFFSET_X = 2500L; // 25.0 mm @ 4x
+  const long MAX_CHIME_OFFSET_Y = 800L;  // 20.0 mm @ 8x
+  const long MAX_CHIME_OFFSET_Z = 500L;  // 20.0 mm @ 1x
   for (unsigned int i = 0; i < count; i++) {
     ChimeSegment seg = seq[i];
-    seg.dirX = chooseChimeSegmentDir(awayX, netStepsX, seg.freqXHz, seg.durationMs);
-    seg.dirY = chooseChimeSegmentDir(awayY, netStepsY, seg.freqYHz, seg.durationMs);
-    seg.dirZ = chooseChimeSegmentDir(awayZ, netStepsZ, seg.freqZHz, seg.durationMs);
+    seg.dirX = resolveChimeAxisDir(seq, count, i, 0, awayX, netStepsX, lastDirX, prevFreqX, prevDurMs, MAX_CHIME_OFFSET_X);
+    seg.dirY = resolveChimeAxisDir(seq, count, i, 1, awayY, netStepsY, lastDirY, prevFreqY, prevDurMs, MAX_CHIME_OFFSET_Y);
+    seg.dirZ = resolveChimeAxisDir(seq, count, i, 2, awayZ, netStepsZ, lastDirZ, prevFreqZ, prevDurMs, MAX_CHIME_OFFSET_Z);
+    lastDirX = seg.dirX; lastDirY = seg.dirY; lastDirZ = seg.dirZ;
+    prevFreqX = seg.freqXHz; prevFreqY = seg.freqYHz; prevFreqZ = seg.freqZHz;
+    prevDurMs = seg.durationMs;
     if (!stepChimeSegment(seg, netStepsX, netStepsY, netStepsZ, cancelled)) {
       break;
     }
@@ -1993,7 +2973,12 @@ void handleChimeGcode(String params, bool emitProtocolReply) {
     return;
   }
 
-  if (!returnChimeOffsetSilently(netStepsX, netStepsY, netStepsZ)) {
+  int chimeMs[NUM_AXES] = {
+    chimeMicrostepsFor(axes[0]),
+    chimeMicrostepsFor(axes[1]),
+    chimeMicrostepsFor(axes[2])
+  };
+  if (!returnChimeOffsetSilently(netStepsX, netStepsY, netStepsZ, snapshots, chimeMs)) {
     sleepAll();
     setRelayOutput(false);
     if (emitProtocolReply) Serial.println("ERR:ESTOP");
@@ -2001,6 +2986,8 @@ void handleChimeGcode(String params, bool emitProtocolReply) {
   }
 
   for (int i = 0; i < NUM_AXES; i++) {
+    if (!usedMask[i]) continue;
+    syncAxisPosition(axes[i], snapshots[i].stepperPos);
     restoreAxisSnapshot(axes[i], snapshots[i]);
   }
   // Allow StealthChop AT#1 to calibrate cleanly at standstill using exact restored settings

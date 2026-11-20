@@ -74,7 +74,11 @@ class ESP32SerialBridge:
         self._abort_generation = 0
         self._last_activity_mono = time.monotonic()
         self.last_press_delta_g = 0.0
+        self.last_press_force_hit: bool = False
+        self.last_press_guard_hit: bool = False
+        self.last_tare_check_g: Optional[float] = None
         self._simulated_held_mass_g: Optional[float] = None
+        self._mock_press_obstacles: list[float] = []
 
     def _start_event_monitor(self) -> None:
         if self._monitor_thread is not None and self._monitor_thread.is_alive():
@@ -186,7 +190,7 @@ class ESP32SerialBridge:
         self._last_activity_mono = time.monotonic()
 
     def _open_and_reset_serial(self, port: str) -> None:
-        """Opens the serial port with short slice read timeout and resets the ESP32 into run mode."""
+        """Opens the serial port with short slice read timeout, resets ESP32, and waits for READY."""
         self._ser = serial.Serial(
             port=port,
             baudrate=self.config.serial_baud,
@@ -198,7 +202,21 @@ class ESP32SerialBridge:
         self._ser.rts = True
         time.sleep(0.15)
         self._ser.rts = False
-        time.sleep(1.0)
+        self._rx_buffer.clear()
+
+        boot_deadline = time.monotonic() + 3.0
+        while time.monotonic() < boot_deadline:
+            raw = self._read_serial_line()
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            self._handle_unsolicited_line(line)
+            if line == "READY":
+                break
+
+        time.sleep(0.05)
         self._ser.reset_input_buffer()
         self._rx_buffer.clear()
         self._last_activity_mono = time.monotonic()
@@ -228,9 +246,10 @@ class ESP32SerialBridge:
             self.send_command(
                 f"STEPS X{self.config.steps_per_mm_x:.2f} "
                 f"Y{self.config.steps_per_mm_y:.2f} "
-                f"Z{self.config.steps_per_mm_z:.2f}"
+                f"Z{self.config.steps_per_mm_z:.2f}",
+                timeout_s=5.0,
             )
-            self.send_command("SETUP")
+            self.send_command("SETUP", timeout_s=5.0)
             self._start_event_monitor()
         except Exception as exc:
             msg = str(exc)
@@ -625,10 +644,15 @@ class ESP32SerialBridge:
         max_press_mm: float,
         force_g: float,
         feedrate_mm_s: Optional[float] = None,
+        guard_force_g: Optional[float] = None,
+        guard_limit_z_mm: Optional[float] = None,
     ) -> float:
         """
         Gently presses the cube/end-effector downward into the floor or stack using
         HX711 compressive force feedback, strictly bounded by travel_z_max_mm.
+        When guard_force_g and guard_limit_z_mm are provided, the firmware monitors
+        early collisions with the sensitive guard threshold above guard_limit_z_mm before
+        switching to `force_g` for seating.
         """
         max_z = max(
             self.pose.z_mm,
@@ -637,14 +661,19 @@ class ESP32SerialBridge:
         press_f = max(1.0, float(self.config.feedrate_press_mm_s if feedrate_mm_s is None else feedrate_mm_s))
         req_force_g = max(0.0, float(force_g))
         dist = max(0.0, max_z - self.pose.z_mm)
-        timeout = max(self.config.serial_timeout_s, (dist / press_f) * 2.5 + 5.0)
+        timeout = max(self.config.serial_timeout_s, (dist / press_f) * 2.5 + 6.5)
+
+        cmd = f"PRESS Z{max_z:.2f} D{req_force_g:.1f} F{press_f:.1f}"
+        if guard_force_g is not None and guard_limit_z_mm is not None:
+            g_lim = max(self.pose.z_mm, min(max_z, float(guard_limit_z_mm)))
+            cmd += f" G{max(0.0, float(guard_force_g)):.1f} S{g_lim:.2f}"
 
         self.last_press_delta_g = 0.0
-        lines = self.send_command(
-            f"PRESS Z{max_z:.2f} D{req_force_g:.1f} F{press_f:.1f}",
-            timeout_s=timeout,
-        )
+        self.last_press_force_hit = False
+        self.last_press_guard_hit = False
+        lines = self.send_command(cmd, timeout_s=timeout)
         actual_z = max_z
+        saw_hit_token = False
         for line in reversed(lines):
             if line.startswith("PRESSED "):
                 for tok in line.split():
@@ -658,7 +687,14 @@ class ESP32SerialBridge:
                             self.last_press_delta_g = float(tok.split(":", 1)[1])
                         except ValueError:
                             pass
+                    elif tok.startswith("HIT:"):
+                        saw_hit_token = True
+                        self.last_press_force_hit = tok.split(":", 1)[1].strip() == "1"
+                    elif tok.startswith("GUARD:"):
+                        self.last_press_guard_hit = tok.split(":", 1)[1].strip() == "1"
                 break
+        if not saw_hit_token:
+            self.last_press_force_hit = abs(self.last_press_delta_g) > 0.5
         self.pose.z_mm = max(0.0, min(self.config.travel_z_max_mm, actual_z))
         self._notify_pose()
         return self.pose.z_mm
@@ -676,11 +712,21 @@ class ESP32SerialBridge:
 
     def tare_scale(self) -> None:
         """Zeroes the HX711 load cell offset before picking a block."""
-        self.send_command("TARE", timeout_s=4.0)
+        self.last_tare_check_g = None
+        lines = self.send_command("TARE", timeout_s=7.0)
+        for line in reversed(lines):
+            if line.startswith("TARED "):
+                for tok in line.split():
+                    if tok.startswith("CHECK:"):
+                        try:
+                            self.last_tare_check_g = float(tok.split(":", 1)[1])
+                        except ValueError:
+                            pass
+                break
 
     def weigh_block(self) -> float:
         """Samples the HX711 load cell and parses WEIGHT:<float> in grams."""
-        lines = self.send_command("WEIGH", timeout_s=4.0)
+        lines = self.send_command("WEIGH", timeout_s=5.0)
         for line in reversed(lines):
             if line.startswith("WEIGHT:"):
                 return float(line.split(":", 1)[1].strip())
@@ -734,15 +780,33 @@ class ESP32SerialBridge:
         if upper.startswith("PRESS"):
             tokens = upper.split()[1:]
             tz, tf = self.pose.z_mm, self.config.feedrate_press_mm_s
+            req_d = 55.0
+            guard_f: Optional[float] = None
+            guard_lim: Optional[float] = None
             for tok in tokens:
                 if tok.startswith("Z"):
                     tz = float(tok[1:])
+                elif tok.startswith("D"):
+                    req_d = float(tok[1:])
                 elif tok.startswith("F"):
                     tf = max(1.0, float(tok[1:]))
+                elif tok.startswith("G"):
+                    guard_f = float(tok[1:])
+                elif tok.startswith("S"):
+                    guard_lim = float(tok[1:])
+
+            obs_z = self._mock_press_obstacles.pop(0) if self._mock_press_obstacles else None
+            if obs_z is not None and obs_z < tz:
+                sim_z = max(self.pose.z_mm, min(tz, float(obs_z)))
+                has_guard = guard_f is not None and guard_lim is not None
+                guard_hit = 1 if (has_guard and sim_z < guard_lim) else 0
+                df = -(guard_f + 5.0) if (guard_hit and guard_f is not None) else -(req_d + 5.0)
+                self._animate_mock_move(self.pose.x_mm, self.pose.y_mm, sim_z, self.pose.angle_deg, tf)
+                return [f"PRESSED Z:{sim_z:.2f} DF:{df:.2f} HIT:1 GUARD:{guard_hit}"]
+
             sim_z = min(tz, max(self.pose.z_mm, tz - 1.5))
             self._animate_mock_move(self.pose.x_mm, self.pose.y_mm, sim_z, self.pose.angle_deg, tf)
-            self.last_press_delta_g = -36.0
-            return [f"PRESSED Z:{sim_z:.2f} DF:-36.00"]
+            return [f"PRESSED Z:{sim_z:.2f} DF:-58.00 HIT:1 GUARD:0"]
 
         if upper.startswith("GRIP"):
             time.sleep(0.12)
@@ -753,7 +817,7 @@ class ESP32SerialBridge:
 
         if upper == "TARE":
             time.sleep(0.1)
-            return []
+            return ["TARED OFFSET:0 CHECK:0.00 SPREAD:0.05"]
 
         if upper == "WEIGH":
             time.sleep(0.18)
