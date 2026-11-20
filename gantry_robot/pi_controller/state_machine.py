@@ -85,6 +85,8 @@ class GantryStateMachine:
         self._live_stream_enabled = True
         self._live_cv_enabled = False  # Eco stream mode by default in IDLE to save ~70% CPU on Pi Zero
         self._current_mass_g: Optional[float] = None
+        self._load_cell_error: Optional[str] = None
+        self._load_cell_seq: int = 0
         self._cmd_queue: queue.Queue = queue.Queue()
         self._cmd_thread: Optional[threading.Thread] = None
         self._latest_live_fiducials = []
@@ -146,6 +148,8 @@ class GantryStateMachine:
             "gantry_pose": self.serial.pose.to_dict(),
             "current_mass_g": mass_val,
             "mass_class": mass_cls,
+            "load_cell_error": self._load_cell_error,
+            "load_cell_seq": self._load_cell_seq,
             "steps_per_mm": {
                 "x": round(self.config.steps_per_mm_x, 2),
                 "y": round(self.config.steps_per_mm_y, 2),
@@ -182,6 +186,19 @@ class GantryStateMachine:
     def _on_pose_updated(self, pose: GantryPose) -> None:
         self.publish_telemetry()
 
+    def _set_mass_reading(self, mass_g: Optional[float], error: Optional[str] = None) -> None:
+        self._current_mass_g = mass_g
+        self._load_cell_error = error
+        self._load_cell_seq += 1
+
+    def _drain_cmd_queue(self) -> None:
+        while not self._cmd_queue.empty():
+            try:
+                self._cmd_queue.get_nowait()
+                self._cmd_queue.task_done()
+            except queue.Empty:
+                break
+
     def _activate_emergency_stop(self, reason: str, notify_esp32: bool) -> None:
         self._estop_active = True
         self._start_requested = False
@@ -189,12 +206,7 @@ class GantryStateMachine:
         if notify_esp32:
             self.serial.trigger_emergency_stop()
         self.log_event(reason)
-        while not self._cmd_queue.empty():
-            try:
-                self._cmd_queue.get_nowait()
-                self._cmd_queue.task_done()
-            except queue.Empty:
-                break
+        self._drain_cmd_queue()
         self.publish_telemetry()
 
     def _on_hardware_event(self, event_name: str) -> None:
@@ -211,8 +223,8 @@ class GantryStateMachine:
     def _on_user_command(self, cmd: str, data: dict) -> None:
         """
         Fast non-blocking command receiver called by the WebSocket server thread.
-        ESTOP is handled immediately for safety; all other motion and configuration
-        commands are queued to a background worker thread so the WebSocket server never blocks.
+        ESTOP and RESET unblock any waiting commands and drain stale queues immediately;
+        all other motion and configuration commands are queued sequentially.
         """
         if cmd == "EMERGENCY_STOP":
             self._activate_emergency_stop(
@@ -220,6 +232,26 @@ class GantryStateMachine:
                 notify_esp32=True,
             )
             return
+
+        if cmd == "RESET":
+            self._pause_requested = False
+            self._start_requested = False
+            self.serial.trigger_emergency_stop()
+            self._drain_cmd_queue()
+            self._cmd_queue.put((cmd, data))
+            return
+
+        if cmd in ("WEIGH_BLOCK", "SAMPLE_MASS", "TARE_SCALE"):
+            if self.state in ("CALIBRATING", "SCANNING", "PLANNING", "PICKING", "WEIGHING", "STACKING"):
+                self.log_event(f"Ignored manual {cmd} while cycle is active ({self.state}).")
+                self._set_mass_reading(self._current_mass_g, f"Busy ({self.state})")
+                self.publish_telemetry()
+                return
+
+        if cmd in ("WEIGH_BLOCK", "SAMPLE_MASS", "TARE_SCALE", "HOME_ALL", "START_SCAN"):
+            with self._cmd_queue.mutex:
+                if any(queued_cmd == cmd for queued_cmd, _ in self._cmd_queue.queue):
+                    return
 
         self._cmd_queue.put((cmd, data))
 
@@ -267,7 +299,7 @@ class GantryStateMachine:
             if self.mock_hardware:
                 self.vision.reset_simulated_course()
             self.planner.clear()
-            self._current_mass_g = None
+            self._set_mass_reading(None, None)
             self.state = "IDLE"
             self.log_event("System reset to IDLE and motors re-energized.")
         elif cmd == "HOME_ALL":
@@ -360,18 +392,20 @@ class GantryStateMachine:
         elif cmd == "TARE_SCALE":
             try:
                 self.serial.tare_scale()
-                self._current_mass_g = 0.00
+                self._set_mass_reading(0.00, None)
                 self.log_event("HX711 scale tared (zeroed) successfully.")
             except Exception as exc:
+                self._set_mass_reading(None, str(exc))
                 self.log_event(f"Tare scale failed: {exc}")
             self.publish_telemetry()
         elif cmd in ("WEIGH_BLOCK", "SAMPLE_MASS"):
             try:
                 measured = self.serial.weigh_block()
-                self._current_mass_g = round(measured, 2)
+                self._set_mass_reading(round(measured, 2), None)
                 cls = self.config.classify_mass(measured)
                 self.log_event(f"HX711 sample: {measured:.2f} g -> Class [{cls.upper()}].")
             except Exception as exc:
+                self._set_mass_reading(None, str(exc))
                 self.log_event(f"Weigh sample failed: {exc}")
             self.publish_telemetry()
         elif cmd == "RAW_SERIAL":
@@ -805,6 +839,27 @@ class GantryStateMachine:
         req_z_down = self.config.base_plate_z_down_mm - (max_top_z_up + clearance_margin_mm)
         return round(max(0.0, min(self.config.z_hover_mm, req_z_down)), 2)
 
+    def _press_cube_into_surface(
+        self,
+        surface_z_mm: float,
+        max_press_mm: float,
+        extra_unload_g: float = 0.0,
+        force_g: Optional[float] = None,
+    ) -> None:
+        """
+        Fast-descends just above the nominal surface, then presses into the floor/stack
+        until HX711 compressive force reaches threshold or max_press_mm is reached.
+        """
+        approach_z = max(0.0, float(surface_z_mm) - self.config.press_approach_offset_mm)
+        base_force_g = self.config.press_force_g if force_g is None else float(force_g)
+        self.serial.move_to(z_mm=approach_z, feedrate_mm_s=self.config.feedrate_z_mm_s)
+        self.serial.press_into_surface(
+            nominal_z_mm=surface_z_mm,
+            max_press_mm=max_press_mm,
+            force_g=base_force_g + max(0.0, float(extra_unload_g)),
+            feedrate_mm_s=self.config.feedrate_press_mm_s,
+        )
+
     def _execute_pick_weigh_and_stack(self, block: BlockRecord, can_stage: bool = True) -> Optional[int]:
         pick_record = PickActionRecord(
             block_id=block.id,
@@ -919,7 +974,7 @@ class GantryStateMachine:
             # Tare HX711 load cell before picking, open NC solenoid gripper (GRIP 0), descend, close (GRIP 1)
             try:
                 self.serial.tare_scale()
-                self._current_mass_g = 0.00
+                self._set_mass_reading(0.00, None)
                 pick_record.tare_success = True
             except Exception as exc:
                 pick_record.tare_success = False
@@ -931,7 +986,10 @@ class GantryStateMachine:
                     f"Topology [PICKING]: Block #{block.id} rests on raised aluminum platform -> picking at Z_down={pick_z_down:.2f} mm."
                 )
             self.serial.set_gripper(closed=False)  # Energize relay to open NC jaws
-            self.serial.move_to(z_mm=pick_z_down, feedrate_mm_s=self.config.feedrate_z_mm_s)
+            self._press_cube_into_surface(
+                surface_z_mm=pick_z_down,
+                max_press_mm=self.config.pick_press_max_mm,
+            )
             self.serial.set_gripper(closed=True)   # De-energize relay so NC solenoid grips block
 
             # Mark closest ground-truth block as picked in synthetic renderer if in mock mode
@@ -954,11 +1012,12 @@ class GantryStateMachine:
             self._check_pause_or_abort()
             try:
                 measured_mass_g = self.serial.weigh_block()
+                self._set_mass_reading(round(measured_mass_g, 2), None)
             except Exception as exc:
                 self.log_event(f"Notice: Load cell sample failed ({exc}); assigning default nominal mass 7.05g.")
                 measured_mass_g = 7.05
+                self._set_mass_reading(round(measured_mass_g, 2), str(exc))
 
-            self._current_mass_g = round(measured_mass_g, 2)
             block.mass_g = measured_mass_g
             block.mass_class = self.config.classify_mass(measured_mass_g)
             block.status = "WEIGHED"
@@ -1048,8 +1107,13 @@ class GantryStateMachine:
                 angle_deg=self.kinematics.servo_angle_for_plate_angle(0.0),
                 feedrate_mm_s=self.config.feedrate_travel_mm_s,
             )
-            self.serial.move_to(z_mm=drop_z_down, feedrate_mm_s=self.config.feedrate_z_mm_s)
-            self.serial.set_gripper(closed=False)  # Release block
+            self._press_cube_into_surface(
+                surface_z_mm=drop_z_down,
+                max_press_mm=self.config.drop_press_max_mm,
+                extra_unload_g=max(0.0, float(block.mass_g or 0.0)),
+                force_g=self.config.drop_press_force_g,
+            )
+            self.serial.set_gripper(closed=False)  # Release block while seated on surface
             self.serial.set_simulated_held_mass(None)
             if staged_blocker_id is None:
                 self.planner.commit_stack_placement(zone_key)
@@ -1057,7 +1121,7 @@ class GantryStateMachine:
             post_drop_z_down = min(self._safe_transit_z_down(), max(0.0, drop_z_down - 10.0))
             self.serial.move_to(z_mm=post_drop_z_down, feedrate_mm_s=self.config.feedrate_z_mm_s)
             self.serial.set_gripper(closed=True)   # Return NC solenoid to de-energized rest state
-            self._current_mass_g = 0.00
+            self._set_mass_reading(0.00, None)
 
             block.x_mm = drop_plate_x
             block.y_mm = drop_plate_y

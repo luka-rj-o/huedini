@@ -35,8 +35,8 @@ CAD_MOTOR_Y = 70.0
 CAD_MOTOR_Z = 0.0
 
 EE_PIVOT_THREE = (-96.6, 106.5, 14.7 - 16.2)  # (-96.6, 106.5, -1.5)
-# Exact physical front camera lens pocket of Load Cell Bracket (Node 153) inside yStageGroup:
-CAM_LOCAL_THREE = (-95.6, 120.5, -58.5)
+# Exact physical circular camera bore on bottom face of Load Cell Bracket inside yStageGroup:
+CAM_LOCAL_THREE = (-95.63, 120.86, -40.73)
 
 # Saturation-boosted palette overrides for washed-out pastel Onshape PLA colors
 MATERIAL_COLOR_OVERRIDES = {

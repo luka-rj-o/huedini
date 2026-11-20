@@ -124,6 +124,8 @@ let drawGripFactor = 1.0; // 1 = closed, 0 = open
 
 let sandboxPreviewActive = false;
 let lastHwPoseSig = "";
+let massSamplePending = false;
+let massPendingSeq = -1;
 
 let socket = null;
 let latestState = {
@@ -131,6 +133,8 @@ let latestState = {
   gantry_pose: { x_mm: 0.0, y_mm: 0.0, z_mm: 0.0, angle_deg: 0.0, grip_closed: true },
   current_mass_g: null,
   mass_class: null,
+  load_cell_error: null,
+  load_cell_seq: 0,
   calibration: { calibrated: false, kx_mm_per_px: 0.25, ky_mm_per_px: 0.25 },
   steps_per_mm: { x: 200.0, y: 10.0, z: 50.0 },
   blocks: [],
@@ -415,13 +419,17 @@ function highlightMassBin(cls) {
 }
 
 function sendTareCmd() {
+  massSamplePending = true;
+  massPendingSeq = latestState.load_cell_seq ?? 0;
   setText("liveMassReadout", "0.00");
-  setMassPill("Tared", "pill-dim");
+  setMassPill("Taring", "pill-accent");
   highlightMassBin(null);
   sendCmd("TARE_SCALE");
 }
 
 function sendWeighCmd() {
+  massSamplePending = true;
+  massPendingSeq = latestState.load_cell_seq ?? 0;
   setText("liveMassReadout", "…");
   setMassPill("Sampling", "pill-accent");
   sendCmd("WEIGH_BLOCK");
@@ -551,20 +559,31 @@ function updateUI(data, prevState) {
   syncSlidersFromState();
   updateReadoutsFromMotor();
 
-  if (data.current_mass_g !== undefined && data.current_mass_g !== null) {
-    setText("liveMassReadout", Number(data.current_mass_g).toFixed(2));
-    const cls = (data.mass_class || "").toLowerCase();
-    if (MASS_CLASS_LABEL[cls]) {
-      setMassPill(MASS_CLASS_LABEL[cls], `pill-${cls}`);
-      highlightMassBin(cls);
+  const lcSeq = data.load_cell_seq ?? 0;
+  if (massSamplePending && (lcSeq > massPendingSeq || replayActive)) {
+    massSamplePending = false;
+  }
+
+  if (!massSamplePending) {
+    if (data.load_cell_error) {
+      setText("liveMassReadout", "ERR");
+      setMassPill("Error", "pill-danger");
+      highlightMassBin(null);
+    } else if (data.current_mass_g !== undefined && data.current_mass_g !== null) {
+      setText("liveMassReadout", Number(data.current_mass_g).toFixed(2));
+      const cls = (data.mass_class || "").toLowerCase();
+      if (MASS_CLASS_LABEL[cls]) {
+        setMassPill(MASS_CLASS_LABEL[cls], `pill-${cls}`);
+        highlightMassBin(cls);
+      } else {
+        setMassPill("Measured", "pill-dim");
+        highlightMassBin(null);
+      }
     } else {
-      setMassPill("Measured", "pill-dim");
+      setText("liveMassReadout", "--.--");
+      setMassPill("Standby", "pill-dim");
       highlightMassBin(null);
     }
-  } else if (replayActive) {
-    setText("liveMassReadout", "--.--");
-    setMassPill("Standby", "pill-dim");
-    highlightMassBin(null);
   }
 
   const cal = data.calibration || {};
@@ -808,7 +827,7 @@ let compiledCadMeta = {
   cad_motor_x_mm: 14.4,
   cad_motor_y_mm: 70.0,
   ee_pivot_three: [-96.6, 106.5, -1.5],
-  cam_local_three: [-95.6, 120.5, -58.5],
+  cam_local_three: [-95.63, 120.86, -40.73],
 };
 let compiledStageGroups = {};
 let compiledPlungerGroup = null;
@@ -937,8 +956,8 @@ function init3DScene() {
   zStageGroup.add(yStageGroup);
   stageGroupsMap.yStage = yStageGroup;
 
-  // Eye-in-hand virtual camera & 3D FOV frustum anchored in physical Load Cell Bracket nose pocket
-  const camPos = compiledCadMeta.cam_local_three || [-95.6, 120.5, -58.5];
+  // Eye-in-hand virtual camera & 3D FOV frustum anchored in physical Load Cell Bracket camera bore
+  const camPos = compiledCadMeta.cam_local_three || [-95.63, 120.86, -40.73];
   eyeCam.position.set(camPos[0], camPos[1] - 0.5, camPos[2]);
   eyeCam.up.set(0, 0, -1);
   eyeCam.lookAt(camPos[0], 0, camPos[2]);
@@ -974,7 +993,7 @@ function init3DScene() {
 function applyCadModeTransforms() {
   if (!yStageGroup || !eeStageGroup || !eyeCam || !fovConeGroup) return;
   for (const g of Object.values(compiledStageGroups)) g.visible = compiledCadActive;
-  const camPos = compiledCadMeta.cam_local_three || [-95.6, 120.5, -58.5];
+  const camPos = compiledCadMeta.cam_local_three || [-95.63, 120.86, -40.73];
   eyeCam.position.set(camPos[0], camPos[1] - 0.5, camPos[2]);
   eyeCam.up.set(0, 0, -1);
   eyeCam.lookAt(camPos[0], 0, camPos[2]);
@@ -987,8 +1006,8 @@ function applyCadModeTransforms() {
 async function loadCompiledGantryCad() {
   try {
     const [metaRes, binRes] = await Promise.all([
-      fetch("assets/v3_gantry_compiled.json?v=2"),
-      fetch("assets/v3_gantry_compiled.bin?v=2"),
+      fetch("assets/v3_gantry_compiled.json?v=3"),
+      fetch("assets/v3_gantry_compiled.bin?v=3"),
     ]);
     if (!metaRes.ok || !binRes.ok) throw new Error("Compiled CAD not found");
     const manifest = await metaRes.json();
@@ -1058,7 +1077,7 @@ function rebuildFovCone(camZ) {
     fovConeGroup.remove(ch);
     if (ch.geometry) ch.geometry.dispose();
   }
-  const camHomeY = compiledCadMeta?.cam_local_three?.[1] ?? 120.5;
+  const camHomeY = compiledCadMeta?.cam_local_three?.[1] ?? 120.86;
   const dropH = Math.max(12, camZ - (COURSE_FLOOR_Z + 0.5));
   const calHomeDrop = Math.max(12, camHomeY - CAL_PLANE_Z);
   const halfW = ((FRAME_W_PX * 0.25) / 2) * (dropH / calHomeDrop);
@@ -2369,7 +2388,7 @@ function animate() {
     }
 
     if (Math.abs(drawZ - prevDrawZ) > 0.15) {
-      const camHomeY = compiledCadMeta?.cam_local_three?.[1] ?? 120.5;
+      const camHomeY = compiledCadMeta?.cam_local_three?.[1] ?? 120.86;
       rebuildFovCone(camHomeY - drawZ);
     }
 

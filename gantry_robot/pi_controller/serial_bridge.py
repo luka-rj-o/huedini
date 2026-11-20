@@ -18,6 +18,12 @@ from .config import GantryConfig
 
 logger = logging.getLogger("gantry.serial")
 
+SERIAL_SLICE_TIMEOUT_S = 0.2
+IDLE_KEEPALIVE_INTERVAL_S = 25.0
+SAFE_WHEN_ESTOPPED = ("ESTOP", "SLEEP", "SETUP", "STATUS", "TARE", "WEIGH", "PING")
+IDEMPOTENT_RETRY_COMMANDS = ("TARE", "WEIGH", "SETUP", "STATUS", "SLEEP")
+IDEMPOTENT_RETRY_PREFIXES = ("GRIP ", "STEPS ")
+
 
 @dataclass
 class GantryPose:
@@ -65,6 +71,8 @@ class ESP32SerialBridge:
         self._running = False
         self._monitor_thread: Optional[threading.Thread] = None
         self._abort_flag = False
+        self._abort_generation = 0
+        self._last_activity_mono = time.monotonic()
         self._simulated_held_mass_g: Optional[float] = None
 
     def _start_event_monitor(self) -> None:
@@ -104,6 +112,7 @@ class ESP32SerialBridge:
         chunk = self._ser.read(waiting)
         if not chunk:
             return
+        self._last_activity_mono = time.monotonic()
         self._rx_buffer.extend(chunk)
         while b"\n" in self._rx_buffer:
             raw_line, _, rest = self._rx_buffer.partition(b"\n")
@@ -115,27 +124,83 @@ class ESP32SerialBridge:
             self._handle_unsolicited_line(line)
 
     def _read_serial_line(self) -> bytes:
-        """Reads a line from _rx_buffer first, completing partial buffered bytes from serial."""
+        """Reads a complete newline-terminated line using short-slice serial reads."""
+        if b"\n" not in self._rx_buffer:
+            chunk = self._ser.readline()
+            if chunk:
+                self._last_activity_mono = time.monotonic()
+                self._rx_buffer.extend(chunk)
         if b"\n" in self._rx_buffer:
             raw_line, _, rest = self._rx_buffer.partition(b"\n")
             self._rx_buffer = bytearray(rest)
             return raw_line + b"\n"
-        raw = self._ser.readline()
-        if self._rx_buffer:
-            raw = bytes(self._rx_buffer) + raw
-            self._rx_buffer.clear()
-        return raw
+        return b""
+
+    def _idle_keepalive_check(self) -> None:
+        """Sends a silent PING while holding self._lock to catch USB URB / ESP32 stalls early."""
+        self._last_activity_mono = time.monotonic()
+        try:
+            self._send_command_locked("PING", timeout_s=2.0)
+        except Exception as exc:
+            logger.warning("Idle keepalive PING failed (%s); reconnecting serial bridge...", exc)
+            self._reconnect()
 
     def _event_monitor_loop(self) -> None:
         while self._running:
             if self._lock.acquire(blocking=False):
                 try:
                     self._drain_unsolicited_events()
+                    if (
+                        not self.mock_hardware
+                        and self._ser is not None
+                        and self._ser.is_open
+                        and (time.monotonic() - self._last_activity_mono) >= IDLE_KEEPALIVE_INTERVAL_S
+                    ):
+                        self._idle_keepalive_check()
                 except Exception as exc:
-                    logger.debug("Idle serial monitor error: %s", exc)
+                    logger.warning("Idle serial monitor error (%s); attempting reconnect...", exc)
+                    try:
+                        self._reconnect()
+                    except Exception as rec_exc:
+                        logger.debug("Idle serial reconnect failed: %s", rec_exc)
+                    self._last_activity_mono = time.monotonic()
                 finally:
                     self._lock.release()
             time.sleep(0.025)
+
+    def _open_serial_no_reset(self, port: str) -> None:
+        """Opens the serial port without toggling DTR/RTS so the ESP32 keeps running without rebooting."""
+        ser = serial.Serial()
+        ser.port = port
+        ser.baudrate = self.config.serial_baud
+        ser.timeout = SERIAL_SLICE_TIMEOUT_S
+        ser.write_timeout = 2.0
+        ser.dtr = False
+        ser.rts = False
+        ser.open()
+        self._ser = ser
+        time.sleep(0.05)
+        self._ser.reset_input_buffer()
+        self._rx_buffer.clear()
+        self._last_activity_mono = time.monotonic()
+
+    def _open_and_reset_serial(self, port: str) -> None:
+        """Opens the serial port with short slice read timeout and resets the ESP32 into run mode."""
+        self._ser = serial.Serial(
+            port=port,
+            baudrate=self.config.serial_baud,
+            timeout=SERIAL_SLICE_TIMEOUT_S,
+            write_timeout=2.0,
+        )
+        # Ensure ESP32 boots into normal SPI Flash run mode (not download boot)
+        self._ser.dtr = False
+        self._ser.rts = True
+        time.sleep(0.15)
+        self._ser.rts = False
+        time.sleep(1.0)
+        self._ser.reset_input_buffer()
+        self._rx_buffer.clear()
+        self._last_activity_mono = time.monotonic()
 
     def connect(self) -> None:
         if self.mock_hardware:
@@ -156,19 +221,7 @@ class ESP32SerialBridge:
 
         logger.info("Connecting to ESP32 on %s @ %d baud...", port, self.config.serial_baud)
         try:
-            self._ser = serial.Serial(
-                port=port,
-                baudrate=self.config.serial_baud,
-                timeout=self.config.serial_timeout_s,
-            )
-            # Ensure ESP32 boots into normal SPI Flash run mode (not download boot):
-            self._ser.dtr = False
-            self._ser.rts = True
-            time.sleep(0.15)
-            self._ser.rts = False
-            time.sleep(1.0)
-            self._ser.reset_input_buffer()
-            self._rx_buffer.clear()
+            self._open_and_reset_serial(port)
 
             # Configure steps/mm and enable TMC2209 drivers
             self.send_command(
@@ -199,11 +252,20 @@ class ESP32SerialBridge:
                         pass
                     self._ser = None
 
+    def _close_ser_quietly(self) -> None:
+        if self._ser is not None:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
+            self._ser = None
+
     def _reconnect(self) -> bool:
         """
-        Recovers a broken or dropped serial connection (e.g. after POSIX EIO / Errno 5,
-        USB bus reset, or transient ESP32 reboot). Closes stale file descriptor, re-detects
-        the active port, and re-initializes TMC2209 driver settings.
+        Recovers a broken or dropped serial connection (e.g. after cp210x urb stopped -32,
+        POSIX EIO, or ESP32 stall) using a two-stage strategy:
+          1. Soft reopen without toggling DTR/RTS + fast PING (preserves ESP32 state & homed position).
+          2. Hard RTS reset + STEPS/SETUP fallback if the ESP32 itself is unresponsive.
         """
         if self.mock_hardware:
             return True
@@ -212,57 +274,50 @@ class ESP32SerialBridge:
             return False
 
         logger.warning("Attempting automatic serial bridge reconnection...")
-        if self._ser is not None:
-            try:
-                self._ser.close()
-            except Exception:
-                pass
-            self._ser = None
+        self._close_ser_quietly()
+        time.sleep(0.25)
 
-        time.sleep(0.5)  # Allow OS USB subsystem to re-enumerate
         port = self._auto_detect_port(self.config.serial_port)
         if not port:
             return False
 
+        # Stage 1: Soft reopen (clears Linux cp210x -EPIPE / stopped URB without resetting ESP32)
         try:
-            logger.info("Reconnecting to ESP32 on %s @ %d baud...", port, self.config.serial_baud)
-            self._ser = serial.Serial(
-                port=port,
-                baudrate=self.config.serial_baud,
-                timeout=self.config.serial_timeout_s,
-            )
-            self._ser.dtr = False
-            self._ser.rts = True
-            time.sleep(0.15)
-            self._ser.rts = False
-            time.sleep(1.0)
-            self._ser.reset_input_buffer()
+            logger.info("Soft-reopening %s @ %d baud (no ESP32 reset)...", port, self.config.serial_baud)
+            self._open_serial_no_reset(port)
+            self._send_command_locked("PING", timeout_s=1.0)
+            self._start_event_monitor()
+            logger.info("ESP32SerialBridge soft-reconnected on %s (stepper position preserved).", port)
+            return True
+        except Exception as soft_exc:
+            logger.warning("Soft reopen failed on %s (%s); falling back to ESP32 RTS reset...", port, soft_exc)
+            self._close_ser_quietly()
+            time.sleep(0.25)
 
-            # Re-apply steps/mm and drivers setup
+        # Stage 2: Hard RTS reset fallback
+        try:
+            logger.info("Hard-reconnecting to ESP32 on %s @ %d baud (RTS reset)...", port, self.config.serial_baud)
+            self._open_and_reset_serial(port)
             steps_cmd = (
                 f"STEPS X{self.config.steps_per_mm_x:.2f} "
                 f"Y{self.config.steps_per_mm_y:.2f} "
-                f"Z{self.config.steps_per_mm_z:.2f}\n"
+                f"Z{self.config.steps_per_mm_z:.2f}"
             )
-            self._ser.write(steps_cmd.encode("ascii"))
-            self._ser.flush()
-            time.sleep(0.1)
-            self._ser.write(b"SETUP\n")
-            self._ser.flush()
-            time.sleep(0.3)
-            self._ser.reset_input_buffer()
-            self._rx_buffer.clear()
+            self._send_command_locked(steps_cmd, timeout_s=3.0)
+            try:
+                self._send_command_locked("SETUP", timeout_s=3.0)
+            except Exception as setup_exc:
+                msg = str(setup_exc)
+                if "VM" in msg or "UART" in msg or "driver not responding" in msg:
+                    logger.warning("Motor supply VM is unpowered (%s). Continuing in idle/manual-test mode.", msg)
+                else:
+                    raise
             self._start_event_monitor()
-            logger.info("ESP32SerialBridge successfully reconnected and initialized.")
+            logger.info("ESP32SerialBridge successfully hard-reconnected and initialized on %s.", port)
             return True
         except Exception as exc:
             logger.error("ESP32SerialBridge reconnection failed: %s", exc)
-            if self._ser:
-                try:
-                    self._ser.close()
-                except Exception:
-                    pass
-                self._ser = None
+            self._close_ser_quietly()
             return False
 
     @staticmethod
@@ -294,6 +349,7 @@ class ESP32SerialBridge:
 
     def trigger_emergency_stop(self) -> None:
         self._abort_flag = True
+        self._abort_generation += 1
         if not self.mock_hardware and self._ser and self._ser.is_open:
             try:
                 self._ser.write(b"ESTOP\n")
@@ -310,10 +366,13 @@ class ESP32SerialBridge:
           - Automated protocol commands wait for 'OK' or 'ERR:<reason>'.
           - Interactive manual commands wait for 'OK', parameter responses, or motion completion.
         Flushes stale unread bytes before transmission so previous timeouts cannot desync replies.
+        Automatically recovers from USB serial URB stalls (-EPIPE) on TimeoutError and retries
+        idempotent non-motion commands once after reconnecting.
         Raises RuntimeError on explicit errors, E-STOP, or detected axis crashes.
         """
         cmd_clean = cmd.strip()
-        if self._abort_flag and cmd_clean.upper() not in ("ESTOP", "SLEEP", "SETUP", "STATUS", "TARE", "WEIGH", "PING"):
+        upper = cmd_clean.upper()
+        if self._abort_flag and upper not in SAFE_WHEN_ESTOPPED:
             raise RuntimeError("ERR:EMERGENCY_STOP_ACTIVE")
 
         t_start = time.monotonic()
@@ -331,119 +390,147 @@ class ESP32SerialBridge:
             return _log_and_return(self._simulate_command(cmd_clean))
 
         with self._lock:
-            if not self._ser or not self._ser.is_open:
-                if not self._reconnect():
-                    if cmd_clean.upper() == "STATUS":
-                        return _log_and_return(["STATUS: ESP32 OFFLINE", "OK"])
-                    logger.warning("Command '%s' dropped: ESP32 is offline.", cmd_clean)
-                    return _log_and_return(["ERR: ESP32 OFFLINE"])
-
-            # Drain any pending hardware switch events before transmitting; keep partial lines intact
             try:
-                self._drain_unsolicited_events()
-                if self._rx_buffer and not self._rx_buffer.startswith(b"EVENT:"):
-                    logger.debug("Flushed %d stale serial bytes before TX", len(self._rx_buffer))
-                    self._rx_buffer.clear()
-            except Exception:
-                pass
+                return _log_and_return(self._send_command_locked(cmd_clean, timeout_s))
+            except TimeoutError as exc:
+                logger.warning(
+                    "Command '%s' timed out (%s); reconnecting serial bridge to recover from USB/ESP32 stall...",
+                    cmd_clean,
+                    exc,
+                )
+                reconnected = self._reconnect()
+                is_idempotent = (
+                    upper in IDEMPOTENT_RETRY_COMMANDS
+                    or upper.startswith(IDEMPOTENT_RETRY_PREFIXES)
+                )
+                if reconnected and is_idempotent:
+                    logger.info("Retrying idempotent command '%s' after automatic reconnect...", cmd_clean)
+                    return _log_and_return(self._send_command_locked(cmd_clean, timeout_s))
+                raise
 
-            io_exceptions = (serial.SerialException, OSError) if serial is not None else (OSError,)
-            logger.debug("TX -> ESP32: %s", cmd_clean)
-            try:
+    def _send_command_locked(self, cmd_clean: str, timeout_s: Optional[float] = None) -> list[str]:
+        """Executes a single serial command while self._lock is held."""
+        upper = cmd_clean.upper()
+        start_gen = self._abort_generation
+
+        if not self._ser or not self._ser.is_open:
+            if not self._reconnect():
+                if upper == "STATUS":
+                    return ["STATUS: ESP32 OFFLINE", "OK"]
+                logger.warning("Command '%s' dropped: ESP32 is offline.", cmd_clean)
+                return ["ERR: ESP32 OFFLINE"]
+
+        # Drain any pending hardware switch events before transmitting; keep partial lines intact
+        try:
+            self._drain_unsolicited_events()
+            if self._rx_buffer and not self._rx_buffer.startswith(b"EVENT:"):
+                logger.debug("Flushed %d stale serial bytes before TX", len(self._rx_buffer))
+                self._rx_buffer.clear()
+        except Exception:
+            pass
+
+        io_exceptions = (serial.SerialException, OSError) if serial is not None else (OSError,)
+        logger.debug("TX -> ESP32: %s", cmd_clean)
+        try:
+            self._ser.write((cmd_clean + "\n").encode("ascii"))
+            self._ser.flush()
+            self._last_activity_mono = time.monotonic()
+        except io_exceptions as io_err:
+            logger.warning("Serial write failed (%s); attempting auto-reconnect...", io_err)
+            if self._reconnect():
+                logger.info("Retrying TX -> ESP32: %s after successful reconnect", cmd_clean)
                 self._ser.write((cmd_clean + "\n").encode("ascii"))
                 self._ser.flush()
+                self._last_activity_mono = time.monotonic()
+            else:
+                raise RuntimeError(f"Serial write failed: {io_err} (reconnection failed)") from io_err
+
+        lines: list[str] = []
+        effective_timeout = float(timeout_s) if timeout_s is not None else self.config.serial_timeout_s
+        deadline = time.monotonic() + effective_timeout
+
+        cmd_lower = cmd_clean.lower()
+        is_motion_cmd = (
+            cmd_lower.startswith("home s")
+            or cmd_lower.startswith(("s1 home", "s2 home", "s3 home"))
+            or (
+                len(cmd_lower) > 3
+                and cmd_lower[0] == "s"
+                and cmd_lower[1] in "123"
+                and cmd_lower[2] == " "
+                and (cmd_lower[3].isdigit() or cmd_lower[3] in "+-")
+            )
+        )
+        is_manual_setting = (
+            cmd_lower.startswith(("s1 ", "s2 ", "s3 ", "servo ", "relay ", "l", "help"))
+            and not is_motion_cmd
+            and not upper.startswith(("SETUP", "STATUS", "STEPS"))
+        )
+
+        while time.monotonic() < deadline:
+            if self._abort_generation != start_gen or (self._abort_flag and upper not in SAFE_WHEN_ESTOPPED):
+                raise RuntimeError("ERR:EMERGENCY_STOP_ACTIVE")
+
+            try:
+                raw = self._read_serial_line()
             except io_exceptions as io_err:
-                logger.warning("Serial write failed (%s); attempting auto-reconnect...", io_err)
+                logger.warning("Serial read failed (%s); attempting auto-reconnect...", io_err)
                 if self._reconnect():
-                    logger.info("Retrying TX -> ESP32: %s after successful reconnect", cmd_clean)
-                    self._ser.write((cmd_clean + "\n").encode("ascii"))
-                    self._ser.flush()
-                else:
-                    raise RuntimeError(f"Serial write failed: {io_err} (reconnection failed)") from io_err
+                    raise RuntimeError(
+                        f"Serial connection was reset during command '{cmd_clean}'; "
+                        f"bridge automatically reconnected and restored driver state. Please retry."
+                    ) from io_err
+                raise RuntimeError(f"Serial read failed: {io_err} (reconnection failed)") from io_err
 
-            lines: list[str] = []
-            effective_timeout = float(timeout_s) if timeout_s is not None else self.config.serial_timeout_s
-            deadline = time.monotonic() + effective_timeout
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line:
+                continue
+            logger.debug("RX <- ESP32: %s", line)
 
-            cmd_lower = cmd_clean.lower()
-            is_motion_cmd = (
-                cmd_lower.startswith("home s")
-                or cmd_lower.startswith(("s1 home", "s2 home", "s3 home"))
-                or (
-                    len(cmd_lower) > 3
-                    and cmd_lower[0] == "s"
-                    and cmd_lower[1] in "123"
-                    and cmd_lower[2] == " "
-                    and (cmd_lower[3].isdigit() or cmd_lower[3] in "+-")
-                )
-            )
-            is_manual_setting = (
-                cmd_lower.startswith(("s1 ", "s2 ", "s3 ", "servo ", "relay ", "l", "help"))
-                and not is_motion_cmd
-                and not cmd_clean.upper().startswith(("SETUP", "STATUS", "STEPS"))
-            )
+            if self._handle_unsolicited_line(line):
+                continue
 
-            while time.monotonic() < deadline:
-                try:
-                    raw = self._read_serial_line()
-                except io_exceptions as io_err:
-                    logger.warning("Serial read failed (%s); attempting auto-reconnect...", io_err)
-                    if self._reconnect():
-                        raise RuntimeError(
-                            f"Serial connection was reset during command '{cmd_clean}'; "
-                            f"bridge automatically reconnected and restored driver state. Please retry."
-                        ) from io_err
-                    raise RuntimeError(f"Serial read failed: {io_err} (reconnection failed)") from io_err
+            lines.append(line)
 
-                if not raw:
+            # Explicit crash detection from firmware [ALERT] or ERR:STALL
+            if "stall detected" in line.lower() or line.startswith("ERR:STALL") or line.startswith("[ALERT]"):
+                raise RuntimeError(f"CRASH_DETECTED: {line}")
+
+            if line == "OK":
+                self._last_activity_mono = time.monotonic()
+                return lines
+
+            if line.startswith("ERR:") or line.startswith("[ERROR]"):
+                if "use hv<speed> or hs<sensitivity>" in line.lower():
+                    logger.warning("Ignoring non-fatal firmware warning: %s", line)
                     continue
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                logger.debug("RX <- ESP32: %s", line)
+                raise RuntimeError(line)
 
-                if self._handle_unsolicited_line(line):
-                    continue
+            if is_motion_cmd:
+                if (
+                    "Position set to 0." in line
+                    or "move complete." in line
+                    or "timed out" in line
+                    or "homing cancelled" in line
+                ):
+                    time.sleep(0.04)
+                    while self._ser.in_waiting > 0:
+                        extra = self._read_serial_line().decode("utf-8", errors="replace").strip()
+                        if extra:
+                            lines.append(extra)
+                            if extra == "OK":
+                                return lines
+                    return lines
 
-                lines.append(line)
+            elif is_manual_setting:
+                if line.startswith("-> ") or line.startswith("---") or line.startswith("["):
+                    time.sleep(0.06)
+                    if self._ser.in_waiting == 0:
+                        return lines
 
-                # Explicit crash detection from firmware [ALERT] or ERR:STALL
-                if "stall detected" in line.lower() or line.startswith("ERR:STALL") or line.startswith("[ALERT]"):
-                    raise RuntimeError(f"CRASH_DETECTED: {line}")
-
-                if line == "OK":
-                    return _log_and_return(lines)
-
-                if line.startswith("ERR:") or line.startswith("[ERROR]"):
-                    if "use hv<speed> or hs<sensitivity>" in line.lower():
-                        logger.warning("Ignoring non-fatal firmware warning: %s", line)
-                        continue
-                    raise RuntimeError(line)
-
-                if is_motion_cmd:
-                    if (
-                        "Position set to 0." in line
-                        or "move complete." in line
-                        or "timed out" in line
-                        or "homing cancelled" in line
-                    ):
-                        # Give a brief moment for the trailing OK to be ingested if firmware sent it
-                        time.sleep(0.04)
-                        while self._ser.in_waiting > 0:
-                            extra = self._ser.readline().decode("utf-8", errors="replace").strip()
-                            if extra:
-                                lines.append(extra)
-                                if extra == "OK":
-                                    return _log_and_return(lines)
-                        return _log_and_return(lines)
-
-                elif is_manual_setting:
-                    if line.startswith("-> ") or line.startswith("---") or line.startswith("["):
-                        time.sleep(0.06)
-                        if self._ser.in_waiting == 0:
-                            return _log_and_return(lines)
-
-            raise TimeoutError(f"ESP32 timed out ({effective_timeout:.1f}s) waiting for completion of command: {cmd_clean}")
+        raise TimeoutError(f"ESP32 timed out ({effective_timeout:.1f}s) waiting for completion of command: {cmd_clean}")
 
     # ------------------------------------------------------------------
     # High-level deterministic operations
@@ -451,7 +538,7 @@ class ESP32SerialBridge:
     def ensure_awake(self) -> None:
         """Ensures steppers are enabled and drivers initialized (sends SETUP if needed)."""
         try:
-            self.send_command("SETUP", timeout_s=10.0)
+            self.send_command("SETUP", timeout_s=4.0)
         except Exception as exc:
             logger.warning("ensure_awake failed: %s", exc)
 
@@ -517,6 +604,44 @@ class ESP32SerialBridge:
         self.pose.angle_deg = ta
         self._notify_pose()
 
+    def press_into_surface(
+        self,
+        nominal_z_mm: float,
+        max_press_mm: float,
+        force_g: float,
+        feedrate_mm_s: Optional[float] = None,
+    ) -> float:
+        """
+        Gently presses the cube/end-effector downward into the floor or stack using
+        HX711 compressive force feedback, strictly bounded by travel_z_max_mm.
+        """
+        max_z = max(
+            self.pose.z_mm,
+            min(self.config.travel_z_max_mm, float(nominal_z_mm) + max(0.0, float(max_press_mm))),
+        )
+        press_f = max(1.0, float(self.config.feedrate_press_mm_s if feedrate_mm_s is None else feedrate_mm_s))
+        req_force_g = max(0.0, float(force_g))
+        dist = max(0.0, max_z - self.pose.z_mm)
+        timeout = max(self.config.serial_timeout_s, (dist / press_f) * 2.5 + 5.0)
+
+        lines = self.send_command(
+            f"PRESS Z{max_z:.2f} D{req_force_g:.1f} F{press_f:.1f}",
+            timeout_s=timeout,
+        )
+        actual_z = max_z
+        for line in reversed(lines):
+            if line.startswith("PRESSED "):
+                for tok in line.split():
+                    if tok.startswith("Z:"):
+                        try:
+                            actual_z = float(tok.split(":", 1)[1])
+                        except ValueError:
+                            pass
+                break
+        self.pose.z_mm = max(0.0, min(self.config.travel_z_max_mm, actual_z))
+        self._notify_pose()
+        return self.pose.z_mm
+
     def set_gripper(self, closed: bool) -> None:
         """
         Controls the Normally-Closed solenoid gripper via PIN_RELAY.
@@ -524,17 +649,17 @@ class ESP32SerialBridge:
         closed=False -> GRIP 0 (open/release block)
         """
         val = 1 if closed else 0
-        self.send_command(f"GRIP {val}")
+        self.send_command(f"GRIP {val}", timeout_s=3.0)
         self.pose.grip_closed = closed
         self._notify_pose()
 
     def tare_scale(self) -> None:
         """Zeroes the HX711 load cell offset before picking a block."""
-        self.send_command("TARE")
+        self.send_command("TARE", timeout_s=4.0)
 
     def weigh_block(self) -> float:
         """Samples the HX711 load cell and parses WEIGHT:<float> in grams."""
-        lines = self.send_command("WEIGH")
+        lines = self.send_command("WEIGH", timeout_s=4.0)
         for line in reversed(lines):
             if line.startswith("WEIGHT:"):
                 return float(line.split(":", 1)[1].strip())
@@ -584,6 +709,18 @@ class ESP32SerialBridge:
                     tf = max(5.0, val)
             self._animate_mock_move(tx, ty, tz, ta, tf)
             return []
+
+        if upper.startswith("PRESS"):
+            tokens = upper.split()[1:]
+            tz, tf = self.pose.z_mm, self.config.feedrate_press_mm_s
+            for tok in tokens:
+                if tok.startswith("Z"):
+                    tz = float(tok[1:])
+                elif tok.startswith("F"):
+                    tf = max(1.0, float(tok[1:]))
+            sim_z = min(tz, self.pose.z_mm + min(1.5, max(0.0, tz - self.pose.z_mm)))
+            self._animate_mock_move(self.pose.x_mm, self.pose.y_mm, sim_z, self.pose.angle_deg, tf)
+            return [f"PRESSED Z:{sim_z:.2f} DF:-36.00"]
 
         if upper.startswith("GRIP"):
             time.sleep(0.12)
