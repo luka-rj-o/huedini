@@ -40,11 +40,11 @@ const DATUM_Y = -43.5;
 const DATUM_Z = 127.5;
 
 // Nominal homed end-effector & camera (plate coordinates at motor (0, 0, 0))
-const EE_HOMED_X = 31.0;
-const EE_HOMED_Y = -8.5;
+const EE_HOMED_X = 31.7;
+const EE_HOMED_Y = 6.4;
 const EE_HOMED_Z = 97.6;
-const CAM_HOMED_X = 32.5;
-const CAM_HOMED_Y = 33.1;
+const CAM_HOMED_X = 33.2;
+const CAM_HOMED_Y = 48.0;
 const CAM_HOMED_Z = 135.4;
 const EE_OFFSET_X = -1.5;
 const EE_OFFSET_Y = -41.6;
@@ -712,8 +712,9 @@ function renderSyntheticCamera(canvas, data) {
     return;
   }
 
-  const camX = CAM_HOMED_X + drawX;
-  const camY = CAM_HOMED_Y + drawY;
+  const camP = motorCamToPlate(drawX, drawY);
+  const camX = camP.x;
+  const camY = camP.y;
   const camZ = CAM_HOMED_Z - drawZ;
   const fovScale = Math.max(0.12, (camZ - CAL_PLANE_Z) / (CAM_HOMED_Z - CAL_PLANE_Z));
   const kx = 0.25 * fovScale;
@@ -824,8 +825,8 @@ let bulkPartAssignments = [];
 let compiledCadLoaded = false;
 let compiledCadActive = false;
 let compiledCadMeta = {
-  cad_motor_x_mm: 14.4,
-  cad_motor_y_mm: 70.0,
+  cad_motor_x_mm: 13.7,
+  cad_motor_y_mm: 55.1,
   ee_pivot_three: [-96.6, 106.5, -1.5],
   cam_local_three: [-95.63, 120.86, -40.73],
 };
@@ -942,8 +943,11 @@ function init3DScene() {
   // ==========================================================================
   //  STAGES 1-4: X-SLIDER/Z-TOWER -> Z-SADDLE/Y-BOOM -> Y-CARRIAGE -> EE_V6
   // ==========================================================================
+  const piv = compiledCadMeta.ee_pivot_three || [-96.6, 106.5, -1.5];
+  const eeP0 = motorCamToPlate(EE_OFFSET_X, EE_OFFSET_Y);
+
   xStageGroup = new THREE.Group();
-  xStageGroup.position.set(-compiledCadMeta.cad_motor_x_mm, 0, 0);
+  xStageGroup.position.set((eeP0.x - 142.0) - piv[0], 0, 0);
   scene3d.add(xStageGroup);
   stageGroupsMap.xStage = xStageGroup;
 
@@ -952,7 +956,7 @@ function init3DScene() {
   stageGroupsMap.zStage = zStageGroup;
 
   yStageGroup = new THREE.Group();
-  yStageGroup.position.set(0, 0, compiledCadMeta.cad_motor_y_mm);
+  yStageGroup.position.set(0, 0, -(eeP0.y - 60.0) - piv[2]);
   zStageGroup.add(yStageGroup);
   stageGroupsMap.yStage = yStageGroup;
 
@@ -970,7 +974,6 @@ function init3DScene() {
 
   // Stage 4: Rotating EE_V6 Solenoid Gripper Assembly
   eeStageGroup = new THREE.Group();
-  const piv = compiledCadMeta.ee_pivot_three || [-96.6, 106.5, -1.5];
   eeStageGroup.position.set(piv[0], piv[1], piv[2]);
   yStageGroup.add(eeStageGroup);
   stageGroupsMap.eeStage = eeStageGroup;
@@ -1006,8 +1009,8 @@ function applyCadModeTransforms() {
 async function loadCompiledGantryCad() {
   try {
     const [metaRes, binRes] = await Promise.all([
-      fetch("assets/v3_gantry_compiled.json?v=3"),
-      fetch("assets/v3_gantry_compiled.bin?v=3"),
+      fetch("assets/v3_gantry_compiled.json?v=4"),
+      fetch("assets/v3_gantry_compiled.bin?v=4"),
     ]);
     if (!metaRes.ok || !binRes.ok) throw new Error("Compiled CAD not found");
     const manifest = await metaRes.json();
@@ -1257,10 +1260,9 @@ function clearTrail() {
 
 function updateTrail() {
   if (!trailLine || !layers.trail) return;
-  const eeX = EE_HOMED_X + drawX;
-  const eeY = EE_HOMED_Y + drawY;
+  const eeP = motorCamToPlate(drawX + EE_OFFSET_X, drawY + EE_OFFSET_Y);
   const eeZ = EE_HOMED_Z - drawZ;
-  const p = plateToThree(eeX, eeY, eeZ);
+  const p = plateToThree(eeP.x, eeP.y, eeZ);
   const last = trailPoints[trailPoints.length - 1];
   if (!last || last.distanceTo(p) > 2.2) {
     trailPoints.push(p);
@@ -2158,6 +2160,9 @@ async function replayLatestReport() {
 
 function startReportReplay(report) {
   const frames = [];
+  const repCal = report.calibration || latestState.calibration || { calibrated: false, kx_mm_per_px: 0.25, ky_mm_per_px: 0.25 };
+  const repOx = repCal.cam_origin_x_mm ?? CAM_HOMED_X;
+  const repOy = repCal.cam_origin_y_mm ?? CAM_HOMED_Y;
   const baseBlocks = (report.cataloged_blocks || []).map((b) => ({
     ...b,
     z_mm: COURSE_FLOOR_Z,
@@ -2169,6 +2174,7 @@ function startReportReplay(report) {
 
   frames.push({
     state: "CALIBRATING",
+    calibration: repCal,
     gantry_pose: { x_mm: 0, y_mm: 0, z_mm: 0, angle_deg: 0, grip_closed: true },
     world_blocks: cloneBlocks(simBlocks),
     blocks: [],
@@ -2184,6 +2190,7 @@ function startReportReplay(report) {
     }
     frames.push({
       state: "SCANNING",
+      calibration: repCal,
       gantry_pose: { x_mm: wp.motor_x_mm, y_mm: wp.motor_y_mm, z_mm: wp.motor_z_mm || 0, angle_deg: 0, grip_closed: true },
       world_blocks: cloneBlocks(simBlocks),
       blocks: cloneBlocks(simBlocks.filter((b) => b.status !== "UNSCANNED")),
@@ -2195,8 +2202,13 @@ function startReportReplay(report) {
 
   for (const p of (report.pick_actions || [])) {
     const blk = simBlocks.find((b) => b.id === p.block_id);
+    if (blk && p.refined_plate_x != null && p.refined_plate_y != null) {
+      blk.x_mm = p.refined_plate_x;
+      blk.y_mm = p.refined_plate_y;
+    }
     frames.push({
       state: "PICKING",
+      calibration: repCal,
       gantry_pose: { x_mm: p.camera_motor_x, y_mm: p.camera_motor_y, z_mm: 25, angle_deg: 0, grip_closed: false },
       world_blocks: cloneBlocks(simBlocks),
       blocks: cloneBlocks(simBlocks),
@@ -2206,6 +2218,7 @@ function startReportReplay(report) {
     });
     frames.push({
       state: "PICKING",
+      calibration: repCal,
       gantry_pose: { x_mm: p.gripper_motor_x, y_mm: p.gripper_motor_y, z_mm: STROKE_Z_BOTTOM, angle_deg: p.servo_angle_deg, grip_closed: true },
       world_blocks: cloneBlocks(simBlocks),
       blocks: cloneBlocks(simBlocks),
@@ -2220,6 +2233,7 @@ function startReportReplay(report) {
     }
     frames.push({
       state: "WEIGHING",
+      calibration: repCal,
       gantry_pose: { x_mm: p.gripper_motor_x, y_mm: p.gripper_motor_y, z_mm: 25, angle_deg: p.servo_angle_deg, grip_closed: true },
       world_blocks: cloneBlocks(simBlocks),
       blocks: cloneBlocks(simBlocks),
@@ -2227,10 +2241,11 @@ function startReportReplay(report) {
       current_mass_g: p.measured_mass_g,
       mass_class: p.mass_class,
     });
-    const dropMx = clamp(p.drop_plate_x - (CAM_HOMED_X + EE_OFFSET_X), 0, STROKE_X);
-    const dropMy = clamp(p.drop_plate_y - (CAM_HOMED_Y + EE_OFFSET_Y), 0, STROKE_Y);
+    const dropMx = clamp(p.drop_plate_x - (repOx + EE_OFFSET_X), 0, STROKE_X);
+    const dropMy = clamp(p.drop_plate_y - (repOy + EE_OFFSET_Y), 0, STROKE_Y);
     frames.push({
       state: "STACKING",
+      calibration: repCal,
       gantry_pose: { x_mm: dropMx, y_mm: dropMy, z_mm: 25, angle_deg: 0, grip_closed: true },
       world_blocks: cloneBlocks(simBlocks),
       blocks: cloneBlocks(simBlocks),
@@ -2247,6 +2262,7 @@ function startReportReplay(report) {
     }
     frames.push({
       state: "STACKING",
+      calibration: repCal,
       gantry_pose: { x_mm: dropMx, y_mm: dropMy, z_mm: p.drop_z_down_mm || STROKE_Z_BOTTOM, angle_deg: 0, grip_closed: false },
       world_blocks: cloneBlocks(simBlocks),
       blocks: cloneBlocks(simBlocks),
@@ -2258,6 +2274,7 @@ function startReportReplay(report) {
 
   frames.push({
     state: "COMPLETE",
+    calibration: repCal,
     gantry_pose: { x_mm: 0, y_mm: 0, z_mm: 0, angle_deg: 0, grip_closed: true },
     world_blocks: cloneBlocks(simBlocks),
     blocks: cloneBlocks(simBlocks),
@@ -2372,14 +2389,13 @@ function animate() {
   const targetGrip = gripClosed ? 1.0 : 0.0;
   drawGripFactor += (targetGrip - drawGripFactor) * 0.3;
 
-  // Apply to 5-Stage 3D Kinematic Hierarchy (Compiled Onshape CAD)
+  // Apply to 5-Stage 3D Kinematic Hierarchy (Compiled Onshape CAD aligned to calibrated plate coords)
   if (xStageGroup && zStageGroup && yStageGroup && eeStageGroup) {
-    const cmx = compiledCadMeta.cad_motor_x_mm;
-    const cmy = compiledCadMeta.cad_motor_y_mm;
     const piv = compiledCadMeta.ee_pivot_three || [-96.6, 106.5, -1.5];
-    xStageGroup.position.set(drawX - cmx, 0, 0);
+    const eeP = motorCamToPlate(drawX + EE_OFFSET_X, drawY + EE_OFFSET_Y);
+    xStageGroup.position.set((eeP.x - 142.0) - piv[0], 0, 0);
     zStageGroup.position.set(0, -drawZ, 0);
-    yStageGroup.position.set(0, 0, -(drawY - cmy));
+    yStageGroup.position.set(0, 0, -(eeP.y - 60.0) - piv[2]);
     eeStageGroup.position.set(piv[0], piv[1], piv[2]);
     eeStageGroup.rotation.y = (drawAngle * Math.PI) / 180.0;
     if (compiledPlungerGroup) {
@@ -2396,7 +2412,7 @@ function animate() {
     updateTrail();
 
     if (cameraPreset === "follow" && orbitCam && controls3d) {
-      const eeWorld = plateToThree(EE_HOMED_X + drawX, EE_HOMED_Y + drawY, EE_HOMED_Z - drawZ - 10);
+      const eeWorld = plateToThree(eeP.x, eeP.y, EE_HOMED_Z - drawZ - 10);
       controls3d.target.lerp(eeWorld, 0.12);
       const desiredPos = eeWorld.clone().add(new THREE.Vector3(75, 85, -105));
       orbitCam.position.lerp(desiredPos, 0.08);

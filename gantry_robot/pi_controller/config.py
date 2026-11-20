@@ -64,21 +64,20 @@ class GantryConfig:
     homed_datum_plate_y_mm: float = -43.5
     homed_datum_plate_z_mm: float = 127.5
 
-    # 2. Homed End-Effector top wrt course origin: 32.5 mm right, 6.0 mm behind, 97.6 mm above
-    #    (Relative to tower datum: +4.0 mm X, +37.5 mm Y, -29.9 mm Z)
-    ee_from_datum_x_mm: float = 4.0
-    ee_from_datum_y_mm: float = 37.5
+    # 2. Homed End-Effector top wrt course origin: 31.7 mm right, +6.4 mm fore, 97.6 mm above
+    #    (Relative to tower datum: +3.2 mm X, +49.9 mm Y, -29.9 mm Z)
+    ee_from_datum_x_mm: float = 3.2
+    ee_from_datum_y_mm: float = 49.9
     ee_from_datum_z_mm: float = -29.9
-    # -> In plate coordinates at motor (0,0,0): EE = (32.5, -6.0, 97.6) mm -> X[32.5..259.5], Y[-6.0..122.0]
+    # -> In plate coordinates at motor (0,0,0): EE = (31.7, +6.4, 97.6) mm
 
-    # 3. Homed Camera optical center: 39.1 mm ahead (+Y) and 37.8 mm above (+Z) EE origin (camera moved 15 mm back in Y)
-    #    -> Cam = (32.5, +33.1, 135.4) mm -> X[32.5..259.5], Y[33.1..161.1]
-    #    (Relative to tower datum: +4.0 mm X, +76.6 mm Y, +7.9 mm Z)
-    cam_from_datum_x_mm: float = 4.0
-    cam_from_datum_y_mm: float = 76.6
+    # 3. Homed Camera optical center: calibrated V3 Gantry nominal origin (33.2, 48.0, 135.4) mm
+    #    (Relative to tower datum: +4.7 mm X, +91.5 mm Y, +7.9 mm Z)
+    cam_from_datum_x_mm: float = 4.7
+    cam_from_datum_y_mm: float = 91.5
     cam_from_datum_z_mm: float = 7.9
-    nominal_cam_origin_x_mm: float = 32.5
-    nominal_cam_origin_y_mm: float = 33.1
+    nominal_cam_origin_x_mm: float = 33.2
+    nominal_cam_origin_y_mm: float = 48.0
     cam_homed_z_above_plate_mm: float = 135.4
 
     # --- Course & Outer Fiducial Border Dimensions (mm) ---
@@ -113,10 +112,20 @@ class GantryConfig:
         ]
     )
 
-    # --- Motion Feedrates (mm/s), Scan Settling, and EE Rotation Clearance ---
-    feedrate_travel_mm_s: float = 25.0
-    feedrate_z_mm_s: float = 15.0
-    feedrate_fine_mm_s: float = 12.0
+    # --- Motion Feedrates (mm/s), Surface Press, Scan Settling, and EE Rotation Clearance ---
+    feedrate_travel_mm_s: float = 75.0   # Firmware caps X at 60.0 mm/s, Y at 80.0 mm/s
+    feedrate_z_mm_s: float = 35.0
+    feedrate_fine_mm_s: float = 40.0
+    feedrate_press_mm_s: float = 8.0     # Controlled downward press (<0.7 mm per HX711 sample)
+    feedrate_pick_guard_mm_s: float = 12.0  # Guarded downward PRESS approach above cube top face
+    press_approach_offset_mm: float = 0.5  # Fast Z descend stops slightly above surface before PRESS
+    pick_guard_offset_mm: float = 23.0     # Start HX711 force-guarded descent 3.0 mm above 20 mm cube top
+    pick_press_max_mm: float = 3.0       # Max downward press past nominal pick surface
+    drop_press_max_mm: float = 4.0       # Max downward press past nominal drop surface (~2 mm deeper pushdown)
+    press_force_g: float = 65.0          # Upward load-cell delta target during open-jaw PICK press
+    drop_press_force_g: float = 200.0    # Upward load-cell delta target beyond cube weight before releasing on DROP
+    early_force_z_margin_mm: float = 0.35  # Force trigger above (pick_z_down - margin) flags cube misalignment
+    max_pick_misalign_retries: int = 3   # Consecutive early force-spike retries before aborting
     scan_settle_s: float = 0.35
     servo_safe_y_mm: float = 10.0
 
@@ -161,8 +170,8 @@ class GantryConfig:
         default_factory=lambda: {
             1: (0.0, 115.0),     # Top-Left (Marker #1)
             2: (215.0, 115.0),   # Top-Right (Marker #2)
-            3: (215.0, 0.0),     # Bottom-Right (Marker #3)
-            0: (0.0, 0.0),       # Bottom-Left (Marker #0)
+            3: (215.0, 6.0),     # Bottom-Right (Marker #3, 6 mm clear of Y=0 rear bumper)
+            0: (0.0, 6.0),       # Bottom-Left (Marker #0, 6 mm clear of Y=0 rear bumper)
         }
     )
     calibration_step_x_mm: float = 20.0

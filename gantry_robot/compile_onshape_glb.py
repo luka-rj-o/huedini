@@ -29,9 +29,9 @@ OUT_JSON = OUT_DIR / "v3_gantry_compiled.json"
 
 # Exact CAD alignment constants derived from V3 Gantry.glb measurements:
 # EE pocket & MG90 shaft center in GLB: X_glb=96.6, Y_glb=14.7 -> X_p=45.4, Y_p=61.5
-# Compared to homed EE_HOMED = (31.0, -8.5):
-CAD_MOTOR_X = 14.4
-CAD_MOTOR_Y = 70.0
+# Compared to calibrated V3 Gantry homed EE_HOMED = (31.7, +6.4):
+CAD_MOTOR_X = 13.7
+CAD_MOTOR_Y = 55.1
 CAD_MOTOR_Z = 0.0
 
 EE_PIVOT_THREE = (-96.6, 106.5, 14.7 - 16.2)  # (-96.6, 106.5, -1.5)

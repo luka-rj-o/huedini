@@ -92,6 +92,8 @@ class EyeInHandKinematics:
         self._plate_t: Optional[np.ndarray] = None      # 2-vector
         self._plate_A_inv: Optional[np.ndarray] = None  # 2x2 inverse
         self._plate_t_inv: Optional[np.ndarray] = None  # 2-vector inverse
+        self.drift_x_mm: float = 0.0
+        self.drift_y_mm: float = 0.0
 
     @staticmethod
     def _wrap_deg(angle_deg: float) -> float:
@@ -231,6 +233,8 @@ class EyeInHandKinematics:
         self.residual_max_mm = 0.0
         self.corner_residuals_mm = {int(marker_id): 0.0}
         self.origin_calibrated = True
+        self.drift_x_mm = 0.0
+        self.drift_y_mm = 0.0
         return self.cam_origin_x_mm, self.cam_origin_y_mm
 
     def calibrate_from_fiducials(
@@ -382,6 +386,8 @@ class EyeInHandKinematics:
         self.corner_residuals_mm = residuals
         self.calibrated = True
         self.origin_calibrated = True
+        self.drift_x_mm = 0.0
+        self.drift_y_mm = 0.0
 
         return {
             "mode": self.calibration_mode,
@@ -529,6 +535,38 @@ class EyeInHandKinematics:
     def gripper_target_for_block(self, block_plate_x: float, block_plate_y: float) -> Tuple[float, float]:
         """Convenience alias for plate_to_gripper_motor."""
         return self.plate_to_gripper_motor(block_plate_x, block_plate_y)
+
+    def record_fine_alignment_drift(
+        self,
+        coarse_x_mm: float,
+        coarse_y_mm: float,
+        refined_x_mm: float,
+        refined_y_mm: float,
+    ) -> Tuple[float, float]:
+        """
+        Tracks systematic motor-to-plate drift observed during Phase 5A fine camera alignment
+        so subsequent Phase 6 stack placements stay centered on the same physical stack.
+        """
+        dx = float(refined_x_mm - coarse_x_mm)
+        dy = float(refined_y_mm - coarse_y_mm)
+        if math.hypot(dx, dy) <= 10.0:
+            if abs(dy) > 1.75:
+                self.drift_y_mm = max(-10.0, min(10.0, 0.6 * self.drift_y_mm + 0.4 * dy))
+            if abs(dx) > 1.75:
+                self.drift_x_mm = max(-10.0, min(10.0, 0.6 * self.drift_x_mm + 0.4 * dx))
+        return self.drift_x_mm, self.drift_y_mm
+
+    def plate_to_drop_gripper_motor(
+        self, drop_plate_x_mm: float, drop_plate_y_mm: float
+    ) -> Tuple[float, float]:
+        """
+        Converts Phase 6 target stack plate coordinates to gripper motor coordinates,
+        compensating for any systematic motor drift observed during fine pick alignments.
+        """
+        return self.plate_to_gripper_motor(
+            drop_plate_x_mm + self.drift_x_mm,
+            drop_plate_y_mm + self.drift_y_mm,
+        )
 
 
 class WorldCatalogAndPlanner:

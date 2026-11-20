@@ -10,6 +10,7 @@ Core 6-Phase Operational State Machine for the HUE-DINI Gantry Robot:
 
 from collections import deque
 import logging
+import math
 import queue
 import threading
 import time
@@ -312,6 +313,7 @@ class GantryStateMachine:
                 try:
                     self.serial.ensure_awake()
                     self.serial.home_all()
+                    self._auto_tare_scale("HOME_ALL")
                     self.state = "IDLE"
                     self.log_event("Gantry successfully homed to (0.0, 0.0, 0.0). Motors ready in IDLE.")
                 except Exception as exc:
@@ -522,6 +524,17 @@ class GantryStateMachine:
                 else:
                     self.reports.finish_run(status="ESTOPPED", error="EMERGENCY_STOP_TRIGGERED")
 
+    def _auto_tare_scale(self, context_label: str) -> bool:
+        """Automatically zeroes the HX711 scale after homing/before picking."""
+        try:
+            self.serial.tare_scale()
+            self._set_mass_reading(0.00, None)
+            self.log_event(f"{context_label}: HX711 scale auto-tared (0.00 g).")
+            return True
+        except Exception as exc:
+            self.log_event(f"Notice: {context_label} auto-tare skipped ({exc}).")
+            return False
+
     def _run_full_cycle(self) -> None:
         # ==============================================================
         # PHASE 2: Homing & 4-ArUco Ground-Truth Calibration (CALIBRATING)
@@ -530,6 +543,7 @@ class GantryStateMachine:
         self.log_event("Phase 2 [CALIBRATING]: Homing Z, X, Y axes via TMC2209 StallGuard4...")
         self._check_pause_or_abort()
         self.serial.home_all()
+        self._auto_tare_scale("Phase 2 [CALIBRATING]")
 
         # Reset kinematic plate transform prior to fresh calibration
         self.kinematics.cam_origin_x_mm = self.config.nominal_cam_origin_x_mm
@@ -537,6 +551,8 @@ class GantryStateMachine:
         self.kinematics.cam_skew_deg = self.config.default_cam_skew_deg
         self.kinematics.cam_motor_skew_deg = self.config.default_cam_skew_deg
         self.kinematics.plate_yaw_deg = 0.0
+        self.kinematics.drift_x_mm = 0.0
+        self.kinematics.drift_y_mm = 0.0
         self.kinematics._plate_A = None
         self.kinematics._plate_t = None
         self.kinematics._plate_A_inv = None
@@ -845,20 +861,160 @@ class GantryStateMachine:
         max_press_mm: float,
         extra_unload_g: float = 0.0,
         force_g: Optional[float] = None,
-    ) -> None:
+        approach_offset_mm: Optional[float] = None,
+        feedrate_press_mm_s: Optional[float] = None,
+    ) -> float:
         """
-        Fast-descends just above the nominal surface, then presses into the floor/stack
+        Fast-descends to the guarded approach height above the nominal surface, then presses
         until HX711 compressive force reaches threshold or max_press_mm is reached.
+        Returns the achieved motor Z_down position.
         """
-        approach_z = max(0.0, float(surface_z_mm) - self.config.press_approach_offset_mm)
+        offset_mm = (
+            self.config.press_approach_offset_mm
+            if approach_offset_mm is None
+            else float(approach_offset_mm)
+        )
+        approach_z = max(0.0, float(surface_z_mm) - offset_mm)
         base_force_g = self.config.press_force_g if force_g is None else float(force_g)
         self.serial.move_to(z_mm=approach_z, feedrate_mm_s=self.config.feedrate_z_mm_s)
-        self.serial.press_into_surface(
+        return self.serial.press_into_surface(
             nominal_z_mm=surface_z_mm,
             max_press_mm=max_press_mm,
             force_g=base_force_g + max(0.0, float(extra_unload_g)),
-            feedrate_mm_s=self.config.feedrate_press_mm_s,
+            feedrate_mm_s=(
+                self.config.feedrate_press_mm_s
+                if feedrate_press_mm_s is None
+                else float(feedrate_press_mm_s)
+            ),
         )
+
+    def _capture_and_refine_target_block(
+        self,
+        block: BlockRecord,
+        cam_z_mm: float,
+        settle: bool = False,
+    ) -> Optional[tuple]:
+        """Moves camera above `block`, captures a stationary frame, and returns best matching detection."""
+        cam_mx, cam_my = self.kinematics.plate_to_camera_motor(block.x_mm, block.y_mm)
+        cam_mx = max(0.0, min(self.config.travel_x_mm, cam_mx))
+        cam_my = max(
+            self.config.servo_safe_y_mm if cam_z_mm > 2.0 else 0.0,
+            min(self.config.travel_y_mm, cam_my),
+        )
+        if self.serial.pose.z_mm > cam_z_mm + 0.1:
+            self.serial.move_to(z_mm=cam_z_mm, feedrate_mm_s=self.config.feedrate_z_mm_s)
+        self.serial.move_to(
+            x_mm=cam_mx,
+            y_mm=cam_my,
+            z_mm=cam_z_mm,
+            angle_deg=0.0,
+        )
+        self._check_pause_or_abort()
+        if settle and not self.mock_hardware and self.config.scan_settle_s > 0.0:
+            time.sleep(self.config.scan_settle_s)
+
+        v_frame = self.vision.capture_stationary_frame(
+            self.serial.pose.x_mm, self.serial.pose.y_mm, self.serial.pose.z_mm
+        )
+        v_dets = [d for d in self.vision.detect_blocks_hsv(v_frame) if d.color == block.color]
+        if not v_dets:
+            return None
+
+        target_h = self.config.block_top_height_mm_at(block.x_mm, block.y_mm)
+        candidates = []
+        for det in v_dets:
+            rx, ry = self.kinematics.pixel_to_world_mm(
+                det.u_px,
+                det.v_px,
+                self.serial.pose.x_mm,
+                self.serial.pose.y_mm,
+                self.serial.pose.z_mm,
+                self.config.z_scan_mm,
+                target_height_above_surface_mm=target_h,
+            )
+            dist = math.hypot(rx - block.x_mm, ry - block.y_mm)
+            candidates.append((dist, det, rx, ry))
+
+        within_radius = [c for c in candidates if c[0] <= 25.0]
+        pool = within_radius if within_radius else candidates
+        err_mm, best, refined_x, refined_y = min(pool, key=lambda item: item[0])
+        return cam_mx, cam_my, best, refined_x, refined_y, err_mm
+
+    def _fine_align_block_with_camera(
+        self,
+        block: BlockRecord,
+        pick_record: PickActionRecord,
+        scan_z_mm: float,
+        is_retry: bool = False,
+    ) -> bool:
+        """
+        Positions the eye-in-hand camera above `block` and refines its (X, Y, angle).
+        On misalignment retry, settles before capture, escalates to wider-FOV z_scan_mm=0.0
+        if unseen, and performs a second centering capture if residual offset > 2.5 mm.
+        """
+        action_word = "Re-scanning" if is_retry else "Moving camera above"
+        cam_mx, cam_my = self.kinematics.plate_to_camera_motor(block.x_mm, block.y_mm)
+        cam_mx = max(0.0, min(self.config.travel_x_mm, cam_mx))
+        cam_my = max(self.config.servo_safe_y_mm, min(self.config.travel_y_mm, cam_my))
+        pick_record.camera_motor_x = round(cam_mx, 2)
+        pick_record.camera_motor_y = round(cam_my, 2)
+        self.log_event(
+            f"Phase 5 [{'RETRY ALIGN' if is_retry else 'PICKING'}]: {action_word} Block #{block.id} "
+            f"({block.color.upper()}) at plate ({block.x_mm:.1f}, {block.y_mm:.1f}) mm "
+            f"-> motor ({cam_mx:.1f}, {cam_my:.1f}, Z={scan_z_mm:.1f}) mm..."
+        )
+
+        match = self._capture_and_refine_target_block(block, scan_z_mm, settle=is_retry)
+        if match is None and is_retry and scan_z_mm > self.config.z_scan_mm + 0.5:
+            self.log_event(
+                f"Retry align for Block #{block.id}: elevating to Z_scan={self.config.z_scan_mm:.1f} mm for wider FOV..."
+            )
+            match = self._capture_and_refine_target_block(
+                block, self.config.z_scan_mm, settle=True
+            )
+
+        pick_record.fine_align_checked = True
+        if match is None:
+            pick_record.fine_align_found = False
+            self.log_event(
+                f"Notice: Fine alignment did not detect '{block.color}' block. "
+                f"Proceeding with ({block.x_mm:.1f}, {block.y_mm:.1f}) mm."
+            )
+            return False
+
+        cam_mx, cam_my, best, refined_x, refined_y, err_mm = match
+        if is_retry and err_mm > 2.5:
+            block.x_mm, block.y_mm = refined_x, refined_y
+            second = self._capture_and_refine_target_block(block, scan_z_mm, settle=True)
+            if second is not None:
+                cam_mx, cam_my, best, refined_x, refined_y, second_err = second
+                err_mm = max(err_mm, second_err)
+
+        refined_angle = self.kinematics.compensate_block_angle(best.angle_deg)
+        # Keep square-block angle within +/-45 deg of prior estimate to avoid 90 deg aspect swaps
+        angle_diff = (refined_angle - block.angle_deg + 180.0) % 180.0
+        if angle_diff > 90.0:
+            angle_diff -= 180.0
+        if abs(angle_diff) > 45.0:
+            refined_angle = round((refined_angle + (-90.0 if angle_diff > 0 else 90.0)) % 180.0, 1)
+
+        pick_record.camera_motor_x = round(cam_mx, 2)
+        pick_record.camera_motor_y = round(cam_my, 2)
+        pick_record.fine_align_found = True
+        pick_record.fine_u_px = round(best.u_px, 1)
+        pick_record.fine_v_px = round(best.v_px, 1)
+        pick_record.fine_contour_area_px = round(best.area_px, 1)
+        pick_record.fine_residual_err_mm = round(err_mm, 2)
+        pick_record.refined_plate_x = round(refined_x, 2)
+        pick_record.refined_plate_y = round(refined_y, 2)
+        pick_record.refined_angle_deg = refined_angle
+
+        block.x_mm, block.y_mm, block.angle_deg = refined_x, refined_y, refined_angle
+        self.log_event(
+            f"Fine alignment {'re-centered' if is_retry else 'check'} on Block #{block.id}: "
+            f"residual offset {err_mm:.2f} mm (area {best.area_px:.0f} px), angle {block.angle_deg:.1f} deg."
+        )
+        return True
 
     def _execute_pick_weigh_and_stack(self, block: BlockRecord, can_stage: bool = True) -> Optional[int]:
         pick_record = PickActionRecord(
@@ -870,127 +1026,85 @@ class GantryStateMachine:
         )
         picked_sb = None
         staged_blocker_id: Optional[int] = None
+        coarse_x, coarse_y = block.x_mm, block.y_mm
 
         try:
-            # --- PHASE 5A: Move Camera Above Block & Stop-and-Check Fine Alignment ---
+            # --- PHASE 5A: Camera Fine Align + Guarded Pick with Early Force-Spike Retry ---
             self.state = "PICKING"
             block.status = "PICKING"
-            cam_mx, cam_my = self.kinematics.plate_to_camera_motor(block.x_mm, block.y_mm)
-            cam_mx = max(0.0, min(self.config.travel_x_mm, cam_mx))
-            cam_my = max(0.0, min(self.config.travel_y_mm, cam_my))
-            pick_record.camera_motor_x = round(cam_mx, 2)
-            pick_record.camera_motor_y = round(cam_my, 2)
-
             transit_z = self._safe_transit_z_down()
-            self.log_event(
-                f"Phase 5 [PICKING]: Moving camera above Block #{block.id} ({block.color.upper()}) "
-                f"at plate ({block.x_mm:.1f}, {block.y_mm:.1f}) mm -> motor ({cam_mx:.1f}, {cam_my:.1f}, Z={transit_z:.1f}) mm..."
-            )
-            if self.serial.pose.z_mm > transit_z + 0.1:
-                self.serial.move_to(z_mm=transit_z, feedrate_mm_s=self.config.feedrate_z_mm_s)
-            self.serial.move_to(
-                x_mm=cam_mx,
-                y_mm=cam_my,
-                z_mm=transit_z,
-                angle_deg=0.0,
-            )
-            self._check_pause_or_abort()
+            max_attempts = max(1, int(self.config.max_pick_misalign_retries))
+            weigh_z = transit_z
 
-            # Capture single verification frame for residual positional error
-            v_frame = self.vision.capture_stationary_frame(
-                self.serial.pose.x_mm, self.serial.pose.y_mm, self.serial.pose.z_mm
-            )
-            v_dets = [d for d in self.vision.detect_blocks_hsv(v_frame) if d.color == block.color]
-            if v_dets:
-                # Pick detection closest to image center
-                cx, cy = self.config.frame_width / 2.0, self.config.frame_height / 2.0
-                best = min(v_dets, key=lambda d: (d.u_px - cx) ** 2 + (d.v_px - cy) ** 2)
-                refined_plate_x, refined_plate_y = self.kinematics.pixel_to_world_mm(
-                    best.u_px,
-                    best.v_px,
-                    self.serial.pose.x_mm,
-                    self.serial.pose.y_mm,
-                    self.serial.pose.z_mm,
-                    self.config.z_scan_mm,
-                    target_height_above_surface_mm=self.config.block_top_height_mm_at(
-                        block.x_mm, block.y_mm
-                    ),
-                )
-                refined_angle = self.kinematics.compensate_block_angle(best.angle_deg)
-                # For square blocks (90 deg rotational symmetry), keep refined angle within +/-45 deg of coarse angle
-                # to prevent 1-px minAreaRect aspect swaps from flipping the servo by 90 degrees
-                angle_diff = (refined_angle - block.angle_deg + 180.0) % 180.0
-                if angle_diff > 90.0:
-                    angle_diff -= 180.0
-                if abs(angle_diff) > 45.0:
-                    if angle_diff > 0:
-                        refined_angle = round((refined_angle - 90.0) % 180.0, 1)
-                    else:
-                        refined_angle = round((refined_angle + 90.0) % 180.0, 1)
-
-                err_mm = ((refined_plate_x - block.x_mm) ** 2 + (refined_plate_y - block.y_mm) ** 2) ** 0.5
-
-                pick_record.fine_align_checked = True
-                pick_record.fine_align_found = True
-                pick_record.fine_u_px = round(best.u_px, 1)
-                pick_record.fine_v_px = round(best.v_px, 1)
-                pick_record.fine_contour_area_px = round(best.area_px, 1)
-                pick_record.fine_residual_err_mm = round(err_mm, 2)
-                pick_record.refined_plate_x = round(refined_plate_x, 2)
-                pick_record.refined_plate_y = round(refined_plate_y, 2)
-                pick_record.refined_angle_deg = refined_angle
-
-                block.x_mm, block.y_mm, block.angle_deg = refined_plate_x, refined_plate_y, refined_angle
-                self.log_event(
-                    f"Fine alignment check on Block #{block.id}: residual offset {err_mm:.2f} mm "
-                    f"(area {best.area_px:.0f} px), angle {block.angle_deg:.1f} deg."
-                )
-            else:
-                pick_record.fine_align_checked = True
-                pick_record.fine_align_found = False
-                self.log_event(
-                    f"Notice: Fine alignment at hover height did not detect '{block.color}' block. "
-                    f"Proceeding with coarse scan coordinates ({block.x_mm:.1f}, {block.y_mm:.1f}) mm."
+            for attempt in range(1, max_attempts + 1):
+                self._fine_align_block_with_camera(
+                    block,
+                    pick_record,
+                    scan_z_mm=transit_z,
+                    is_retry=(attempt > 1),
                 )
 
-            # Translate plate coordinate to gripper center target & fold square block grasp angle into [0..90 deg)
-            # so wrist servo + zero trim stays clear of its 180 deg mechanical end-stop.
-            grip_mx, grip_my = self.kinematics.plate_to_gripper_motor(block.x_mm, block.y_mm)
-            grip_mx = max(0.0, min(self.config.travel_x_mm, grip_mx))
-            grip_my = max(0.0, min(self.config.travel_y_mm, grip_my))
-            servo_angle = self.kinematics.servo_angle_for_plate_angle(block.angle_deg)
-            pick_record.gripper_motor_x = round(grip_mx, 2)
-            pick_record.gripper_motor_y = round(grip_my, 2)
-            pick_record.servo_angle_deg = servo_angle
+                # Translate plate coordinate to gripper center target (clamped clear of rear stop)
+                grip_mx, grip_my = self.kinematics.plate_to_gripper_motor(block.x_mm, block.y_mm)
+                grip_mx = max(0.0, min(self.config.travel_x_mm, grip_mx))
+                grip_my = max(self.config.servo_safe_y_mm, min(self.config.travel_y_mm, grip_my))
+                servo_angle = self.kinematics.servo_angle_for_plate_angle(block.angle_deg)
+                pick_record.gripper_motor_x = round(grip_mx, 2)
+                pick_record.gripper_motor_y = round(grip_my, 2)
+                pick_record.servo_angle_deg = servo_angle
 
-            self.serial.move_to(
-                x_mm=grip_mx,
-                y_mm=grip_my,
-                z_mm=transit_z,
-                angle_deg=servo_angle,
-                feedrate_mm_s=self.config.feedrate_fine_mm_s,
-            )
+                pick_z_down = self.config.surface_pick_z_down_mm(block.x_mm, block.y_mm)
+                weigh_z = min(self.config.z_hover_mm, max(10.0, pick_z_down - 35.0))
+                if attempt == 1 and pick_z_down < self.config.z_pick_mm - 0.1:
+                    self.log_event(
+                        f"Topology [PICKING]: Block #{block.id} rests on raised aluminum platform -> picking at Z_down={pick_z_down:.2f} mm."
+                    )
 
-            # Tare HX711 load cell before picking, open NC solenoid gripper (GRIP 0), descend, close (GRIP 1)
-            try:
-                self.serial.tare_scale()
-                self._set_mass_reading(0.00, None)
-                pick_record.tare_success = True
-            except Exception as exc:
-                pick_record.tare_success = False
-                self.log_event(f"Notice: Tare scale skipped ({exc}).")
-
-            pick_z_down = self.config.surface_pick_z_down_mm(block.x_mm, block.y_mm)
-            if pick_z_down < self.config.z_pick_mm - 0.1:
-                self.log_event(
-                    f"Topology [PICKING]: Block #{block.id} rests on raised aluminum platform -> picking at Z_down={pick_z_down:.2f} mm."
+                if self.serial.pose.z_mm > weigh_z + 0.1:
+                    self.serial.move_to(z_mm=weigh_z, feedrate_mm_s=self.config.feedrate_z_mm_s)
+                self.serial.move_to(
+                    x_mm=grip_mx,
+                    y_mm=grip_my,
+                    z_mm=weigh_z,
+                    angle_deg=servo_angle,
+                    feedrate_mm_s=self.config.feedrate_fine_mm_s,
                 )
-            self.serial.set_gripper(closed=False)  # Energize relay to open NC jaws
-            self._press_cube_into_surface(
-                surface_z_mm=pick_z_down,
-                max_press_mm=self.config.pick_press_max_mm,
-            )
-            self.serial.set_gripper(closed=True)   # De-energize relay so NC solenoid grips block
+
+                # Tare HX711 at hover height before opening jaws and starting guarded descent
+                pick_record.tare_success = self._auto_tare_scale(f"Pre-pick Block #{block.id}")
+
+                self.serial.set_gripper(closed=False)  # Energize relay to open NC jaws
+                actual_z = self._press_cube_into_surface(
+                    surface_z_mm=pick_z_down,
+                    max_press_mm=self.config.pick_press_max_mm,
+                    approach_offset_mm=self.config.pick_guard_offset_mm,
+                    feedrate_press_mm_s=self.config.feedrate_pick_guard_mm_s,
+                )
+
+                early_limit_z = pick_z_down - self.config.early_force_z_margin_mm
+                if actual_z < early_limit_z:
+                    spike_g = abs(self.serial.last_press_delta_g)
+                    self.log_event(
+                        f"Misalignment [PICKING]: Early force spike ({spike_g:.1f} g) on Block #{block.id} "
+                        f"at Z_down={actual_z:.2f} mm (expected >= {early_limit_z:.2f} mm) "
+                        f"[attempt {attempt}/{max_attempts}]."
+                    )
+                    self.serial.move_to(z_mm=transit_z, feedrate_mm_s=self.config.feedrate_z_mm_s)
+                    self.serial.set_gripper(closed=True)
+                    if attempt >= max_attempts:
+                        raise RuntimeError(
+                            f"Pick failed after {max_attempts} consecutive early force spikes on Block #{block.id} "
+                            f"({block.color.upper()}): last contact at Z_down={actual_z:.2f} mm (< {early_limit_z:.2f} mm)."
+                        )
+                    continue
+
+                self.serial.set_gripper(closed=True)   # De-energize relay so NC solenoid grips block
+                break
+
+            if pick_record.fine_align_found:
+                self.kinematics.record_fine_alignment_drift(
+                    coarse_x, coarse_y, block.x_mm, block.y_mm
+                )
 
             # Mark closest ground-truth block as picked in synthetic renderer if in mock mode
             if self.mock_hardware:
@@ -1004,8 +1118,10 @@ class GantryStateMachine:
                     picked_sb = nearest_sb
                     self.serial.set_simulated_held_mass(nearest_sb.mass_g)
 
-            # Lift to safe transit height (clears tallest existing stack on the course)
-            self.serial.move_to(z_mm=transit_z, feedrate_mm_s=self.config.feedrate_z_mm_s)
+            # Lift to consistent hover height (clear of Z=0 top stop) to weigh accurately before full transit retract
+            self.serial.move_to(z_mm=weigh_z, feedrate_mm_s=self.config.feedrate_z_mm_s)
+            if not self.mock_hardware:
+                time.sleep(0.15)
 
             # --- PHASE 5B: Weigh Block on HX711 Load Cell & Classify Mass ---
             self.state = "WEIGHING"
@@ -1017,6 +1133,9 @@ class GantryStateMachine:
                 self.log_event(f"Notice: Load cell sample failed ({exc}); assigning default nominal mass 7.05g.")
                 measured_mass_g = 7.05
                 self._set_mass_reading(round(measured_mass_g, 2), str(exc))
+
+            if transit_z < weigh_z - 0.1:
+                self.serial.move_to(z_mm=transit_z, feedrate_mm_s=self.config.feedrate_z_mm_s)
 
             block.mass_g = measured_mass_g
             block.mass_class = self.config.classify_mass(measured_mass_g)
@@ -1079,10 +1198,10 @@ class GantryStateMachine:
             pick_record.drop_z_down_mm = round(drop_z_down, 2)
             pick_record.stack_zone = zone_label
 
-            # Convert drop Plate Coordinates to gripper motor coordinates
-            drop_mx, drop_my = self.kinematics.plate_to_gripper_motor(drop_plate_x, drop_plate_y)
+            # Convert drop Plate Coordinates to gripper motor coordinates (compensating any observed drift)
+            drop_mx, drop_my = self.kinematics.plate_to_drop_gripper_motor(drop_plate_x, drop_plate_y)
             drop_mx = max(0.0, min(self.config.travel_x_mm, drop_mx))
-            drop_my = max(0.0, min(self.config.travel_y_mm, drop_my))
+            drop_my = max(self.config.servo_safe_y_mm, min(self.config.travel_y_mm, drop_my))
             if staged_blocker_id is not None:
                 self.log_event(
                     f"Phase 6 [STAGING]: Destination {zone_key.upper()} blocked by Block #{blocker.id} "

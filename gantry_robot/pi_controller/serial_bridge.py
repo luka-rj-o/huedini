@@ -73,6 +73,7 @@ class ESP32SerialBridge:
         self._abort_flag = False
         self._abort_generation = 0
         self._last_activity_mono = time.monotonic()
+        self.last_press_delta_g = 0.0
         self._simulated_held_mass_g: Optional[float] = None
 
     def _start_event_monitor(self) -> None:
@@ -572,9 +573,23 @@ class ESP32SerialBridge:
         ty = max(0.0, min(self.config.travel_y_mm, ty))
         tz = max(0.0, min(self.config.travel_z_bottom_mm, tz))
 
-        # EE rotation clearance: never rotate servo A when Y < servo_safe_y_mm (10 mm),
-        # because swinging the end-effector near Y=0 hits the rear end stop.
+        # EE & Z-carriage rear clearance: when Z is lowered (> 2.0 mm) or about to lower,
+        # keep Y >= servo_safe_y_mm (10.0 mm) so the lowered end-effector never hits the rear
+        # end-stop or rotates into it (which causes Y belt step loss).
         safe_y = self.config.servo_safe_y_mm
+        if tz > 2.0 or self.pose.z_mm > 2.0:
+            if ty < safe_y:
+                logger.debug("Clamping lowered-Z target Y %.2f -> %.2f mm to clear rear stop.", ty, safe_y)
+                ty = safe_y
+            if self.pose.z_mm <= 2.0 and self.pose.y_mm < safe_y:
+                self.move_to(
+                    y_mm=safe_y,
+                    z_mm=self.pose.z_mm,
+                    angle_deg=self.pose.angle_deg,
+                    feedrate_mm_s=tf,
+                    timeout_s=timeout_s,
+                )
+
         if abs(ta - self.pose.angle_deg) > 0.1 and ty < safe_y:
             if self.pose.y_mm < safe_y:
                 self.move_to(
@@ -624,6 +639,7 @@ class ESP32SerialBridge:
         dist = max(0.0, max_z - self.pose.z_mm)
         timeout = max(self.config.serial_timeout_s, (dist / press_f) * 2.5 + 5.0)
 
+        self.last_press_delta_g = 0.0
         lines = self.send_command(
             f"PRESS Z{max_z:.2f} D{req_force_g:.1f} F{press_f:.1f}",
             timeout_s=timeout,
@@ -635,6 +651,11 @@ class ESP32SerialBridge:
                     if tok.startswith("Z:"):
                         try:
                             actual_z = float(tok.split(":", 1)[1])
+                        except ValueError:
+                            pass
+                    elif tok.startswith("DF:"):
+                        try:
+                            self.last_press_delta_g = float(tok.split(":", 1)[1])
                         except ValueError:
                             pass
                 break
@@ -718,8 +739,9 @@ class ESP32SerialBridge:
                     tz = float(tok[1:])
                 elif tok.startswith("F"):
                     tf = max(1.0, float(tok[1:]))
-            sim_z = min(tz, self.pose.z_mm + min(1.5, max(0.0, tz - self.pose.z_mm)))
+            sim_z = min(tz, max(self.pose.z_mm, tz - 1.5))
             self._animate_mock_move(self.pose.x_mm, self.pose.y_mm, sim_z, self.pose.angle_deg, tf)
+            self.last_press_delta_g = -36.0
             return [f"PRESSED Z:{sim_z:.2f} DF:-36.00"]
 
         if upper.startswith("GRIP"):
