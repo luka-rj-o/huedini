@@ -185,8 +185,8 @@ const unsigned long STALL_CONFIRM_WINDOW_MS = 15;
 const unsigned long DRIVER_ENABLE_SETTLE_MS = 200;
 
 // Wrist servo mechanical zero trim (degrees added to logical 0..180 commands)
-// Tuned for MG90S replacement (-3 deg from prior 12.0f trim)
-float servoZeroOffsetDeg = 9.0f;
+// Tuned for MG90S replacement (+1 deg CW trim from prior 9.0f trim)
+float servoZeroOffsetDeg = 10.0f;
 
 // ============================================================
 //  OBJECTS & STATE
@@ -2435,7 +2435,7 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
 //  STEPPER CHIMES (TADA & WIN95 via verified SpreadCycle + DDS)
 // ============================================================
 static const int CHIME_MICROSTEPS_X  = 4;   // Verified 1:1 fundamental pitch (A4=440, Eb5=622.25)
-static const int CHIME_MICROSTEPS_Y  = 8;   // Unused in 2-voice chimes (belt damps tone)
+static const int CHIME_MICROSTEPS_Y  = 2;   // Verified loudest 1:1 mid/harmony voice on replacement Y motor
 static const int CHIME_MICROSTEPS_Z  = 1;   // Verified 1:1 clean bass/harmony (C4=261.63, A4=440)
 static const int CHIME_CURRENT_MA_XZ = 500; // Moderate chime boost (avoids rail droop / UVLO)
 static const int CHIME_CURRENT_MA_Y  = 500; // Matches normal 480 mA Y motor rating in vsense=1
@@ -2961,29 +2961,29 @@ void handleChimeGcode(String params, bool emitProtocolReply) {
   int awayY = (curYMm > TRAVEL_Y_MM * 0.5f) ? -1 : 1;
   int awayZ = (curZMm > TRAVEL_Z_MM * 0.5f) ? -1 : 1;
 
-  // Calibrated 2-voice arrangements (X @ 4x = 1:1 treble/melody, Z @ 1x = 1:1 bass/harmony, Y muted):
-  // Windows 3.1 "Tada!" (same C6+E4 brass chord repeated twice with 22ms lip-up attack, second sustains longer)
+  // Calibrated 3-voice arrangements (X @ 4x = 1:1 treble/melody, Y @ 2x = 1:1 mid/harmony, Z @ 1x = 1:1 bass/harmony):
+  // Windows 3.1 "Tada!" (C6+G4+E4 C-major brass triad repeated twice with 22ms lip-up attack, second sustains longer)
   const ChimeSegment tada[] = {
-    {  995.00f, 0.00f, 314.00f,   22UL, 0, 0, 0 }, // brass attack scoop into C6+E4
-    { 1046.50f, 0.00f, 329.63f,   73UL, 0, 0, 0 }, // "Ta-" (C6 + E4 short burst)
-    {    0.00f, 0.00f,   0.00f,   30UL, 0, 0, 0 }, // crisp articulation breath
-    {  995.00f, 0.00f, 314.00f,   22UL, 0, 0, 0 }, // matching brass attack scoop into C6+E4
-    { 1046.50f, 0.00f, 329.63f, 1020UL, 0, 0, 0 }, // "-DAAA!" (C6 + E4 sustained burst)
+    {  995.00f, 372.50f, 314.00f,   22UL, 0, 0, 0 }, // brass attack scoop into C6+G4+E4
+    { 1046.50f, 392.00f, 329.63f,   73UL, 0, 0, 0 }, // "Ta-" (C6 + G4 + E4 short burst)
+    {    0.00f,   0.00f,   0.00f,   30UL, 0, 0, 0 }, // crisp articulation breath
+    {  995.00f, 372.50f, 314.00f,   22UL, 0, 0, 0 }, // matching brass attack scoop into C6+G4+E4
+    { 1046.50f, 392.00f, 329.63f, 1020UL, 0, 0, 0 }, // "-DAAA!" (C6 + G4 + E4 sustained burst)
   };
 
-  // Windows 95 Startup Theme ("The Microsoft Sound", spectral transcription at original A4=428.5Hz pitch)
+  // Windows 95 Startup Theme ("The Microsoft Sound", 3-voice spectral transcription at original A4=428.5Hz pitch)
   const ChimeSegment win95[] = {
-    {  764.40f, 0.00f, 169.50f,  880UL, 0, 0, 0 }, // G5 bell + F3 bass drone (0.00-0.88s)
-    { 1145.00f, 0.00f, 254.50f,  100UL, 0, 0, 0 }, // D6 bell leap + C4 chord swell
-    { 1145.00f, 0.00f, 301.50f,  100UL, 0, 0, 0 }, // D6 (cont) + Eb4 chord bloom
-    { 1145.00f, 0.00f, 340.30f,  910UL, 0, 0, 0 }, // D6 (cont) + F4 warm hold
-    { 1018.50f, 0.00f, 340.30f,  330UL, 0, 0, 0 }, // C6 echo ping 1 + F4 sustain
-    {    0.00f, 0.00f, 254.50f,  510UL, 0, 0, 0 }, // C4 pad sustain between pings
-    { 1018.50f, 0.00f, 340.30f,  330UL, 0, 0, 0 }, // C6 echo ping 2 + F4 sustain
-    {    0.00f, 0.00f, 254.50f,  510UL, 0, 0, 0 }, // C4 pad sustain between pings
-    { 1018.50f, 0.00f, 340.30f,  330UL, 0, 0, 0 }, // C6 echo ping 3 + F4 sustain
-    {    0.00f, 0.00f, 254.50f,  510UL, 0, 0, 0 }, // C4 pad sustain between pings
-    { 1018.50f, 0.00f, 340.30f,  850UL, 0, 0, 0 }, // C6 echo ping 4 + F4 (longer final ring)
+    {  764.40f, 254.50f, 169.50f,  880UL, 0, 0, 0 }, // G5 bell + C4 5th drone + F3 bass drone (0.00-0.88s)
+    { 1145.00f, 381.60f, 254.50f,  100UL, 0, 0, 0 }, // D6 bell leap + G4 + C4 stacked-5ths swell
+    { 1145.00f, 453.50f, 301.50f,  100UL, 0, 0, 0 }, // D6 (cont) + Bb4 + Eb4 Ebmaj7 chord bloom
+    { 1145.00f, 254.50f, 340.30f,  910UL, 0, 0, 0 }, // D6 (cont) + C4 + F4 warm hold
+    { 1018.50f, 254.50f, 340.30f,  330UL, 0, 0, 0 }, // C6 echo ping 1 + C4 + F4 sustain
+    {    0.00f, 169.50f, 254.50f,  510UL, 0, 0, 0 }, // F3 + C4 warm dual-voice pad breath
+    { 1018.50f, 254.50f, 340.30f,  330UL, 0, 0, 0 }, // C6 echo ping 2 + C4 + F4 sustain
+    {    0.00f, 169.50f, 254.50f,  510UL, 0, 0, 0 }, // F3 + C4 warm dual-voice pad breath
+    { 1018.50f, 254.50f, 340.30f,  330UL, 0, 0, 0 }, // C6 echo ping 3 + C4 + F4 sustain
+    {    0.00f, 169.50f, 254.50f,  510UL, 0, 0, 0 }, // F3 + C4 warm dual-voice pad breath
+    { 1018.50f, 254.50f, 340.30f,  850UL, 0, 0, 0 }, // C6 echo ping 4 + C4 + F4 (longer final ring)
   };
 
   const bool isWin95 = (params == "WIN95" || params == "95");
@@ -3016,7 +3016,7 @@ void handleChimeGcode(String params, bool emitProtocolReply) {
   float prevFreqX = -1.0f, prevFreqY = -1.0f, prevFreqZ = -1.0f;
   unsigned long prevDurMs = 0;
   const long MAX_CHIME_OFFSET_X = 2500L; // 25.0 mm @ 4x
-  const long MAX_CHIME_OFFSET_Y = 800L;  // 20.0 mm @ 8x
+  const long MAX_CHIME_OFFSET_Y = 450L;  // 45.0 mm @ 2x (10.0 steps/mm)
   const long MAX_CHIME_OFFSET_Z = 500L;  // 20.0 mm @ 1x
   for (unsigned int i = 0; i < count; i++) {
     ChimeSegment seg = seq[i];

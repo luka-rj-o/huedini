@@ -371,6 +371,29 @@ function promptCustomSpm() {
   if (!isNaN(val) && val > 0) applyLeadPreset(0, val);
 }
 
+function setServoOffsetTag(offsetDeg) {
+  const val = Number(offsetDeg);
+  if (isNaN(val)) return;
+  const tag = $("currentServoOffsetTag");
+  if (tag) tag.textContent = `${val >= 0 ? "+" : ""}${val.toFixed(1)}°`;
+}
+
+function nudgeServoOffset(deltaDeg) {
+  sendCmd("SET_SERVO_OFFSET", { delta_deg: deltaDeg });
+}
+
+function promptServoOffset() {
+  const cur = latestState.calibration?.servo_zero_offset_deg ?? 11.0;
+  const input = prompt("Servo mechanical neutral offset at A=0° (-45.0 to +45.0°; + rotates CW):", Number(cur).toFixed(1));
+  if (input === null) return;
+  const val = parseFloat(input);
+  if (!isNaN(val) && val >= -45.0 && val <= 45.0) {
+    const clamped = Math.round(val * 10) / 10;
+    setServoOffsetTag(clamped);
+    sendCmd("SET_SERVO_OFFSET", { offset_deg: clamped });
+  }
+}
+
 let liveStreamActive = true;
 function toggleLiveStream() {
   liveStreamActive = !liveStreamActive;
@@ -648,6 +671,7 @@ function updateUI(data, prevState) {
   const rmsStr = cal.residual_rms_mm != null ? `${Number(cal.residual_rms_mm).toFixed(3)} mm` : "— mm";
   setText("calPlateFitReadout", `${plateYaw >= 0 ? "+" : ""}${plateYaw.toFixed(2)}° · ${rmsStr}`);
   if (data.steps_per_mm) setSpmTag(data.steps_per_mm.x, data.steps_per_mm.y);
+  if (cal.servo_zero_offset_deg !== undefined && cal.servo_zero_offset_deg !== null) setServoOffsetTag(cal.servo_zero_offset_deg);
   if (typeof update3DReachBounds === "function") update3DReachBounds();
 
   if (data.live_cv_enabled !== undefined) {

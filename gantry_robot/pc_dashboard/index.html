@@ -313,6 +313,19 @@
               <button class="seg" onclick="promptCustomSpm()" title="Enter exact calibrated steps/mm">Custom…</button>
             </div>
           </div>
+          <div class="cal-lead">
+            <div class="cal-lead-head">
+              <span class="k">Wrist servo neutral trim (0&deg;)</span>
+              <span id="currentServoOffsetTag" class="pill pill-accent">+11.0&deg;</span>
+            </div>
+            <div class="segmented segmented-wide">
+              <button class="seg" onclick="nudgeServoOffset(-5)" title="Rotate neutral 5° CCW">&minus;5&deg; CCW</button>
+              <button class="seg" onclick="nudgeServoOffset(-1)" title="Rotate neutral 1° CCW">&minus;1&deg; CCW</button>
+              <button class="seg" onclick="nudgeServoOffset(1)" title="Rotate neutral 1° CW">+1&deg; CW</button>
+              <button class="seg" onclick="nudgeServoOffset(5)" title="Rotate neutral 5° CW">+5&deg; CW</button>
+              <button class="seg" onclick="promptServoOffset()" title="Enter exact servo neutral offset (deg)">Exact…</button>
+            </div>
+          </div>
         </div>
       </section>
     </section>

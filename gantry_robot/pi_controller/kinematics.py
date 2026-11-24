@@ -59,6 +59,8 @@ class EyeInHandKinematics:
         cam_origin_x_mm: float = 32.5,
         cam_origin_y_mm: float = 33.1,
         corner_fiducials: Optional[Dict[int, Tuple[float, float]]] = None,
+        cam_tilt_x_mm_per_mm_z: float = 0.0,
+        cam_tilt_y_mm_per_mm_z: float = 0.0,
     ):
         self.frame_width = frame_width
         self.frame_height = frame_height
@@ -73,6 +75,8 @@ class EyeInHandKinematics:
         self.course_elevation_mm = course_elevation_mm
         self.cam_origin_x_mm = cam_origin_x_mm
         self.cam_origin_y_mm = cam_origin_y_mm
+        self.cam_tilt_x_mm_per_mm_z = cam_tilt_x_mm_per_mm_z
+        self.cam_tilt_y_mm_per_mm_z = cam_tilt_y_mm_per_mm_z
         self.corner_fiducials = corner_fiducials or {
             0: (7.5, 7.5),
             1: (7.5, 159.9),
@@ -182,6 +186,19 @@ class EyeInHandKinematics:
         cam_h_now = max(25.0, cam_above_course - z_down_mm - target_height_above_surface_mm)
         cam_h_scan = max(25.0, cam_above_course - z_scan_down_mm)
         return cam_h_now / cam_h_scan
+
+    def _tilt_dz_closer_mm(
+        self,
+        z_current_mm: float,
+        z_scan_mm: float = 0.0,
+        target_height_above_surface_mm: float = 0.0,
+    ) -> float:
+        """
+        Distance (mm) the camera optical axis is closer to the observed plane than during
+        the Z_scan=0 ArUco fiducial calibration (includes floor elevation when elevated).
+        """
+        dz_elev = self.course_elevation_mm if target_height_above_surface_mm > 0.0 else 0.0
+        return (z_current_mm - z_scan_mm) + target_height_above_surface_mm + dz_elev
 
     def compute_auto_scale(
         self,
@@ -462,9 +479,16 @@ class EyeInHandKinematics:
         # Image Y axis: v > cy is to physical +Y (forward) direction
         u_prime = -(u_px - self.cx_px) * kx
         v_prime = (v_px - self.cy_px) * ky
+        dz_closer = self._tilt_dz_closer_mm(
+            z_current_mm, z_scan_mm, target_height_above_surface_mm
+        )
+        tilt_dx_mm = self.cam_tilt_x_mm_per_mm_z * dz_closer
+        tilt_dy_mm = self.cam_tilt_y_mm_per_mm_z * dz_closer
 
         if self._plate_A is not None and self._plate_t is not None:
             dx_m, dy_m = self._rotate_2d(u_prime, v_prime, self.cam_motor_skew_deg)
+            dx_m -= tilt_dx_mm
+            dy_m -= tilt_dy_mm
             cx_m = motor_x_mm + dx_m
             cy_m = motor_y_mm + dy_m
             plate_x = float(self._plate_A[0, 0]) * cx_m + float(self._plate_A[0, 1]) * cy_m + float(self._plate_t[0])
@@ -472,6 +496,8 @@ class EyeInHandKinematics:
             return plate_x, plate_y
 
         dx_mm, dy_mm = self._rotate_2d(u_prime, v_prime, self.cam_skew_deg)
+        dx_mm -= tilt_dx_mm
+        dy_mm -= tilt_dy_mm
         plate_x = self.cam_origin_x_mm + motor_x_mm + dx_mm
         plate_y = self.cam_origin_y_mm + motor_y_mm + dy_mm
         return plate_x, plate_y
@@ -495,18 +521,23 @@ class EyeInHandKinematics:
         )
         kx = self.kx_mm_per_px * height_ratio
         ky = self.ky_mm_per_px * height_ratio
+        dz_closer = self._tilt_dz_closer_mm(
+            z_current_mm, z_scan_mm, target_height_above_surface_mm
+        )
+        tilt_dx_mm = self.cam_tilt_x_mm_per_mm_z * dz_closer
+        tilt_dy_mm = self.cam_tilt_y_mm_per_mm_z * dz_closer
 
         if self._plate_A_inv is not None and self._plate_t_inv is not None:
             cx_m = float(self._plate_A_inv[0, 0]) * plate_x_mm + float(self._plate_A_inv[0, 1]) * plate_y_mm + float(self._plate_t_inv[0])
             cy_m = float(self._plate_A_inv[1, 0]) * plate_x_mm + float(self._plate_A_inv[1, 1]) * plate_y_mm + float(self._plate_t_inv[1])
-            dx_m = cx_m - motor_x_mm
-            dy_m = cy_m - motor_y_mm
+            dx_m = cx_m - motor_x_mm + tilt_dx_mm
+            dy_m = cy_m - motor_y_mm + tilt_dy_mm
             u_prime, v_prime = self._rotate_2d(dx_m, dy_m, -self.cam_motor_skew_deg)
         else:
             cam_x = self.cam_origin_x_mm + motor_x_mm
             cam_y = self.cam_origin_y_mm + motor_y_mm
-            dx_mm = plate_x_mm - cam_x
-            dy_mm = plate_y_mm - cam_y
+            dx_mm = plate_x_mm - cam_x + tilt_dx_mm
+            dy_mm = plate_y_mm - cam_y + tilt_dy_mm
             u_prime, v_prime = self._rotate_2d(dx_mm, dy_mm, -self.cam_skew_deg)
 
         u_px = self.cx_px - u_prime / kx
@@ -525,7 +556,11 @@ class EyeInHandKinematics:
         Maps a desired plate-frame grasp/place orientation (deg) into the gantry's
         motor-frame wrist servo angle [0..90 deg) for symmetric square blocks.
         """
-        return round((plate_angle_deg + self.plate_yaw_deg) % 90.0, 1)
+        eff_yaw = self.plate_yaw_deg if abs(self.plate_yaw_deg) >= 0.5 else 0.0
+        angle = round((plate_angle_deg + eff_yaw) % 90.0, 1)
+        if angle >= 89.0:
+            angle = 0.0
+        return angle
 
     def plate_to_camera_motor(self, plate_x_mm: float, plate_y_mm: float) -> Tuple[float, float]:
         """Calculates motor coordinates to position camera optical center directly over a plate location."""

@@ -138,6 +138,7 @@ class GantryConfig:
     weigh_settle_s: float = 0.25         # Post-lift cantilever settling before HX711 WEIGH
     weigh_servo_angle_deg: float = 0.0   # Keep wrist clear of camera FOV and matched across TARE and WEIGH
     servo_safe_y_mm: float = 10.0
+    servo_zero_offset_deg: float = 6.0   # Mechanical neutral trim calibrated in UI (matches servo_trim.json)
 
     # --- Eye-in-Hand Camera & Offset Parameters ---
     camera_index: int = 0
@@ -148,10 +149,13 @@ class GantryConfig:
     default_ky_mm_per_px: float = 0.25
     default_cam_skew_deg: float = 0.0
 
-    # Camera is offset from gripper in CAD (updated after moving camera mount 15.0 mm back in -Y & upright cam skew ~+1.8 deg):
-    # Empirically calibrated from run_20261118_002144 gripper deltas (+3.0 mm X, -9.0 mm Y offset shift -> -3.0 mm X, +9.0 mm Y gripper move from (-4.5, -32.6)):
-    camera_to_gripper_offset_x_mm: float = -1.5
-    camera_to_gripper_offset_y_mm: float = -41.6
+    # Camera is offset from gripper in CAD (calibrated for camera Z-tilt + laydown symmetry):
+    # Measured Z-tilt (+0.0207 mm/mmZ X, +0.0387 mm/mmZ Y) + Z=25 staged-block repicks (-1.815 X, -0.770 Y),
+    # plus empirical -2.0 mm X laydown trim from run_20261124_012323 (-4.38 -> -2.38 X).
+    camera_to_gripper_offset_x_mm: float = -2.38
+    camera_to_gripper_offset_y_mm: float = -44.36
+    cam_tilt_x_mm_per_mm_z: float = 0.0207
+    cam_tilt_y_mm_per_mm_z: float = 0.0387
 
     # --- Calibration Fiducials (15 x 15 mm squares at the 4 corners of the 284 x 167.4 mm outer border) ---
     aruco_marker_id: int = 1

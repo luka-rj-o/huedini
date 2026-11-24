@@ -252,6 +252,10 @@ class ESP32SerialBridge:
                 timeout_s=5.0,
             )
             self.send_command("SETUP", timeout_s=5.0)
+            self.send_command(
+                f"servo offset {self.config.servo_zero_offset_deg:.1f}",
+                timeout_s=5.0,
+            )
             self._start_event_monitor()
         except Exception as exc:
             msg = str(exc)
@@ -336,6 +340,10 @@ class ESP32SerialBridge:
                     logger.warning("Motor supply VM is unpowered (%s). Continuing in idle/manual-test mode.", msg)
                 else:
                     raise
+            self._send_command_locked(
+                f"servo offset {self.config.servo_zero_offset_deg:.1f}",
+                timeout_s=3.0,
+            )
             self._start_event_monitor()
             logger.info("ESP32SerialBridge successfully hard-reconnected and initialized on %s.", port)
             return True
@@ -747,6 +755,14 @@ class ESP32SerialBridge:
     def play_chime(self, tune: str = "TADA") -> None:
         """Plays a celebratory stepper victory chime on the X/Z axes without losing position."""
         self.send_command(f"CHIME {tune}".strip(), timeout_s=10.0)
+
+    def set_servo_zero_offset(self, offset_deg: float) -> float:
+        """Sets and applies mechanical zero trim (deg) on the ESP32 wrist servo."""
+        clamped = round(max(-45.0, min(45.0, float(offset_deg))), 1)
+        self.config.servo_zero_offset_deg = clamped
+        if not self.mock_hardware:
+            self.send_command(f"servo offset {clamped:.1f}", timeout_s=5.0)
+        return clamped
 
     def set_simulated_held_mass(self, mass_g: Optional[float]) -> None:
         """Used in --mock-hardware mode so WEIGH returns the picked block's mass."""

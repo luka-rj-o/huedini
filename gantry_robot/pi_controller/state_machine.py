@@ -9,8 +9,10 @@ Core 6-Phase Operational State Machine for the HUE-DINI Gantry Robot:
 """
 
 from collections import deque
+import json
 import logging
 import math
+from pathlib import Path
 import queue
 import threading
 import time
@@ -55,6 +57,8 @@ class GantryStateMachine:
             cam_origin_x_mm=config.nominal_cam_origin_x_mm,
             cam_origin_y_mm=config.nominal_cam_origin_y_mm,
             corner_fiducials=config.corner_fiducials_by_id,
+            cam_tilt_x_mm_per_mm_z=config.cam_tilt_x_mm_per_mm_z,
+            cam_tilt_y_mm_per_mm_z=config.cam_tilt_y_mm_per_mm_z,
         )
         self.planner = WorldCatalogAndPlanner(
             dedup_radius_mm=config.deduplication_radius_mm,
@@ -65,6 +69,7 @@ class GantryStateMachine:
             kinematics=self.kinematics,
             mock_hardware=mock_hardware,
         )
+        self._load_servo_trim()
         self.serial = ESP32SerialBridge(
             config=config,
             mock_hardware=mock_hardware,
@@ -95,6 +100,29 @@ class GantryStateMachine:
         self._latest_live_blocks = []
         self._worker_thread: Optional[threading.Thread] = None
         self._live_vision_thread: Optional[threading.Thread] = None
+
+    def _servo_trim_path(self) -> Path:
+        return Path(__file__).resolve().parent / "servo_trim.json"
+
+    def _load_servo_trim(self) -> None:
+        path = self._servo_trim_path()
+        try:
+            if path.is_file():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                val = float(data.get("servo_zero_offset_deg", self.config.servo_zero_offset_deg))
+                self.config.servo_zero_offset_deg = round(max(-45.0, min(45.0, val)), 1)
+        except Exception as exc:
+            logger.warning("Failed to load servo trim from %s: %s", path, exc)
+
+    def _save_servo_trim(self, offset_deg: float) -> None:
+        path = self._servo_trim_path()
+        try:
+            path.write_text(
+                json.dumps({"servo_zero_offset_deg": round(float(offset_deg), 1)}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            logger.warning("Failed to save servo trim to %s: %s", path, exc)
 
     def log_event(self, message: str) -> None:
         timestamped = f"[{time.strftime('%H:%M:%S')}] {message}"
@@ -178,6 +206,7 @@ class GantryStateMachine:
                 "plate_transform": self.kinematics.plate_transform_dict(),
                 "kx_mm_per_px": round(self.kinematics.kx_mm_per_px, 4),
                 "ky_mm_per_px": round(self.kinematics.ky_mm_per_px, 4),
+                "servo_zero_offset_deg": round(self.config.servo_zero_offset_deg, 1),
             },
             "blocks": [b.to_dict() for b in self.planner.blocks],
             "live_fiducials": list(self._latest_live_fiducials),
@@ -386,6 +415,24 @@ class GantryStateMachine:
             except Exception as exc:
                 self.log_event(f"Update steps/mm failed: {exc}")
             self.publish_telemetry()
+        elif cmd == "SET_SERVO_OFFSET":
+            if self.state in ("IDLE", "PAUSED", "COMPLETE", "ERROR"):
+                try:
+                    if data.get("delta_deg") is not None:
+                        target = self.config.servo_zero_offset_deg + float(data["delta_deg"])
+                    elif data.get("offset_deg") is not None:
+                        target = float(data["offset_deg"])
+                    else:
+                        target = self.config.servo_zero_offset_deg
+                    target = round(max(-45.0, min(45.0, target)), 1)
+                    applied = self.serial.set_servo_zero_offset(target)
+                    self._save_servo_trim(applied)
+                    self.log_event(f"Servo neutral trim set to {applied:+.1f}° (saved).")
+                except Exception as exc:
+                    self.log_event(f"Update servo trim failed: {exc}")
+                self.publish_telemetry()
+            else:
+                self.log_event(f"Cannot adjust servo trim while state is {self.state}.")
         elif cmd in ("FREE_MOTORS", "SLEEP_MOTORS"):
             try:
                 self._estop_active = False
