@@ -42,6 +42,7 @@
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 #include "soc/gpio_struct.h"
+#include "esp_cpu.h"
 
 // ============================================================
 //  PIN DEFINITIONS
@@ -77,16 +78,17 @@ const unsigned long ESTOP_DEBOUNCE_MS  = 20UL;
 const float R_SENSE = 0.11f;
 
 // Values applied to steppers by the "setup" command
-const int SETUP_CURRENT_MA_XZ = 350; // Calibrated 350mA for X and Z lead screws
-const int SETUP_CURRENT_MA_Y  = 700; // Optimal 700mA for Y-axis carrying X+Z gantry bridge on belt
-const int SETUP_MICROSTEPS    = 2;   // Y & Z keep tuned 2x; X uses 8x for smooth, quiet motion
-const int SETUP_MICROSTEPS_X  = 8;
+const int SETUP_CURRENT_MA_XZ     = 350; // Calibrated 350mA for X and Z lead screws
+const int SETUP_CURRENT_MA_Y_MOVE = 480; // Cool StealthChop2 8x DDS current (0.35x hold = ~168 mA standby)
+const int SETUP_MICROSTEPS        = 2;   // Z uses 2x
+const int SETUP_MICROSTEPS_X      = 8;   // X uses 8x
+const int SETUP_MICROSTEPS_Y      = 8;   // Y uses 8x StealthChop2 + 256x intpol + IRAM S-curve DDS (40.0 steps/mm)
 // Crash (stall) detection SGTHRS used during MOVE / manual jogs.
 // Tuned per-axis at cruise speed + settle time + debounce (see isStalled()) so fast S-curve
 // moves maintain strong StallGuard headroom while catching real collisions.
 // Set to 0 with "s1 s0" (etc.) to disable crash detection on an axis.
 const int SETUP_STALL_SENS_X  = 50;  // Triggers at SG_RESULT <= 100 (X cruise avg ~290)
-const int SETUP_STALL_SENS_Y  = 2;   // Triggers at SG_RESULT <= 4 (Y cruise min ~10 at 75-80 mm/s)
+const int SETUP_STALL_SENS_Y  = 0;   // Disabled during Y moves (prioritizes drift-free travel)
 const int SETUP_STALL_SENS_Z  = 40;  // Triggers at SG_RESULT <= 80 (Z UP cruise min ~228 at 35 mm/s)
 
 // Per-axis defaults (speeds in microsteps/s, peak S-curve acceleration in microsteps/s^2)
@@ -98,21 +100,21 @@ const float DEFAULT_MAX_SPEED_Z   = 1750.0f;  // 35.0 mm/s on 8mm-lead screw @ 2
 const float DEFAULT_ACCEL_Z       = 6000.0f;  // 120.0 mm/s^2 peak S-curve accel on 8mm-lead screw @ 2x
 const float DEFAULT_HOME_SPEED_XZ = 800.0f;   // 16.0 mm/s @ 2x (calibrated for healthy back-EMF)
 
-const float DEFAULT_MAX_SPEED_Y   = 800.0f;   // 80.0 mm/s on 40mm/rev GT2 20T belt
-const float DEFAULT_ACCEL_Y       = 2400.0f;  // 240.0 mm/s^2 peak S-curve accel on 40mm/rev GT2 20T belt
-const float DEFAULT_HOME_SPEED_Y  = 700.0f;   // 70.0 mm/s (1.75 rev/s for healthy back-EMF)
+const float DEFAULT_MAX_SPEED_Y   = 4000.0f;  // 100.0 mm/s on 40mm/rev GT2 20T belt @ 8x (40.0 steps/mm)
+const float DEFAULT_ACCEL_Y       = 9600.0f;  // 240.0 mm/s^2 peak S-curve accel @ 8x (verified 0.00 mm drift)
+const float DEFAULT_HOME_SPEED_Y  = 2000.0f;  // 50.0 mm/s (1.25 rev/s) @ 8x in native StealthChop2
 
 const int   DEFAULT_HOME_SENS     = 60;      // Homing sensitivity threshold for X and Z lead screws (SGTHRS=60)
-const int   DEFAULT_HOME_SENS_Y   = 3;       // Homing sensitivity threshold for Y belt pulley (SGTHRS=3)
+const int   DEFAULT_HOME_SENS_Y   = 35;      // Calibrated Y StallGuard4 threshold (stall ~56-60, cruise ~82-142, 0.00 px repeat)
 
 // X: Lead screw 8.0 mm/rev @ 8x microsteps -> 200.0 microsteps/mm.
 // Z: Lead screw 8.0 mm/rev @ 2x microsteps -> 50.0 microsteps/mm.
-// Y: GT2 belt (2.0 mm pitch) x 20-tooth pulley = 40.0 mm/rev -> 10.0 microsteps/mm @ 2x microsteps.
+// Y: GT2 belt (2.0 mm pitch) x 20-tooth pulley = 40.0 mm/rev -> 40.0 microsteps/mm @ 8x move microsteps.
 const float LEAD_SCREW_LEAD_MM     = 8.0f;
 const float BELT_PULLEY_MM_REV_Y   = 40.0f; // 20 teeth * 2.0 mm GT2 pitch
 const float MOTOR_FULL_STEPS_REV   = 200.0f;
 const float DEFAULT_STEPS_PER_MM_X = (MOTOR_FULL_STEPS_REV * SETUP_MICROSTEPS_X) / LEAD_SCREW_LEAD_MM;   // 200.0f
-const float DEFAULT_STEPS_PER_MM_Y = (MOTOR_FULL_STEPS_REV * SETUP_MICROSTEPS)   / BELT_PULLEY_MM_REV_Y; // 10.0f
+const float DEFAULT_STEPS_PER_MM_Y = (MOTOR_FULL_STEPS_REV * SETUP_MICROSTEPS_Y) / BELT_PULLEY_MM_REV_Y; // 40.0f
 const float DEFAULT_STEPS_PER_MM_Z = (MOTOR_FULL_STEPS_REV * SETUP_MICROSTEPS)   / LEAD_SCREW_LEAD_MM;   // 50.0f
 
 // Homing direction per axis (true = reverse/negative towards 0, false = forward)
@@ -158,14 +160,14 @@ const float TRAVEL_Z_MM = 76.7f;
 
 // Safe pull-away distances before homing so axes against bumpers have runway to accelerate
 const float HOME_BACKOFF_MM_XZ = 5.0f;
-const float HOME_BACKOFF_MM_Y  = 25.0f;
+const float HOME_BACKOFF_MM_Y  = 20.0f;
 const unsigned long HOME_PRE_SETTLE_MS = 50;
 
 // Per-axis cap applied to MOVE feedrates (microsteps/s) so each axis stays inside its verified
 // S-curve + StallGuard operating envelope.
 const float MAX_FEED_SPEED_X  = DEFAULT_MAX_SPEED_X;  // 12000 steps/s = 60.0 mm/s @ 8x
 const float MAX_FEED_SPEED_Z  = DEFAULT_MAX_SPEED_Z;  // 1750 steps/s = 35.0 mm/s @ 2x
-const float MAX_FEED_SPEED_Y  = DEFAULT_MAX_SPEED_Y;  // 800 steps/s = 80.0 mm/s @ 2x
+const float MAX_FEED_SPEED_Y  = DEFAULT_MAX_SPEED_Y;  // 4000 steps/s = 100.0 mm/s @ 8x
 
 // Stall detection during moves only runs near full (cruise) speed
 const float STALL_CHECK_SPEED_RATIO = 0.9f;
@@ -258,7 +260,7 @@ struct IsrStepAxis {
   volatile uint32_t ddsInc;
 };
 
-static const uint32_t STEP_ISR_HZ = 62500UL; // 16 us hardware timer tick -> jitter-free stepping
+static const uint32_t STEP_ISR_HZ = 50000UL; // 20 us hardware timer tick -> jitter-free stepping
 static portMUX_TYPE stepMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile IsrStepAxis isrAxes[3] = {
   { false, -1, 1, 0, 0, 0, 0 },
@@ -269,9 +271,9 @@ static hw_timer_t* stepTimer = nullptr;
 
 const int NUM_AXES = 3;
 Axis axes[NUM_AXES] = {
-  { "S1", 'X', PIN_STEP_1, PIN_DIR_1, PIN_DIAG_1, &stepper1, &driver1, false, DEFAULT_MAX_SPEED_X, DEFAULT_ACCEL_X, DEFAULT_HOME_SPEED_X,  SETUP_STALL_SENS_X, DEFAULT_HOME_SENS,   DEFAULT_STEPS_PER_MM_X, LEAD_SCREW_LEAD_MM,   DEFAULT_HOME_DIR_REVERSE_X, INVERT_DIR_X, SETUP_CURRENT_MA_XZ, TRAVEL_X_MM, HOME_BACKOFF_MM_XZ, MAX_FEED_SPEED_X, STALL_SETTLE_MS_XZ, SETUP_MICROSTEPS_X },
-  { "S2", 'Y', PIN_STEP_2, PIN_DIR_2, PIN_DIAG_2, &stepper2, &driver2, false, DEFAULT_MAX_SPEED_Y, DEFAULT_ACCEL_Y, DEFAULT_HOME_SPEED_Y,  SETUP_STALL_SENS_Y, DEFAULT_HOME_SENS_Y, DEFAULT_STEPS_PER_MM_Y, BELT_PULLEY_MM_REV_Y, DEFAULT_HOME_DIR_REVERSE_Y, INVERT_DIR_Y, SETUP_CURRENT_MA_Y,  TRAVEL_Y_MM, HOME_BACKOFF_MM_Y,  MAX_FEED_SPEED_Y, STALL_SETTLE_MS_Y,  SETUP_MICROSTEPS },
-  { "S3", 'Z', PIN_STEP_3, PIN_DIR_3, PIN_DIAG_3, &stepper3, &driver3, false, DEFAULT_MAX_SPEED_Z, DEFAULT_ACCEL_Z, DEFAULT_HOME_SPEED_XZ, SETUP_STALL_SENS_Z, DEFAULT_HOME_SENS,   DEFAULT_STEPS_PER_MM_Z, LEAD_SCREW_LEAD_MM,   DEFAULT_HOME_DIR_REVERSE_Z, INVERT_DIR_Z, SETUP_CURRENT_MA_XZ, TRAVEL_Z_MM, HOME_BACKOFF_MM_XZ, MAX_FEED_SPEED_Z, STALL_SETTLE_MS_XZ, SETUP_MICROSTEPS },
+  { "S1", 'X', PIN_STEP_1, PIN_DIR_1, PIN_DIAG_1, &stepper1, &driver1, false, DEFAULT_MAX_SPEED_X, DEFAULT_ACCEL_X, DEFAULT_HOME_SPEED_X,  SETUP_STALL_SENS_X, DEFAULT_HOME_SENS,   DEFAULT_STEPS_PER_MM_X, LEAD_SCREW_LEAD_MM,   DEFAULT_HOME_DIR_REVERSE_X, INVERT_DIR_X, SETUP_CURRENT_MA_XZ,     TRAVEL_X_MM, HOME_BACKOFF_MM_XZ, MAX_FEED_SPEED_X, STALL_SETTLE_MS_XZ, SETUP_MICROSTEPS_X },
+  { "S2", 'Y', PIN_STEP_2, PIN_DIR_2, PIN_DIAG_2, &stepper2, &driver2, false, DEFAULT_MAX_SPEED_Y, DEFAULT_ACCEL_Y, DEFAULT_HOME_SPEED_Y,  SETUP_STALL_SENS_Y, DEFAULT_HOME_SENS_Y, DEFAULT_STEPS_PER_MM_Y, BELT_PULLEY_MM_REV_Y, DEFAULT_HOME_DIR_REVERSE_Y, INVERT_DIR_Y, SETUP_CURRENT_MA_Y_MOVE, TRAVEL_Y_MM, HOME_BACKOFF_MM_Y,  MAX_FEED_SPEED_Y, STALL_SETTLE_MS_Y,  SETUP_MICROSTEPS_Y },
+  { "S3", 'Z', PIN_STEP_3, PIN_DIR_3, PIN_DIAG_3, &stepper3, &driver3, false, DEFAULT_MAX_SPEED_Z, DEFAULT_ACCEL_Z, DEFAULT_HOME_SPEED_XZ, SETUP_STALL_SENS_Z, DEFAULT_HOME_SENS,   DEFAULT_STEPS_PER_MM_Z, LEAD_SCREW_LEAD_MM,   DEFAULT_HOME_DIR_REVERSE_Z, INVERT_DIR_Z, SETUP_CURRENT_MA_XZ,     TRAVEL_Z_MM, HOME_BACKOFF_MM_XZ, MAX_FEED_SPEED_Z, STALL_SETTLE_MS_XZ, SETUP_MICROSTEPS },
 };
 
 // Set when an ESTOP line or hardware E-STOP switch triggers
@@ -363,6 +365,7 @@ void handleRegsGcode();
 void handleStepsGcode(String params);
 void handleChimeGcode(String params, bool emitProtocolReply = true);
 void handleTuneGcode(String params);
+void applyYMoveMode(Axis& axis);
 void applyAxisDriverSettings(Axis& axis);
 bool restoreAxisFromChime(Axis& axis);
 void captureAxisSnapshot(Axis& axis, SavedAxisSnapshot& snap);
@@ -685,7 +688,7 @@ void handleHomeAllGcode() {
     return;
   }
 
-  // Guarantee every axis has its calibrated microsteps, interpolation, current, and StealthChop before homing
+  // Guarantee every axis has its calibrated microsteps, interpolation, current, and chopper mode before homing
   bool restoredAny = false;
   for (int i = 0; i < NUM_AXES; i++) {
     if (axes[i].driver->microsteps() != axes[i].microsteps ||
@@ -784,9 +787,9 @@ static inline float lookupSCurveLut(const float* lut, float x) {
 }
 
 static inline uint32_t speedToDdsInc(float stepsPerSec) {
-  double inc = ((double)max(1.0f, stepsPerSec) * 4294967296.0) / (double)STEP_ISR_HZ;
-  if (inc >= 4294967295.0) return 0xFFFFFFFFUL;
-  return (uint32_t)(inc + 0.5);
+  float inc = max(1.0f, stepsPerSec) * (4294967296.0f / (float)STEP_ISR_HZ);
+  if (inc >= 4294967295.0f) return 0xFFFFFFFFUL;
+  return (uint32_t)(inc + 0.5f);
 }
 
 static void IRAM_ATTR onStepTimer() {
@@ -819,7 +822,8 @@ static void IRAM_ATTR onStepTimer() {
 
   if (stepMask != 0) {
     GPIO.out_w1ts = stepMask;
-    delayMicroseconds(1); // ARDUINO_ISR_ATTR; 10x TMC2209 100 ns t_SWH min
+    uint32_t t0 = esp_cpu_get_cycle_count();
+    while ((uint32_t)(esp_cpu_get_cycle_count() - t0) < 480U) {} // exact 2.00 us @ 240 MHz
     GPIO.out_w1tc = stepMask;
   }
 }
@@ -829,7 +833,7 @@ void initStepTimer() {
   stepTimer = timerBegin(1000000UL); // 1 MHz base clock (1 us/tick)
   if (stepTimer != nullptr) {
     timerAttachInterrupt(stepTimer, &onStepTimer);
-    timerAlarm(stepTimer, 1000000UL / STEP_ISR_HZ, true, 0); // 16 us = 62.5 kHz auto-reload
+    timerAlarm(stepTimer, 1000000UL / STEP_ISR_HZ, true, 0); // 20 us = 50 kHz auto-reload
     timerStop(stepTimer);
   }
 }
@@ -1023,7 +1027,7 @@ void handleMoveGcode(String params) {
     }
   }
 
-  // Initialize hardware-timer DDS S-curve profiles for X (S1), Y (S2), Z (S3)
+  // Unified phase-locked S-curve DDS motion engine in the -O2 IRAM timer ISR for X, Y, and Z.
   SCurveAxis scAxes[NUM_AXES];
   for (int i = 0; i < NUM_AXES; i++) {
     float targetMm = 0.0f;
@@ -1035,40 +1039,41 @@ void handleMoveGcode(String params) {
     initSCurveAxis(scAxes[i], axes[i], targetSteps);
   }
 
-  unsigned long lastWdtYieldMs = millis();
-  unsigned long moveStartUs = micros();
-  startStepEngine(scAxes, NUM_AXES);
-  while (tickStepEngine(scAxes, NUM_AXES, moveStartUs)) {
-    yieldWdt(lastWdtYieldMs);
-
-    if (hasPendingAngle) {
-      float curYmm = (float)scAxes[1].curPos / axes[1].stepsPerMm;
-      if (curYmm >= SERVO_SAFE_Y_MM) {
-        writeServoLogicalAngle(targetAngle);
-        hasPendingAngle = false;
+  bool anyActive = (scAxes[0].active || scAxes[1].active || scAxes[2].active);
+  if (anyActive) {
+    unsigned long lastWdtYieldMs = millis();
+    unsigned long moveStartUs = micros();
+    startStepEngine(scAxes, NUM_AXES);
+    while (tickStepEngine(scAxes, NUM_AXES, moveStartUs)) {
+      yieldWdt(lastWdtYieldMs);
+      if (hasPendingAngle) {
+        float curYmm = (float)scAxes[1].curPos / axes[1].stepsPerMm;
+        if (curYmm >= SERVO_SAFE_Y_MM) {
+          writeServoLogicalAngle(targetAngle);
+          hasPendingAngle = false;
+        }
       }
-    }
-    if (pollMoveEstop()) {
-      stopStepEngine(scAxes, NUM_AXES);
-      sleepAll();
-      setRelayOutput(false);
-      Serial.println("ERR:ESTOP");
-      return;
-    }
-
-    for (int i = 0; i < NUM_AXES; i++) {
-      if (scAxes[i].active && isStalled(axes[i])) {
+      if (pollMoveEstop()) {
         stopStepEngine(scAxes, NUM_AXES);
-        // Immediately cut power to steppers so motor does not sustain power against the stop!
         sleepAll();
-        Serial.print("ERR:STALL_");
-        Serial.println(axes[i].coordCode);
+        setRelayOutput(false);
+        Serial.println("ERR:ESTOP");
         return;
       }
+      for (int i = 0; i < NUM_AXES; i++) {
+        if (scAxes[i].active && isStalled(axes[i])) {
+          stopStepEngine(scAxes, NUM_AXES);
+          // Immediately cut power to steppers so motor does not sustain power against the stop!
+          sleepAll();
+          Serial.print("ERR:STALL_");
+          Serial.println(axes[i].coordCode);
+          return;
+        }
+      }
+      delayMicroseconds(250);
     }
-    delayMicroseconds(250);
+    stopStepEngine(scAxes, NUM_AXES);
   }
-  stopStepEngine(scAxes, NUM_AXES);
 
   if (hasPendingAngle) {
     float endYmm = (float)axes[1].stepper->currentPosition() / axes[1].stepsPerMm;
@@ -1226,6 +1231,7 @@ void handlePressGcode(String params) {
   unsigned long moveStartUs = micros();
   bool forceReached = false;
   bool guardTripped = false;
+  bool slowedForContact = false;
   startStepEngine(&scZ, 1);
   while (tickStepEngine(&scZ, 1, moveStartUs)) {
     yieldWdt(lastWdtYieldMs);
@@ -1239,35 +1245,59 @@ void handlePressGcode(String params) {
       return;
     }
 
+    // Two-stage guarded descent: cruise fast in open air, then decelerate to gentle 8.0 mm/s
+    // for the final ~5 mm contact window so 10 Hz HX711 latency never slams the load cell beam.
+    if (!forceReached && !slowedForContact && hasGuard && pressSpeedMmS > 9.0f) {
+      float curLiveZmm = (float)scZ.curPos / zAx.stepsPerMm;
+      float slowStartZmm = max(curZmm, guardLimitZmm - 1.5f);
+      if (curLiveZmm >= slowStartZmm) {
+        slowedForContact = true;
+        scZ.vPeak = min(scZ.vPeak, max(40.0f, 8.0f * zAx.stepsPerMm));
+        scZ.decelDist = min(scZ.decelDist, ((float)PI * scZ.vPeak * scZ.vPeak) / (4.0f * max(10.0f, zAx.acceleration)));
+      }
+    }
+
     if (hasBaseline && !forceReached && (unsigned long)(micros() - moveStartUs) >= 40000UL && scale.is_ready()) {
       long raw = scale.read();
-      // Hanging load reads +grams; upward contact/floor press reads negative deltaG
-      lastDeltaG = (float)(raw - baseRaw) / hx711ScaleFactor;
-
       long liveCur = 0;
       portENTER_CRITICAL(&stepMux);
       liveCur = isrAxes[2].curPos;
       portEXIT_CRITICAL(&stepMux);
       float liveZmm = (float)liveCur / zAx.stepsPerMm;
 
-      bool inGuardZone = hasGuard && (liveZmm < guardLimitZmm);
-      float activeThreshG = inGuardZone ? guardDeltaG : targetDeltaG;
+      float guardZoneStartZmm = hasGuard ? max(curZmm, guardLimitZmm - 22.0f) : curZmm;
+      float rawDeltaG = (float)(raw - baseRaw) / hx711ScaleFactor;
 
-      if (activeThreshG > 0.5f && lastDeltaG <= -activeThreshG) {
-        forceReached = true;
-        guardTripped = inGuardZone;
-        portENTER_CRITICAL(&stepMux);
-        liveCur = isrAxes[2].curPos;
-        long rem = scZ.targetPos - liveCur;
-        long stopSteps = (rem > 0) ? min(rem, 3L) : 0L;
-        long newTarget = liveCur + stopSteps;
-        isrAxes[2].targetPos = newTarget;
-        if (stopSteps == 0L) isrAxes[2].active = false;
-        scZ.curPos = liveCur;
-        scZ.targetPos = newTarget;
-        scZ.decelDist = max(1.0f, (float)stopSteps);
-        scZ.active = (stopSteps > 0L);
-        portEXIT_CRITICAL(&stepMux);
+      // In high open air well above the guard band, track steady downward Z lead-screw friction baseline
+      if (hasGuard && liveZmm < (guardZoneStartZmm - 2.0f) && fabsf(rawDeltaG) <= 65.0f) {
+        baseRaw = raw;
+        lastDeltaG = 0.0f;
+      } else {
+        // Hanging load reads +grams; upward contact/floor press reads negative deltaG
+        lastDeltaG = rawDeltaG;
+
+        bool inGuardZone = hasGuard && (liveZmm >= guardZoneStartZmm) && (liveZmm < guardLimitZmm);
+        bool aboveGuardZone = hasGuard && (liveZmm < guardZoneStartZmm);
+        float activeThreshG = aboveGuardZone
+            ? max(targetDeltaG, 180.0f)
+            : (inGuardZone ? guardDeltaG : targetDeltaG);
+
+        if (activeThreshG > 0.5f && lastDeltaG <= -activeThreshG) {
+          forceReached = true;
+          guardTripped = hasGuard && (liveZmm < guardLimitZmm);
+          portENTER_CRITICAL(&stepMux);
+          liveCur = isrAxes[2].curPos;
+          long rem = scZ.targetPos - liveCur;
+          long stopSteps = (rem > 0) ? min(rem, 3L) : 0L;
+          long newTarget = liveCur + stopSteps;
+          isrAxes[2].targetPos = newTarget;
+          if (stopSteps == 0L) isrAxes[2].active = false;
+          scZ.curPos = liveCur;
+          scZ.targetPos = newTarget;
+          scZ.decelDist = max(1.0f, (float)stopSteps);
+          scZ.active = (stopSteps > 0L);
+          portEXIT_CRITICAL(&stepMux);
+        }
       }
     }
 
@@ -1325,7 +1355,7 @@ void handleTareGcode() {
   long baseRaw = 0;
   float spreadG = 0.0f;
   bool estopAborted = false;
-  if (!sampleLoadCellFilteredRaw(baseRaw, spreadG, 11, 2, &estopAborted)) {
+  if (!sampleLoadCellFilteredRaw(baseRaw, spreadG, 5, 1, &estopAborted)) {
     if (estopAborted) {
       sleepAll();
       setRelayOutput(false);
@@ -1336,8 +1366,8 @@ void handleTareGcode() {
     return;
   }
 
-  // If spread exceeds 1.2 g due to transient vibration, settle 150 ms and re-sample once
-  if (spreadG > 1.2f) {
+  // If spread exceeds 1.5 g due to transient vibration, settle 150 ms and re-sample once
+  if (spreadG > 1.5f) {
     unsigned long lastWdtYieldMs = millis();
     for (int w = 0; w < 15; w++) {
       yieldWdt(lastWdtYieldMs);
@@ -1349,7 +1379,7 @@ void handleTareGcode() {
       }
       delay(10);
     }
-    if (!sampleLoadCellFilteredRaw(baseRaw, spreadG, 11, 1, &estopAborted)) {
+    if (!sampleLoadCellFilteredRaw(baseRaw, spreadG, 5, 1, &estopAborted)) {
       if (estopAborted) {
         sleepAll();
         setRelayOutput(false);
@@ -1362,26 +1392,7 @@ void handleTareGcode() {
   }
 
   scale.set_offset(baseRaw);
-
-  // Verify zero residual across 3 fresh samples and re-center if drift > 0.8 g
-  long chkRaw = baseRaw;
-  float chkSpread = 0.0f;
   float checkG = 0.0f;
-  if (sampleLoadCellFilteredRaw(chkRaw, chkSpread, 3, 0, &estopAborted)) {
-    if (fabsf(hx711ScaleFactor) > 1e-3f) {
-      checkG = (float)(chkRaw - baseRaw) / hx711ScaleFactor;
-    }
-    if (fabsf(checkG) > 0.8f) {
-      baseRaw = (baseRaw + chkRaw) / 2;
-      scale.set_offset(baseRaw);
-      checkG *= 0.5f;
-    }
-  } else if (estopAborted) {
-    sleepAll();
-    setRelayOutput(false);
-    Serial.println("ERR:ESTOP");
-    return;
-  }
 
   Serial.print("TARED OFFSET:");
   Serial.print(baseRaw);
@@ -1415,6 +1426,12 @@ void handleWeighGcode() {
   float massGrams = (fabsf(hx711ScaleFactor) > 1e-3f)
       ? (float)(raw - scale.get_offset()) / hx711ScaleFactor
       : 0.0f;
+  Serial.print("WEIGH_RAW:");
+  Serial.print(raw);
+  Serial.print(" OFFSET:");
+  Serial.print(scale.get_offset());
+  Serial.print(" SPREAD:");
+  Serial.println(spreadG, 2);
   Serial.print("WEIGHT:");
   Serial.println(massGrams, 2);
   Serial.println("OK");
@@ -1443,12 +1460,16 @@ void handleStatusGcode() {
 void handleRegsGcode() {
   for (int i = 0; i < NUM_AXES; i++) {
     Axis& ax = axes[i];
+    uint32_t drv = ax.driver->DRV_STATUS();
     Serial.print("REGS "); Serial.print(ax.name);
     Serial.print(" GCONF=0x"); Serial.print(ax.driver->GCONF(), HEX);
     Serial.print(" GSTAT=0x"); Serial.print(ax.driver->GSTAT(), HEX);
     Serial.print(" CHOP=0x"); Serial.print(ax.driver->CHOPCONF(), HEX);
     Serial.print(" PWM=0x"); Serial.print(ax.driver->PWMCONF(), HEX);
-    Serial.print(" DRV=0x"); Serial.print(ax.driver->DRV_STATUS(), HEX);
+    Serial.print(" DRV=0x"); Serial.print(drv, HEX);
+    Serial.print(" OTPW="); Serial.print(drv & 0x01);
+    Serial.print(" OT="); Serial.print((drv >> 1) & 0x01);
+    Serial.print(" FLG=0x"); Serial.print((uint32_t)(drv & 0x0FFF), HEX);
     Serial.print(" STEALTH="); Serial.print(ax.driver->stealth());
     Serial.print(" CS_ACT="); Serial.print(ax.driver->cs_actual());
     Serial.print(" IRUN="); Serial.print(ax.driver->irun());
@@ -1722,9 +1743,44 @@ bool setupAll(bool quietProtocol) {
 }
 
 static inline float axisHoldMultiplier(const Axis& axis) {
-  // Y runs at 700 mA IRUN for belt inertia/StallGuard4; cut standstill IHOLD to 25% (~175 mA)
-  // so its standby current and coil heating match X and Z (50% of 350 mA = ~175 mA).
-  return (axis.coordCode == 'Y') ? 0.25f : 0.50f;
+  // Y runs StealthChop2 at 480 mA (0.35x = ~168 mA standby, IHOLD=5) matching X and Z standby heat.
+  return (axis.coordCode == 'Y') ? 0.35f : 0.50f;
+}
+
+void applyYMoveMode(Axis& axis) {
+  axis.microsteps      = SETUP_MICROSTEPS_Y;
+  axis.stepsPerMm      = DEFAULT_STEPS_PER_MM_Y;
+  axis.currentMa       = SETUP_CURRENT_MA_Y_MOVE;
+  axis.moveSensitivity = SETUP_STALL_SENS_Y;
+  axis.maxSpeed        = DEFAULT_MAX_SPEED_Y;
+  axis.maxFeedSpeed    = MAX_FEED_SPEED_Y;
+  axis.acceleration    = DEFAULT_ACCEL_Y;
+  axis.stepper->setMinPulseWidth(2);
+  axis.stepper->setMaxSpeed(axis.maxSpeed);
+  axis.stepper->setAcceleration(axis.acceleration);
+
+  axis.driver->en_spreadCycle(false);
+  axis.driver->toff(5);
+  axis.driver->hstrt(5);
+  axis.driver->hend(0);
+  axis.driver->tbl(0);
+  axis.driver->intpol(true);
+  axis.driver->multistep_filt(true);
+  axis.driver->microsteps(SETUP_MICROSTEPS_Y);
+  axis.driver->rms_current(axis.currentMa, axisHoldMultiplier(axis));
+  axis.driver->TPOWERDOWN(15); // ~327 ms standstill delay matching X and Z
+  axis.driver->iholddelay(4);
+  axis.driver->pwm_ofs(36);
+  axis.driver->pwm_grad(14);
+  if (axis.driver->pwm_grad_auto() == 0) {
+    axis.driver->pwm_autograd(false);
+    delay(2);
+  }
+  axis.driver->pwm_autoscale(true);
+  axis.driver->pwm_autograd(true);
+  axis.driver->TCOOLTHRS(0xFFFFF);
+  axis.driver->TPWMTHRS(0);
+  axis.driver->SGTHRS(axis.moveSensitivity);
 }
 
 void applyAxisDriverSettings(Axis& axis) {
@@ -1732,10 +1788,22 @@ void applyAxisDriverSettings(Axis& axis) {
   axis.driver->pdn_disable(true);
   axis.driver->mstep_reg_select(true);
   axis.driver->I_scale_analog(false);
-  axis.driver->multistep_filt(true);
   axis.driver->shaft(axis.invertDir);
+
+  if (axis.coordCode == 'Y') {
+    applyYMoveMode(axis);
+    return;
+  }
+
+  axis.driver->multistep_filt(true);
   axis.driver->toff(5);
   axis.driver->en_spreadCycle(false);  // StealthChop on (needed for StallGuard)
+  axis.driver->pwm_ofs(36);
+  axis.driver->pwm_grad(14);
+  if (axis.driver->pwm_grad_auto() == 0) {
+    axis.driver->pwm_autograd(false);
+    delay(2);
+  }
   axis.driver->pwm_autoscale(true);
   axis.driver->pwm_autograd(true);
   axis.driver->intpol(true);           // Enable TMC2209 internal 256x microstep interpolation for silent, smooth motion
@@ -1743,10 +1811,9 @@ void applyAxisDriverSettings(Axis& axis) {
   axis.driver->TPWMTHRS(0);
 
   // Restore default maxSpeed and acceleration so prior MOVE feedrate caps never taint SETUP/HOME
-  axis.maxSpeed     = (axis.coordCode == 'Y') ? DEFAULT_MAX_SPEED_Y :
-                      (axis.coordCode == 'X') ? DEFAULT_MAX_SPEED_X : DEFAULT_MAX_SPEED_Z;
-  axis.acceleration = (axis.coordCode == 'Y') ? DEFAULT_ACCEL_Y :
-                      (axis.coordCode == 'X') ? DEFAULT_ACCEL_X : DEFAULT_ACCEL_Z;
+  axis.maxSpeed     = (axis.coordCode == 'X') ? DEFAULT_MAX_SPEED_X : DEFAULT_MAX_SPEED_Z;
+  axis.acceleration = (axis.coordCode == 'X') ? DEFAULT_ACCEL_X : DEFAULT_ACCEL_Z;
+  axis.stepper->setMinPulseWidth(2);
   axis.stepper->setMaxSpeed(axis.maxSpeed);
   axis.stepper->setAcceleration(axis.acceleration);
 
@@ -2109,7 +2176,10 @@ unsigned long homingTimeoutMs(Axis& axis, bool knownDistance) {
       ? fabs((float)axis.stepper->currentPosition()) + 10.0f * axis.stepsPerMm
       : (axis.maxTravelMm + axis.homeBackoffMm) * axis.stepsPerMm;
   unsigned long ms = (unsigned long)(1500.0f * travelSteps / axis.homeSpeed) + HOMING_RAMP_MS + HOMING_BLANKING_MS;
-  unsigned long minMs = knownDistance ? 3000UL : HOMING_TIMEOUT_MS;
+  unsigned long minMs = knownDistance ? 3000UL : ((axis.coordCode == 'Y') ? 8000UL : HOMING_TIMEOUT_MS);
+  if (!knownDistance && axis.coordCode == 'Y' && ms > 8000UL) {
+    ms = 8000UL;
+  }
   return ms > minMs ? ms : minMs;
 }
 
@@ -2219,20 +2289,19 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
   unsigned long startMs = millis();
   unsigned long lastRampMs = startMs;
   unsigned long lastWdtYieldMs = startMs;
-  unsigned long diagFirstHighMs = 0;
   bool diagHighActive = false;
   unsigned long diagHighStartUs = 0;
-  // Y belt pulley shows a 2-full-step SG_RESULT square wave (~10..180); track a 60 ms rolling peak via
-  // non-blocking UART polling so bumper impact (peak drops <= 104 from 126..144) triggers cleanly with zero step jitter.
-  const int Y_SG_WINDOW = 12;
+  const unsigned long diagDebounceUs = (axis.coordCode == 'Y') ? 600UL : 150UL;
+
+  // Non-blocking UART SG_RESULT telemetry sampler for Y while cruising post-blanking (no step jitter)
   const unsigned long Y_SG_POLL_MS = 5;
   const unsigned long Y_SG_WARMUP_MS = HOMING_RAMP_MS + 20;
-  const uint16_t Y_SG_PEAK_THRESH = 104;
-  uint16_t ySgRing[12] = {0};
-  int ySgIdx = 0;
-  int ySgCount = 0;
   unsigned long lastYSgPollMs = 0;
   bool ySgReqPending = false;
+  uint16_t ySgMin = 1023;
+  uint16_t ySgMax = 0;
+  uint32_t ySgSum = 0;
+  int ySgSamples = 0;
   uint8_t ySgReq[4] = {0x05, 0b01, 0x41, 0}; // S2 slave address 0b01, read SG_RESULT (0x41)
   ySgReq[3] = tmc2209Crc(ySgReq, 3);
   if (axis.coordCode == 'Y') {
@@ -2256,7 +2325,7 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
       stepper->setSpeed(dirSign * axis.homeSpeed);
     }
 
-    // Non-blocking UART SG_RESULT sampling for Y (60 ms rolling peak drop catches belt stall without step jitter)
+    // Collect live SG_RESULT telemetry for Y during post-blanking cruise
     if (axis.coordCode == 'Y' && axis.homeSensitivity > 0 && elapsed >= Y_SG_WARMUP_MS && (nowMs - lastYSgPollMs >= Y_SG_POLL_MS)) {
       lastYSgPollMs = nowMs;
       if (ySgReqPending && TMCSerial.available() >= 12) {
@@ -2265,17 +2334,11 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
         while (TMCSerial.available() && n < 16) buf[n++] = (uint8_t)TMCSerial.read();
         if (n >= 12 && buf[4] == 0x05 && buf[5] == 0xFF && buf[6] == 0x41 && buf[11] == tmc2209Crc(&buf[4], 7)) {
           uint16_t sg = ((uint16_t)(buf[9] & 0x03) << 8) | buf[10];
-          ySgRing[ySgIdx] = sg;
-          ySgIdx = (ySgIdx + 1) % Y_SG_WINDOW;
-          if (ySgCount < Y_SG_WINDOW) ySgCount++;
-          if (elapsed > HOMING_BLANKING_MS && ySgCount >= Y_SG_WINDOW) {
-            uint16_t sgPeak = 0;
-            for (int k = 0; k < Y_SG_WINDOW; k++) {
-              if (ySgRing[k] > sgPeak) sgPeak = ySgRing[k];
-            }
-            if (sgPeak <= Y_SG_PEAK_THRESH) {
-              outcome = HOMED;
-            }
+          if (elapsed > HOMING_BLANKING_MS) {
+            if (sg < ySgMin) ySgMin = sg;
+            if (sg > ySgMax) ySgMax = sg;
+            ySgSum += sg;
+            ySgSamples++;
           }
         }
       }
@@ -2286,34 +2349,18 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
       }
     }
 
-    // Check DIAG after blanking window (350 ms).
-    // X/Z lead screws emit brief (~2.8 ms) DIAG pulses at SGTHRS=60 on bumper impact, so confirm >= 150 us
-    // to reject EMI spikes while stopping immediately; keep Y on 12 ms fallback alongside 60 ms SG_RESULT peak.
+    // Check DIAG after blanking window (350 ms) with clean continuous-HIGH debounce (2 ms on Y, 150 us on X/Z)
     if (outcome == RUNNING && elapsed > HOMING_BLANKING_MS) {
-      if (axis.coordCode != 'Y') {
-        if (digitalRead(axis.diagPin) == HIGH) {
-          unsigned long nowUs = micros();
-          if (!diagHighActive) {
-            diagHighActive = true;
-            diagHighStartUs = nowUs;
-          } else if ((nowUs - diagHighStartUs) >= 150) {
-            outcome = HOMED;
-          }
-        } else {
-          diagHighActive = false;
+      if (digitalRead(axis.diagPin) == HIGH) {
+        unsigned long nowUs = micros();
+        if (!diagHighActive) {
+          diagHighActive = true;
+          diagHighStartUs = nowUs;
+        } else if ((nowUs - diagHighStartUs) >= diagDebounceUs) {
+          outcome = HOMED;
         }
       } else {
-        if (digitalRead(axis.diagPin) == HIGH) {
-          if (diagFirstHighMs == 0) {
-            diagFirstHighMs = (nowMs == 0) ? 1UL : nowMs;
-          } else if ((nowMs - diagFirstHighMs) >= 12) {
-            outcome = HOMED;
-          }
-        } else {
-          if (diagFirstHighMs != 0 && (nowMs - diagFirstHighMs > 25)) {
-            diagFirstHighMs = 0; // noise glitch cleared
-          }
-        }
+        diagHighActive = false;
       }
     }
 
@@ -2339,13 +2386,31 @@ bool homeAxis(Axis& axis, bool reverse, bool withBackoff) {
       // Homing toward the origin stop defines 0. Homing the other way ("home s1" with homeReverse=true) lands
       // on the far stop, which is +maxTravel in the MOVE frame — it used to be set to 0 as well, after which
       // every MOVE drove further into the far stop.
-      long homePos = towardOrigin ? 0 : (long)(dirSign * lroundf(axis.maxTravelMm * axis.stepsPerMm));
-      if (!axis.homeReverse) homePos = -homePos;
+      long homePos = 0;
+      if (axis.coordCode == 'Y') {
+        float homePosMm = towardOrigin ? 0.0f : (dirSign * axis.maxTravelMm);
+        if (!axis.homeReverse) homePosMm = -homePosMm;
+        if (towardOrigin) {
+          const float postHomePulloffMm = 1.0f;
+          syncAxisPosition(axis, -lroundf(postHomePulloffMm * axis.stepsPerMm));
+          delay(10);
+          runAxisTo(axis, 0);
+        }
+        homePos = lroundf(homePosMm * axis.stepsPerMm);
+      } else {
+        homePos = towardOrigin ? 0 : (long)(dirSign * lroundf(axis.maxTravelMm * axis.stepsPerMm));
+        if (!axis.homeReverse) homePos = -homePos;
+      }
       syncAxisPosition(axis, homePos);
       axis.homed = true;
       Serial.print("-> "); Serial.print(axis.name);
       Serial.print(" homed (SG_RESULT="); Serial.print(stallSg);
       Serial.print(", TSTEP="); Serial.print(stallTstep);
+      if (axis.coordCode == 'Y' && ySgSamples > 0) {
+        Serial.print(", SG_CRUISE="); Serial.print(ySgMin);
+        Serial.print("/"); Serial.print(ySgSum / (uint32_t)ySgSamples);
+        Serial.print("/"); Serial.print(ySgMax);
+      }
       Serial.print("). Position set to "); Serial.print(homePos);
       Serial.println(towardOrigin ? "." : " (far end).");
       return true;
@@ -2373,7 +2438,7 @@ static const int CHIME_MICROSTEPS_X  = 4;   // Verified 1:1 fundamental pitch (A
 static const int CHIME_MICROSTEPS_Y  = 8;   // Unused in 2-voice chimes (belt damps tone)
 static const int CHIME_MICROSTEPS_Z  = 1;   // Verified 1:1 clean bass/harmony (C4=261.63, A4=440)
 static const int CHIME_CURRENT_MA_XZ = 500; // Moderate chime boost (avoids rail droop / UVLO)
-static const int CHIME_CURRENT_MA_Y  = 700; // Keeps Y in vsense=1 matching normal operation
+static const int CHIME_CURRENT_MA_Y  = 500; // Matches normal 480 mA Y motor rating in vsense=1
 
 static int chimeMicrostepsFor(const Axis& axis) {
   if (axis.coordCode == 'X') return CHIME_MICROSTEPS_X;

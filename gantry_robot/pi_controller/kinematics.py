@@ -112,7 +112,12 @@ class EyeInHandKinematics:
         return x * c - y * s, x * s + y * c
 
     @staticmethod
-    def _fit_similarity_2d(src_pts: np.ndarray, dst_pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def _fit_similarity_2d(
+        src_pts: np.ndarray,
+        dst_pts: np.ndarray,
+        min_scale: Optional[float] = None,
+        max_scale: Optional[float] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """Closed-form 2D Procrustes similarity fit: dst = A @ src + t (rotation + uniform scale + translation)."""
         src_mean = src_pts.mean(axis=0)
         dst_mean = dst_pts.mean(axis=0)
@@ -123,6 +128,16 @@ class EyeInHandKinematics:
             raise ValueError("Degenerate fiducial geometry (collocated points).")
         a = float(np.sum(ds[:, 0] * dd[:, 0] + ds[:, 1] * dd[:, 1])) / denom
         b = float(np.sum(ds[:, 0] * dd[:, 1] - ds[:, 1] * dd[:, 0])) / denom
+        scale = math.hypot(a, b)
+        if scale > 1e-6 and (min_scale is not None or max_scale is not None):
+            clamped = scale
+            if min_scale is not None:
+                clamped = max(min_scale, clamped)
+            if max_scale is not None:
+                clamped = min(max_scale, clamped)
+            factor = clamped / scale
+            a *= factor
+            b *= factor
         A = np.array([[a, -b], [b, a]], dtype=float)
         t = dst_mean - A @ src_mean
         return A, t
@@ -145,12 +160,12 @@ class EyeInHandKinematics:
             return False
         sx = math.hypot(float(A[0, 0]), float(A[1, 0]))
         sy = math.hypot(float(A[0, 1]), float(A[1, 1]))
-        if not (0.95 <= sx <= 1.05 and 0.95 <= sy <= 1.05):
+        if not (0.992 <= sx <= 1.008 and 0.992 <= sy <= 1.008 and abs(sx - sy) <= 0.008):
             return False
-        # Verify axes remain nearly orthogonal (within +/- 5 deg of 90 deg)
+        # Verify axes remain nearly orthogonal (within +/- 2 deg of 90 deg)
         dot = float(A[0, 0] * A[0, 1] + A[1, 0] * A[1, 1])
         cos_ortho = abs(dot) / max(1e-6, sx * sy)
-        return cos_ortho <= math.sin(math.radians(5.0))
+        return cos_ortho <= math.sin(math.radians(2.0))
 
     def _height_ratio(
         self,
@@ -332,10 +347,10 @@ class EyeInHandKinematics:
                     A, t = cand_A, cand_t
                     mode = f"{len(ordered_ids)}_corner_affine"
                 else:
-                    A, t = self._fit_similarity_2d(C_arr, P_arr)
+                    A, t = self._fit_similarity_2d(C_arr, P_arr, min_scale=0.995, max_scale=1.005)
                     mode = f"{len(ordered_ids)}_corner_similarity"
             else:
-                A, t = self._fit_similarity_2d(C_arr, P_arr)
+                A, t = self._fit_similarity_2d(C_arr, P_arr, min_scale=0.995, max_scale=1.005)
                 mode = "2_corner_similarity"
 
             # P = A @ C + t maps Motor -> Plate, so plate rotation wrt motor is -atan2(A[1,0], A[0,0])
@@ -357,10 +372,10 @@ class EyeInHandKinematics:
             if self._is_valid_plate_affine(cand_A):
                 A, t = cand_A, cand_t
             else:
-                A, t = self._fit_similarity_2d(C_arr, P_arr)
+                A, t = self._fit_similarity_2d(C_arr, P_arr, min_scale=0.995, max_scale=1.005)
                 mode = f"{len(ordered_ids)}_corner_similarity"
         else:
-            A, t = self._fit_similarity_2d(C_arr, P_arr)
+            A, t = self._fit_similarity_2d(C_arr, P_arr, min_scale=0.995, max_scale=1.005)
 
         pred = (C_arr @ A.T) + t
         errs = np.linalg.norm(pred - P_arr, axis=1)
@@ -585,13 +600,11 @@ class EyeInHandKinematics:
         self, drop_plate_x_mm: float, drop_plate_y_mm: float
     ) -> Tuple[float, float]:
         """
-        Converts Phase 6 target stack plate coordinates to gripper motor coordinates,
-        compensating for any systematic motor drift observed during fine pick alignments.
+        Converts Phase 6 target stack plate coordinates to gripper motor coordinates.
+        Uses exact calibrated plate coordinates so every layer of a stack aligns on the
+        same motor (X, Y) target without perspective-parallax drift.
         """
-        return self.plate_to_gripper_motor(
-            drop_plate_x_mm + self.drift_x_mm,
-            drop_plate_y_mm + self.drift_y_mm,
-        )
+        return self.plate_to_gripper_motor(drop_plate_x_mm, drop_plate_y_mm)
 
 
 class WorldCatalogAndPlanner:
@@ -664,12 +677,12 @@ class WorldCatalogAndPlanner:
         zone_y_mm: float,
     ) -> Optional[float]:
         """
-        Returns the lowest CAD stage Z_up (at motor Z_down=0) overlapping the 24x24 mm
-        footprint around a zone stack (zone_x +/- 12, zone_y +/- 12), or None if disjoint.
+        Returns the lowest CAD stage Z_up (at motor Z_down=0) overlapping the 20x20 mm
+        footprint around a zone stack (zone_x +/- 10, zone_y +/- 10), or None if disjoint.
         Measured from v3_gantry_compiled.bin (cad_motor_z_mm = 4.9).
         """
-        bx0, bx1 = zone_x_mm - 12.0, zone_x_mm + 12.0
-        by0, by1 = zone_y_mm - 12.0, zone_y_mm + 12.0
+        bx0, bx1 = zone_x_mm - 10.0, zone_x_mm + 10.0
+        by0, by1 = zone_y_mm - 10.0, zone_y_mm + 10.0
         z0: Optional[float] = None
 
         def _upd(val: float) -> None:
@@ -677,13 +690,13 @@ class WorldCatalogAndPlanner:
             z0 = val if z0 is None or val < z0 else z0
 
         # 1. zStage main Y-boom & linear rail over playable plate (plateY in [10.0, 146.0])
-        if min(ee_x_mm - 33.5, bx1) > max(ee_x_mm - 62.0, bx0) and min(146.0, by1) > max(10.0, by0):
+        if min(ee_x_mm - 38.0, bx1) > max(ee_x_mm - 62.0, bx0) and min(146.0, by1) > max(10.0, by0):
             _upd(118.9)
         # 2. zStage front boom end-cap (plateY in [146.0, 171.5])
         if min(ee_x_mm - 41.0, bx1) > max(ee_x_mm - 64.0, bx0) and min(171.5, by1) > max(146.0, by0):
             _upd(114.9)
         # 3. yStage boom clamp & low carriage plate (dY in [-18.0, +22.0])
-        if min(ee_x_mm - 10.0, bx1) > max(ee_x_mm - 57.0, bx0) and min(ee_y_mm + 22.0, by1) > max(ee_y_mm - 18.0, by0):
+        if min(ee_x_mm - 15.0, bx1) > max(ee_x_mm - 57.0, bx0) and min(ee_y_mm + 22.0, by1) > max(ee_y_mm - 18.0, by0):
             _upd(111.4)
         # 4. yStage upper camera arm & guide (dY in [+22.0, +68.0])
         if min(ee_x_mm + 13.0, bx1) > max(ee_x_mm - 24.0, bx0) and min(ee_y_mm + 68.0, by1) > max(ee_y_mm + 22.0, by0):
@@ -754,16 +767,16 @@ class WorldCatalogAndPlanner:
                 top = z_coords[zi][2] + c * block_height_mm
                 if top > max_top:
                     max_top = top
-        if max_top <= 48.0:
+        if max_top <= 0.0:
             return z_hover_mm
-        return max(4.0, min(z_hover_mm, base_plate_z_down_mm - (max_top + 6.0)))
+        return max(2.0, min(z_hover_mm, base_plate_z_down_mm - (max_top + 8.0)))
 
     def compute_pick_sequence(
         self,
         current_x_mm: float,
         current_y_mm: float,
         stack_zones_mm: Optional[Dict[str, Tuple[float, float, float]]] = None,
-        zone_clear_radius_mm: float = 38.0,
+        zone_clear_radius_mm: float = 26.0,
         priority_block_id: Optional[int] = None,
         deferred_block_ids: Optional[Set[int]] = None,
         boom_x_min_offset_mm: float = -64.0,
@@ -909,22 +922,51 @@ class WorldCatalogAndPlanner:
 
         is_boom_shadowed = [any(pick_max[i][zi] < 3 for zi in range(nz)) for i in range(n)]
 
-        # Hard step-0 enforcement for priority_block_id / deferred_block_ids so a
-        # just-staged block never re-triggers immediately before clearing blockers.
+        full_mask = (1 << n) - 1
+
+        # Hard step-0 enforcement for priority_block_id / deferred_block_ids:
+        # 1) Never pick a deferred (just-staged) block on Step 0 when non-deferred safe candidates exist.
+        # 2) Trace transitive zone blockers from priority_block_id so if the priority blocker's own
+        #    destination is blocked by an unblocked block, Step 0 clears the unblocked blocker first
+        #    instead of forcing a chain-staging move.
         safe_step0 = [
             i for i in range(n) if all(init_counts[zi] <= pick_max[i][zi] for zi in range(nz))
         ]
-        step0_allowed: Optional[Set[int]] = None
-        if priority_block_id is not None:
-            prio_matches = [i for i in safe_step0 if candidates[i].id == priority_block_id]
-            if prio_matches:
-                step0_allowed = set(prio_matches)
-        if step0_allowed is None and deferred:
-            non_def = [i for i in safe_step0 if candidates[i].id not in deferred]
-            if non_def:
-                step0_allowed = set(non_def)
+        non_def_safe = [i for i in safe_step0 if candidates[i].id not in deferred]
+        step0_pool = non_def_safe if non_def_safe else safe_step0
 
-        full_mask = (1 << n) - 1
+        def _is_unblocked_at_step0(idx: int) -> bool:
+            di0 = b_dest[idx]
+            if obs_mask[di0] & (full_mask ^ (1 << idx)):
+                return False
+            dm0 = drop_max[di0][init_counts[di0]]
+            return all(init_counts[zi] <= dm0[zi] for zi in range(nz))
+
+        step0_allowed: Optional[Set[int]] = None
+        priority_bonus_ids: Set[int] = set()
+        if priority_block_id is not None:
+            id_to_idx = {candidates[i].id: i for i in range(n)}
+            if priority_block_id in id_to_idx:
+                prio_chain: Set[int] = set()
+                frontier = [id_to_idx[priority_block_id]]
+                while frontier:
+                    cur_i = frontier.pop()
+                    if cur_i in prio_chain:
+                        continue
+                    prio_chain.add(cur_i)
+                    mask = obs_mask[b_dest[cur_i]] & (full_mask ^ (1 << cur_i))
+                    for j in range(n):
+                        if (mask & (1 << j)) and j not in prio_chain:
+                            frontier.append(j)
+                unblocked_chain = [
+                    i for i in step0_pool if i in prio_chain and _is_unblocked_at_step0(i)
+                ]
+                if unblocked_chain:
+                    step0_allowed = set(unblocked_chain)
+                    priority_bonus_ids = {candidates[i].id for i in unblocked_chain}
+        if step0_allowed is None and non_def_safe and deferred:
+            step0_allowed = set(non_def_safe)
+
         # State tuple: (cost, last_x, last_y, counts_tuple, rem_mask, path_tuple)
         beam = [(0.0, float(current_x_mm), float(current_y_mm), init_counts, full_mask, ())]
 
@@ -1010,7 +1052,7 @@ class WorldCatalogAndPlanner:
                     out_pen = outward_mult * b_laydown_dist[i]
                     prio_bonus = (
                         -3000.0
-                        if (step == 0 and priority_block_id is not None and candidates[i].id == priority_block_id)
+                        if (step == 0 and candidates[i].id in priority_bonus_ids)
                         else 0.0
                     )
                     def_pen = 800.0 / (step + 1) if candidates[i].id in deferred else 0.0
@@ -1155,7 +1197,7 @@ class WorldCatalogAndPlanner:
         zone_x_mm: float,
         zone_y_mm: float,
         exclude_block_id: int,
-        radius_mm: float = 38.0,
+        radius_mm: float = 26.0,
     ) -> Optional[BlockRecord]:
         """Returns the closest unstacked block sitting within `radius_mm` of a laydown zone."""
         blockers = [

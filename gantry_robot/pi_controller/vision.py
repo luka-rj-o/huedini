@@ -77,6 +77,7 @@ class VisionPipeline:
         self._cap: Optional[cv2.VideoCapture] = None
         self._cam_lock = threading.Lock()
         self.last_annotated_jpeg_b64: Optional[str] = None
+        self.frame_seq: int = 0
 
         # Setup ArUco DICT_4X4_50 detector (compatible across OpenCV 4.5 - 4.10+)
         self._aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
@@ -223,33 +224,49 @@ class VisionPipeline:
     def encode_fast_preview(self, frame: np.ndarray) -> None:
         """
         Lightweight fast preview encoding for live streaming in IDLE/manual mode.
-        Draws the optical center crosshair and compresses to JPEG without running
-        the heavy 5-color HSV morphology and ArUco matrix detector loops, saving ~70% CPU on Pi Zero.
+        Draws the optical center crosshair in-place and compresses to JPEG without
+        running heavy HSV morphology/ArUco loops or copying the 921 KB frame buffer.
         """
-        annotated = frame.copy()
         h, w = frame.shape[:2]
         cx_img, cy_img = w // 2, h // 2
-        cv2.line(annotated, (cx_img - 20, cy_img), (cx_img + 20, cy_img), (200, 200, 200), 1)
-        cv2.line(annotated, (cx_img, cy_img - 20), (cx_img, cy_img + 20), (200, 200, 200), 1)
-        cv2.circle(annotated, (cx_img, cy_img), 3, (255, 255, 255), -1)
+        cv2.line(frame, (cx_img - 20, cy_img), (cx_img + 20, cy_img), (200, 200, 200), 1)
+        cv2.line(frame, (cx_img, cy_img - 20), (cx_img, cy_img + 20), (200, 200, 200), 1)
+        cv2.circle(frame, (cx_img, cy_img), 3, (255, 255, 255), -1)
 
-        ok, buf = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 52])
         if ok:
             self.last_annotated_jpeg_b64 = base64.b64encode(buf).decode("ascii")
+            self.frame_seq += 1
+
+    def _detect_raw_aruco(
+        self, frame: np.ndarray
+    ) -> Tuple[tuple, Optional[np.ndarray]]:
+        """Detects DICT_4X4_50 markers in grayscale, falling back to CLAHE contrast boost in shadow."""
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if hasattr(cv2.aruco, "ArucoDetector"):
+            detector = cv2.aruco.ArucoDetector(self._aruco_dict, self._aruco_params)
+            corners, ids, _ = detector.detectMarkers(gray)
+            if ids is None or len(ids) == 0:
+                enhanced = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(gray)
+                corners, ids, _ = detector.detectMarkers(enhanced)
+            return corners, ids
+
+        corners, ids, _ = cv2.aruco.detectMarkers(
+            gray, self._aruco_dict, parameters=self._aruco_params
+        )
+        if ids is None or len(ids) == 0:
+            enhanced = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(gray)
+            corners, ids, _ = cv2.aruco.detectMarkers(
+                enhanced, self._aruco_dict, parameters=self._aruco_params
+            )
+        return corners, ids
 
     def _detect_aruco_markers_and_mask(
         self, frame: np.ndarray
     ) -> Tuple[tuple, Optional[np.ndarray], np.ndarray]:
         """Detects DICT_4X4_50 markers and builds an expanded binary exclusion mask."""
         h, w = frame.shape[:2]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if hasattr(cv2.aruco, "ArucoDetector"):
-            detector = cv2.aruco.ArucoDetector(self._aruco_dict, self._aruco_params)
-            corners, ids, _ = detector.detectMarkers(gray)
-        else:
-            corners, ids, _ = cv2.aruco.detectMarkers(
-                gray, self._aruco_dict, parameters=self._aruco_params
-            )
+        corners, ids = self._detect_raw_aruco(frame)
 
         exclusion_mask = np.zeros((h, w), dtype=np.uint8)
         if ids is not None and len(ids) > 0:
@@ -418,6 +435,7 @@ class VisionPipeline:
         ok, buf = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
         if ok:
             self.last_annotated_jpeg_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+            self.frame_seq += 1
 
         return detected_fiducials, detected_blocks
 
@@ -428,14 +446,7 @@ class VisionPipeline:
         Detects all DICT_4X4_50 ArUco markers in `frame` and returns a list of
         (marker_id, center_u_px, center_v_px, angle_deg), sorted closest to center first.
         """
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        if hasattr(cv2.aruco, "ArucoDetector"):
-            detector = cv2.aruco.ArucoDetector(self._aruco_dict, self._aruco_params)
-            corners, ids, _ = detector.detectMarkers(gray)
-        else:
-            corners, ids, _ = cv2.aruco.detectMarkers(
-                gray, self._aruco_dict, parameters=self._aruco_params
-            )
+        corners, ids = self._detect_raw_aruco(frame)
 
         annotated = frame.copy()
         results: List[Tuple[float, int, float, float, float]] = []
@@ -537,6 +548,7 @@ class VisionPipeline:
         ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
         if ok:
             self.last_annotated_jpeg_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+            self.frame_seq += 1
 
     # ------------------------------------------------------------------
     # Synthetic Camera Frame Renderer (--mock-hardware)

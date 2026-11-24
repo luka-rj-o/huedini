@@ -40,6 +40,9 @@ class TelemetryServer:
         self._clients: Set[asyncio.StreamWriter] = set()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
+        self._pending_state: Optional[Dict[str, Any]] = None
+        self._broadcast_draining: bool = False
+        self._last_sent_frame_seq: Optional[int] = None
         self._latest_payload: Dict[str, Any] = {
             "timestamp": time.time(),
             "state": "IDLE",
@@ -80,14 +83,46 @@ class TelemetryServer:
             self.port,
         )
 
+    @property
+    def client_count(self) -> int:
+        return len(self._clients)
+
     def broadcast_state(self, state_dict: Dict[str, Any]) -> None:
-        """Non-blocking state broadcast; safe with zero connected WebSocket clients."""
+        """Non-blocking, coalescing delta-frame state broadcast."""
         self._latest_payload = state_dict
         if not self._clients or self._loop is None or not self._loop.is_running():
             return
 
-        msg = json.dumps(state_dict)
-        asyncio.run_coroutine_threadsafe(self._async_broadcast(msg), self._loop)
+        self._pending_state = state_dict
+        try:
+            self._loop.call_soon_threadsafe(self._schedule_drain)
+        except RuntimeError:
+            pass
+
+    def _schedule_drain(self) -> None:
+        if not self._broadcast_draining and self._loop is not None:
+            self._broadcast_draining = True
+            self._loop.create_task(self._drain_broadcasts())
+
+    async def _drain_broadcasts(self) -> None:
+        try:
+            while self._pending_state is not None:
+                state = self._pending_state
+                self._pending_state = None
+                if not self._clients:
+                    continue
+                fseq = state.get("vision_frame_seq")
+                if fseq is not None and fseq == self._last_sent_frame_seq:
+                    wire_state = dict(state)
+                    wire_state["vision_frame_b64"] = None
+                else:
+                    wire_state = state
+                    self._last_sent_frame_seq = fseq
+                await self._async_broadcast(json.dumps(wire_state))
+        finally:
+            self._broadcast_draining = False
+            if self._pending_state is not None and self._loop is not None and self._loop.is_running():
+                self._schedule_drain()
 
     async def _async_broadcast(self, message: str) -> None:
         if not self._clients:
@@ -328,6 +363,7 @@ class TelemetryServer:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         self._clients.add(writer)
+        self._last_sent_frame_seq = None
         logger.info("Tier 1 Dashboard client connected (%d active)", len(self._clients))
         try:
             # Push initial snapshot

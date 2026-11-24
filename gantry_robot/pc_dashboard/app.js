@@ -52,7 +52,7 @@ const EE_OFFSET_Y = -41.6;
 // Aluminum drop-off pedestal
 const DROPOFF_X = 224.6;
 const DROPOFF_Y = 44.5;
-const DROPOFF_Z_UP = 15.9;
+const DROPOFF_Z_UP = 18.5;
 const ALUM_PLATFORM_SIZE = 76.2;
 
 // Camera sensor
@@ -136,7 +136,7 @@ let latestState = {
   load_cell_error: null,
   load_cell_seq: 0,
   calibration: { calibrated: false, kx_mm_per_px: 0.25, ky_mm_per_px: 0.25 },
-  steps_per_mm: { x: 200.0, y: 10.0, z: 50.0 },
+  steps_per_mm: { x: 200.0, y: 40.0, z: 50.0 },
   blocks: [],
   logs: [],
   vision_frame_b64: null,
@@ -245,6 +245,9 @@ function connectWebSocket() {
     if (replayActive) return;
     try {
       const payload = JSON.parse(event.data);
+      if (!payload.vision_frame_b64 && latestState && latestState.vision_frame_b64) {
+        payload.vision_frame_b64 = latestState.vision_frame_b64;
+      }
       const prevState = latestState ? latestState.state : "IDLE";
       latestState = payload;
       updateUI(payload, prevState);
@@ -356,8 +359,8 @@ function applyLeadPreset(leadMm, spm) {
   document.querySelectorAll(".preset-btn").forEach((b) => b.classList.remove("active"));
   const btn = $(`presetT8x${Math.round(leadMm)}`);
   if (btn) btn.classList.add("active");
-  setSpmTag(spm, 10.0);
-  sendCmd("SET_STEPS_CALIBRATION", { steps_per_mm_x: spm, steps_per_mm_y: 10.0, steps_per_mm_z: spm });
+  setSpmTag(spm, 40.0);
+  sendCmd("SET_STEPS_CALIBRATION", { steps_per_mm_x: spm, steps_per_mm_y: 40.0, steps_per_mm_z: spm });
 }
 
 function promptCustomSpm() {
@@ -549,6 +552,7 @@ function updateReadoutsFromMotor() {
 
 let lastLogSignature = "";
 let lastBlocksSignature = "";
+let lastRenderedFrameB64 = null;
 
 function updateUI(data, prevState) {
   const state = data.state || "IDLE";
@@ -655,10 +659,14 @@ function updateUI(data, prevState) {
   const imgEl = $("visionPreviewImg");
   const synthCanvas = $("synthCamCanvas");
   if (data.vision_frame_b64) {
-    imgEl.src = `data:image/jpeg;base64,${data.vision_frame_b64}`;
+    if (data.vision_frame_b64 !== lastRenderedFrameB64) {
+      lastRenderedFrameB64 = data.vision_frame_b64;
+      imgEl.src = `data:image/jpeg;base64,${data.vision_frame_b64}`;
+    }
     imgEl.style.display = "block";
     synthCanvas.style.display = "none";
   } else {
+    lastRenderedFrameB64 = null;
     imgEl.style.display = "none";
     synthCanvas.style.display = "block";
     renderSyntheticCamera(synthCanvas, data);

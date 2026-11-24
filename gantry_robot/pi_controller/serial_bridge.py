@@ -77,6 +77,8 @@ class ESP32SerialBridge:
         self.last_press_force_hit: bool = False
         self.last_press_guard_hit: bool = False
         self.last_tare_check_g: Optional[float] = None
+        self.last_tare_offset_raw: Optional[int] = None
+        self._drivers_awake: bool = False
         self._simulated_held_mass_g: Optional[float] = None
         self._mock_press_obstacles: list[float] = []
 
@@ -294,6 +296,7 @@ class ESP32SerialBridge:
             return False
 
         logger.warning("Attempting automatic serial bridge reconnection...")
+        self._drivers_awake = False
         self._close_ser_quietly()
         time.sleep(0.25)
 
@@ -326,6 +329,7 @@ class ESP32SerialBridge:
             self._send_command_locked(steps_cmd, timeout_s=3.0)
             try:
                 self._send_command_locked("SETUP", timeout_s=3.0)
+                self._drivers_awake = True
             except Exception as setup_exc:
                 msg = str(setup_exc)
                 if "VM" in msg or "UART" in msg or "driver not responding" in msg:
@@ -362,6 +366,7 @@ class ESP32SerialBridge:
 
     def close(self) -> None:
         self._running = False
+        self._drivers_awake = False
         if self._monitor_thread is not None and self._monitor_thread.is_alive():
             self._monitor_thread.join(timeout=0.5)
         if self._ser and self._ser.is_open:
@@ -370,6 +375,7 @@ class ESP32SerialBridge:
     def trigger_emergency_stop(self) -> None:
         self._abort_flag = True
         self._abort_generation += 1
+        self._drivers_awake = False
         if not self.mock_hardware and self._ser and self._ser.is_open:
             try:
                 self._ser.write(b"ESTOP\n")
@@ -398,6 +404,10 @@ class ESP32SerialBridge:
         t_start = time.monotonic()
 
         def _log_and_return(results: list[str]) -> list[str]:
+            if upper in ("SLEEP", "ESTOP"):
+                self._drivers_awake = False
+            elif upper in ("SETUP", "HOME"):
+                self._drivers_awake = True
             dur_ms = (time.monotonic() - t_start) * 1000.0
             if self.command_log_callback:
                 try:
@@ -555,10 +565,13 @@ class ESP32SerialBridge:
     # ------------------------------------------------------------------
     # High-level deterministic operations
     # ------------------------------------------------------------------
-    def ensure_awake(self) -> None:
-        """Ensures steppers are enabled and drivers initialized (sends SETUP if needed)."""
+    def ensure_awake(self, force: bool = False) -> None:
+        """Ensures steppers are enabled and drivers initialized (skips redundant SETUP when already awake)."""
+        if self._drivers_awake and not force:
+            return
         try:
             self.send_command("SETUP", timeout_s=4.0)
+            self._drivers_awake = True
         except Exception as exc:
             logger.warning("ensure_awake failed: %s", exc)
 
@@ -592,24 +605,17 @@ class ESP32SerialBridge:
         ty = max(0.0, min(self.config.travel_y_mm, ty))
         tz = max(0.0, min(self.config.travel_z_bottom_mm, tz))
 
-        # EE & Z-carriage rear clearance: when Z is lowered (> 2.0 mm) or about to lower,
-        # keep Y >= servo_safe_y_mm (10.0 mm) so the lowered end-effector never hits the rear
-        # end-stop or rotates into it (which causes Y belt step loss).
+        # EE rotation clearance: never rotate servo A when Y < servo_safe_y_mm (10 mm),
+        # because swinging the end-effector near Y=0 hits the rear end stop.
         safe_y = self.config.servo_safe_y_mm
-        if tz > 2.0 or self.pose.z_mm > 2.0:
-            if ty < safe_y:
-                logger.debug("Clamping lowered-Z target Y %.2f -> %.2f mm to clear rear stop.", ty, safe_y)
-                ty = safe_y
-            if self.pose.z_mm <= 2.0 and self.pose.y_mm < safe_y:
+        if abs(ta - self.pose.angle_deg) > 0.1 and ty < safe_y:
+            if tz < self.pose.z_mm - 0.5:
                 self.move_to(
-                    y_mm=safe_y,
-                    z_mm=self.pose.z_mm,
+                    z_mm=tz,
                     angle_deg=self.pose.angle_deg,
-                    feedrate_mm_s=tf,
+                    feedrate_mm_s=self.config.feedrate_z_mm_s,
                     timeout_s=timeout_s,
                 )
-
-        if abs(ta - self.pose.angle_deg) > 0.1 and ty < safe_y:
             if self.pose.y_mm < safe_y:
                 self.move_to(
                     y_mm=safe_y,
@@ -713,6 +719,7 @@ class ESP32SerialBridge:
     def tare_scale(self) -> None:
         """Zeroes the HX711 load cell offset before picking a block."""
         self.last_tare_check_g = None
+        self.last_tare_offset_raw = None
         lines = self.send_command("TARE", timeout_s=7.0)
         for line in reversed(lines):
             if line.startswith("TARED "):
@@ -720,6 +727,11 @@ class ESP32SerialBridge:
                     if tok.startswith("CHECK:"):
                         try:
                             self.last_tare_check_g = float(tok.split(":", 1)[1])
+                        except ValueError:
+                            pass
+                    elif tok.startswith("OFFSET:"):
+                        try:
+                            self.last_tare_offset_raw = int(tok.split(":", 1)[1])
                         except ValueError:
                             pass
                 break

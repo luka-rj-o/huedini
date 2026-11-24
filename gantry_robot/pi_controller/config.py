@@ -38,13 +38,13 @@ class GantryConfig:
     # Most standard T8 lead screws (T8x8, 4 starts) advance 8.0 mm per rev:
     # X uses 8x microstepping (1600 microsteps/rev -> 200.0 steps/mm on 8 mm lead screw) for quiet motion.
     # Z uses 2x microstepping (400 microsteps/rev -> 50.0 steps/mm on 8 mm lead screw).
-    # Y axis: 20-tooth GT2 belt pulley (40.0 mm/rev), 200 steps/rev, 2x microstepping = 10.0 steps/mm.
+    # Y axis: 20-tooth GT2 belt pulley (40.0 mm/rev), 200 steps/rev, 8x microstepping = 40.0 steps/mm.
     lead_screw_pitch_mm: float = 2.0
     lead_screw_lead_mm: float = 8.0
     y_belt_pulley_mm_rev: float = 40.0
     microsteps: int = 2
     steps_per_mm_x: float = 200.0
-    steps_per_mm_y: float = 10.0
+    steps_per_mm_y: float = 40.0
     steps_per_mm_z: float = 50.0
 
     # --- Physical Motor Travel Strokes from Homed (0, 0, 0) (mm) ---
@@ -107,13 +107,13 @@ class GantryConfig:
         default_factory=lambda: [
             MassClassSpec("low_infill", nominal_g=2.46, min_g=0.0, max_g=4.75),
             MassClassSpec("med_infill", nominal_g=7.05, min_g=4.75, max_g=8.40),
-            MassClassSpec("high_infill", nominal_g=9.75, min_g=8.40, max_g=15.70),
-            MassClassSpec("aluminum", nominal_g=21.6, min_g=15.70, max_g=50.0),
+            MassClassSpec("high_infill", nominal_g=9.75, min_g=8.40, max_g=17.50),
+            MassClassSpec("aluminum", nominal_g=21.6, min_g=17.50, max_g=60.0),
         ]
     )
 
     # --- Motion Feedrates (mm/s), Surface Press, Scan Settling, and EE Rotation Clearance ---
-    feedrate_travel_mm_s: float = 75.0   # Firmware caps X at 60.0 mm/s, Y at 80.0 mm/s
+    feedrate_travel_mm_s: float = 100.0  # Firmware caps X at 60.0 mm/s, Y at 100.0 mm/s
     feedrate_z_mm_s: float = 35.0
     feedrate_fine_mm_s: float = 40.0
     feedrate_press_mm_s: float = 8.0     # Controlled downward press (<0.8 mm per HX711 sample)
@@ -123,18 +123,20 @@ class GantryConfig:
     pick_guard_offset_mm: float = 80.0     # Start HX711 force-guarded PRESS directly from current Z hover
     drop_guard_offset_mm: float = 80.0     # Start HX711 force-guarded PRESS directly from pre-drop Z hover
     fine_align_max_radius_mm: float = 18.0  # Max association radius for Phase 5A fine alignment (blocks hijacking)
-    pick_press_max_mm: float = 3.0       # Max downward press past nominal pick surface
-    drop_press_max_mm: float = 4.0       # Max downward press past nominal drop surface (~2 mm deeper pushdown)
-    press_force_g: float = 55.0          # Upward load-cell delta target during open-jaw PICK press
-    pick_guard_force_g: float = 35.0     # Early-collision threshold during PICK guarded approach
-    drop_guard_force_g: float = 40.0     # Early-collision threshold (above held mass) during DROP guarded approach
-    drop_press_force_g: float = 200.0    # Upward load-cell delta target beyond cube weight before releasing on DROP
-    early_force_z_margin_mm: float = 3.5  # Force trigger above (target_z_down - margin) flags collision/misalignment
+    pick_press_max_mm: float = 2.5       # Max downward press past nominal pick surface
+    drop_press_max_mm: float = 2.5       # Max downward press past nominal drop surface (firmly pins cube on release)
+    press_force_g: float = 85.0          # Upward load-cell delta target during open-jaw PICK press
+    pick_guard_force_g: float = 95.0     # Early-collision threshold during PICK guarded approach
+    drop_guard_force_g: float = 95.0     # Early-collision threshold (above held mass) during DROP guarded approach
+    drop_press_force_g: float = 120.0    # Upward load-cell delta target beyond cube weight before releasing on DROP
+    early_force_z_margin_mm: float = 4.5  # Force trigger above (pick_z_down - margin) flags PICK misalignment
+    drop_early_force_z_margin_mm: float = 9.0  # Real obstacles are ~20 mm tall; within 9.0 mm is normal drop seating
     max_pick_misalign_retries: int = 3   # Consecutive early force-spike retries on PICK (3 retries = 4 total attempts)
     max_drop_collision_retries: int = 3  # Consecutive early force-spike retries on DROP (3 retries = 4 total attempts)
-    scan_settle_s: float = 0.35
-    tare_settle_s: float = 0.40          # Mechanical + servo settling before HX711 TARE
-    weigh_settle_s: float = 0.20         # Post-lift cantilever settling before HX711 WEIGH
+    scan_settle_s: float = 0.45
+    tare_settle_s: float = 0.25          # Mechanical + servo settling before HX711 TARE
+    weigh_settle_s: float = 0.25         # Post-lift cantilever settling before HX711 WEIGH
+    weigh_servo_angle_deg: float = 0.0   # Keep wrist clear of camera FOV and matched across TARE and WEIGH
     servo_safe_y_mm: float = 10.0
 
     # --- Eye-in-Hand Camera & Offset Parameters ---
@@ -178,24 +180,24 @@ class GantryConfig:
         default_factory=lambda: {
             1: (0.0, 115.0),     # Top-Left (Marker #1)
             2: (215.0, 115.0),   # Top-Right (Marker #2)
-            3: (215.0, 6.0),     # Bottom-Right (Marker #3, 6 mm clear of Y=0 rear bumper)
-            0: (0.0, 6.0),       # Bottom-Left (Marker #0, 6 mm clear of Y=0 rear bumper)
+            3: (215.0, 0.0),     # Bottom-Right (Marker #3)
+            0: (0.0, 0.0),       # Bottom-Left (Marker #0)
         }
     )
     calibration_step_x_mm: float = 20.0
     calibration_step_y_mm: float = 0.0
 
     # --- Global Scan Grid Coordinates (in motor travel coordinates within 227 x 128 mm envelope) ---
-    # Column-serpentine 6-point (3x2) grid finishes at (196.0, 70.0) right over the laydown zones so
-    # shortest-path planning spans outward immediately without deadhead return from home.
+    # Column-serpentine 6-point (3x2) grid reaches Y=0.0 cleanly for rear-row coverage and finishes
+    # at (196.0, 65.0) over the laydown zones so shortest-path planning spans outward without deadhead.
     scan_grid_points_mm: List[Tuple[float, float]] = field(
         default_factory=lambda: [
-            (20.0, 10.0),
-            (20.0, 70.0),
-            (108.0, 70.0),
-            (108.0, 10.0),
-            (196.0, 10.0),
-            (196.0, 70.0),
+            (20.0, 0.0),
+            (20.0, 65.0),
+            (108.0, 65.0),
+            (108.0, 0.0),
+            (196.0, 0.0),
+            (196.0, 65.0),
         ]
     )
 
@@ -205,7 +207,7 @@ class GantryConfig:
             "red": (250.2, 115.0, 6.35),
             "green": (210.2, 115.0, 6.35),
             "blue": (170.2, 115.0, 6.35),
-            "aluminum": (224.6, 44.5, 15.9),
+            "aluminum": (224.6, 44.5, 18.5),
         }
     )
     # Aluminum pedestal is a 76.2 x 76.2 mm (3" x 3") raised square centered at stack_zones_mm["aluminum"][:2]
@@ -293,7 +295,7 @@ class GantryConfig:
         return (dx * dx + dy * dy) ** 0.5
 
     def surface_z_up_mm_at(self, plate_x_mm: float, plate_y_mm: float) -> float:
-        """Returns local surface Z-up (mm wrt origin) at plate (x, y): 15.9 on the aluminum platform, else 6.35."""
+        """Returns local surface Z-up (mm wrt origin) at plate (x, y): 18.5 on the aluminum platform, else 6.35."""
         alum = self.stack_zones_mm.get("aluminum")
         if alum is not None and self.distance_to_aluminum_platform(plate_x_mm, plate_y_mm) <= 1e-6:
             return alum[2]

@@ -185,6 +185,7 @@ class GantryStateMachine:
             "live_cv_enabled": self._live_cv_enabled,
             "logs": list(self._logs),
             "vision_frame_b64": self.vision.last_annotated_jpeg_b64,
+            "vision_frame_seq": getattr(self.vision, "frame_seq", 0),
         }
         self.telemetry.broadcast_state(payload)
 
@@ -301,7 +302,7 @@ class GantryStateMachine:
             self._pause_requested = False
             self._start_requested = False
             self.serial.clear_emergency_stop()
-            self.serial.ensure_awake()
+            self.serial.ensure_awake(force=True)
             if self.mock_hardware:
                 self.vision.reset_simulated_course()
             self.planner.clear()
@@ -342,6 +343,16 @@ class GantryStateMachine:
             if self.state in ("IDLE", "PAUSED", "COMPLETE", "ERROR"):
                 axis = str(data.get("axis", "")).upper()
                 dist_mm = float(data.get("dist_mm", 0.0))
+                with self._cmd_queue.mutex:
+                    while self._cmd_queue.queue:
+                        nxt_cmd, nxt_data = self._cmd_queue.queue[0]
+                        if nxt_cmd != "JOG_AXIS" or str(nxt_data.get("axis", "")).upper() != axis:
+                            break
+                        self._cmd_queue.queue.popleft()
+                        self._cmd_queue.unfinished_tasks = max(
+                            0, self._cmd_queue.unfinished_tasks - 1
+                        )
+                        dist_mm += float(nxt_data.get("dist_mm", 0.0))
                 if axis in ("X", "Y", "Z") and dist_mm != 0.0:
                     try:
                         self.serial.ensure_awake()
@@ -391,6 +402,7 @@ class GantryStateMachine:
                 self._estop_active = False
                 self.serial.clear_emergency_stop()
                 self.serial.send_command("SETUP")
+                self.serial._drivers_awake = True
                 if self.state == "ESTOPPED":
                     self.state = "IDLE"
                 self.log_event("Motors re-energized (SETUP). Drivers ready.")
@@ -465,20 +477,22 @@ class GantryStateMachine:
 
     def _live_vision_loop(self) -> None:
         """
-        Background loop providing semi-live (~2.5-3 FPS) video feed to the Tier 1 Dashboard
-        whenever the robot is stationary / manual / idle / paused / errored.
-        Pauses during automated multi-axis motion / scan cycles so as not to contend for camera.
+        Background loop providing semi-live (~2.2 FPS) video feed to the Tier 1 Dashboard
+        whenever a client is connected and the robot is idle/manual/paused/errored.
+        Pauses during automated cycles, pending user commands, or when no dashboard client is viewing.
         """
         last_frame_time = 0.0
-        target_period_s = 0.35  # ~2.8 FPS - optimal for Pi Zero W single-core CPU
+        target_period_s = 0.45  # ~2.2 FPS - leaves CPU headroom for responsive jog/UI updates
         while self._running:
             can_stream = (
                 self._live_stream_enabled
                 and not self._start_requested
+                and self.telemetry.client_count > 0
+                and self._cmd_queue.empty()
                 and self.state in ("IDLE", "PAUSED", "COMPLETE", "ERROR", "ESTOPPED")
             )
             if not can_stream:
-                time.sleep(0.1)
+                time.sleep(0.12)
                 continue
 
             now = time.time()
@@ -672,6 +686,11 @@ class GantryStateMachine:
                 self.serial.pose.x_mm, self.serial.pose.y_mm, self.serial.pose.z_mm
             )
             c_fids = self.vision.detect_all_aruco_fiducials(c_frame)
+            if not any(m_id == corner_id for m_id, *_ in c_fids):
+                c_frame = self.vision.capture_stationary_frame(
+                    self.serial.pose.x_mm, self.serial.pose.y_mm, self.serial.pose.z_mm
+                )
+                c_fids = self.vision.detect_all_aruco_fiducials(c_frame)
             for m_id, u_px, v_px, ang in c_fids:
                 if m_id in self.kinematics.corner_fiducials:
                     observations.append((m_id, u_px, v_px, cx_m, cy_m, ang))
@@ -896,6 +915,8 @@ class GantryStateMachine:
         # Return to home park position: retract Z first to avoid collisions, park clear of Y blanking stop
         self.serial.move_to(z_mm=self.config.z_scan_mm, feedrate_mm_s=self.config.feedrate_z_mm_s)
         self.serial.move_to(x_mm=20.0, y_mm=30.0, angle_deg=0.0)
+        self._auto_tare_scale("Post-run park")
+        self._set_mass_reading(0.00, None)
         self.state = "COMPLETE"
         self.log_event(
             f"All {total_blocks} blocks processed and sorted! Returning to IDLE/COMPLETE."
@@ -906,19 +927,17 @@ class GantryStateMachine:
         except Exception as exc:
             logger.debug("Completion chime skipped: %s", exc)
 
-    def _safe_transit_z_down(self, clearance_margin_mm: float = 6.0) -> float:
+    def _safe_transit_z_down(self, clearance_margin_mm: float = 8.0) -> float:
         """
-        Computes safe transit Z_down clearance.
-        At z_hover_mm (25.0 mm), the end-effector naturally clears 1-high (26.35 mm)
-        and 2-high (46.35 mm) RGB stacks as well as 1-high Aluminum (35.9 mm).
-        Only raise transit Z above z_hover_mm once a 3rd+ cube stack (> 48.0 mm top)
-        exists so 1- and 2-cube stacks do not trigger unnecessary Z travel.
+        Computes safe transit Z_down clearance above any active laydown stacks.
+        Enforces at least `clearance_margin_mm` (default 8.0 mm: +2.0 mm over earlier
+        6.0 mm margin) above the tallest stack so 2-high and 3-high stacks clear cleanly.
         """
         max_top_z_up = self.planner.max_stack_top_z_up_mm(self.config.stack_zones_mm)
-        if max_top_z_up <= 48.0:
+        if max_top_z_up <= 0.0:
             return self.config.z_hover_mm
         req_z_down = self.config.base_plate_z_down_mm - (max_top_z_up + clearance_margin_mm)
-        return round(max(4.0, min(self.config.z_hover_mm, req_z_down)), 2)
+        return round(max(2.0, min(self.config.z_hover_mm, req_z_down)), 2)
 
     def _press_cube_into_surface(
         self,
@@ -969,10 +988,7 @@ class GantryStateMachine:
         """Moves camera above `block`, captures a stationary frame, and returns best matching detection."""
         cam_mx, cam_my = self.kinematics.plate_to_camera_motor(block.x_mm, block.y_mm)
         cam_mx = max(0.0, min(self.config.travel_x_mm, cam_mx))
-        cam_my = max(
-            self.config.servo_safe_y_mm if cam_z_mm > 2.0 else 0.0,
-            min(self.config.travel_y_mm, cam_my),
-        )
+        cam_my = max(0.0, min(self.config.travel_y_mm, cam_my))
         if self.serial.pose.z_mm > cam_z_mm + 0.1:
             self.serial.move_to(z_mm=cam_z_mm, feedrate_mm_s=self.config.feedrate_z_mm_s)
         self.serial.move_to(
@@ -999,8 +1015,11 @@ class GantryStateMachine:
         )
         other_blocks = [b for b in self.planner.blocks if b.id != block.id]
         target_h = self.config.block_top_height_mm_at(block.x_mm, block.y_mm)
+        min_fine_area_px = 4500.0 if self.serial.pose.z_mm <= 5.0 else 8500.0
         candidates = []
         for det in v_dets:
+            if det.area_px < min_fine_area_px:
+                continue
             rx, ry = self.kinematics.pixel_to_world_mm(
                 det.u_px,
                 det.v_px,
@@ -1044,35 +1063,42 @@ class GantryStateMachine:
     ) -> bool:
         """
         Positions the eye-in-hand camera above `block` and refines its (X, Y, angle).
-        On misalignment retry, settles before capture, escalates to wider-FOV z_scan_mm=0.0
-        if unseen, and performs a second centering capture if residual offset > 2.5 mm.
+        For rear-edge blocks requiring cam_my < 0 or whenever the initial
+        hover capture misses the target, captures at wider-FOV z_scan_mm=0.0.
         """
         action_word = "Re-scanning" if is_retry else "Moving camera above"
-        cam_mx, cam_my = self.kinematics.plate_to_camera_motor(block.x_mm, block.y_mm)
-        cam_mx = max(0.0, min(self.config.travel_x_mm, cam_mx))
-        cam_my = max(self.config.servo_safe_y_mm, min(self.config.travel_y_mm, cam_my))
+        raw_cam_mx, raw_cam_my = self.kinematics.plate_to_camera_motor(block.x_mm, block.y_mm)
+        eff_scan_z_mm = (
+            self.config.z_scan_mm
+            if (raw_cam_my < -2.0 and scan_z_mm > self.config.z_scan_mm + 0.5)
+            else scan_z_mm
+        )
+        cam_mx = max(0.0, min(self.config.travel_x_mm, raw_cam_mx))
+        cam_my = max(0.0, min(self.config.travel_y_mm, raw_cam_my))
         pick_record.camera_motor_x = round(cam_mx, 2)
         pick_record.camera_motor_y = round(cam_my, 2)
         self.log_event(
             f"Phase 5 [{'RETRY ALIGN' if is_retry else 'PICKING'}]: {action_word} Block #{block.id} "
             f"({block.color.upper()}) at plate ({block.x_mm:.1f}, {block.y_mm:.1f}) mm "
-            f"-> motor ({cam_mx:.1f}, {cam_my:.1f}, Z={scan_z_mm:.1f}) mm..."
+            f"-> motor ({cam_mx:.1f}, {cam_my:.1f}, Z={eff_scan_z_mm:.1f}) mm..."
         )
 
         eff_radius = (
             self.config.fine_align_max_radius_mm + 4.0
             if is_retry
-            else self.config.fine_align_max_radius_mm
+            else min(self.config.fine_align_max_radius_mm, 8.5)
         )
         match = self._capture_and_refine_target_block(
-            block, scan_z_mm, settle=is_retry, max_radius_mm=eff_radius
+            block, eff_scan_z_mm, settle=is_retry, max_radius_mm=eff_radius
         )
-        if match is None and is_retry and scan_z_mm > self.config.z_scan_mm + 0.5:
+        if match is None and eff_scan_z_mm > self.config.z_scan_mm + 0.5:
             self.log_event(
-                f"Retry align for Block #{block.id}: elevating to Z_scan={self.config.z_scan_mm:.1f} mm for wider FOV..."
+                f"{'Retry align' if is_retry else 'Fine align'} for Block #{block.id}: "
+                f"elevating to Z_scan={self.config.z_scan_mm:.1f} mm for wider FOV..."
             )
+            eff_scan_z_mm = self.config.z_scan_mm
             match = self._capture_and_refine_target_block(
-                block, self.config.z_scan_mm, settle=True, max_radius_mm=eff_radius
+                block, eff_scan_z_mm, settle=True, max_radius_mm=eff_radius
             )
 
         pick_record.fine_align_checked = True
@@ -1088,7 +1114,7 @@ class GantryStateMachine:
         if is_retry and err_mm > 2.5:
             block.x_mm, block.y_mm = refined_x, refined_y
             second = self._capture_and_refine_target_block(
-                block, scan_z_mm, settle=True, max_radius_mm=eff_radius
+                block, eff_scan_z_mm, settle=True, max_radius_mm=eff_radius
             )
             if second is not None:
                 cam_mx, cam_my, best, refined_x, refined_y, second_err = second
@@ -1138,8 +1164,8 @@ class GantryStateMachine:
             block.status = "PICKING"
             transit_z = self._safe_transit_z_down()
             max_pick_retries = max(0, int(self.config.max_pick_misalign_retries))
-            # Unify weigh height with safe stack-clearance transit height to avoid redundant post-weigh Z hops
-            weigh_z = round(max(4.0, min(self.config.z_hover_mm, transit_z)), 2)
+            transit_hover_z = round(max(2.0, min(self.config.z_hover_mm, transit_z)), 2)
+            weigh_z = round(min(transit_hover_z, 15.0), 2)
 
             for retry_idx in range(0, max_pick_retries + 1):
                 self._fine_align_block_with_camera(
@@ -1149,10 +1175,10 @@ class GantryStateMachine:
                     is_retry=(retry_idx > 0),
                 )
 
-                # Translate plate coordinate to gripper center target (clamped clear of rear stop)
+                # Translate plate coordinate to gripper center target
                 grip_mx, grip_my = self.kinematics.plate_to_gripper_motor(block.x_mm, block.y_mm)
                 grip_mx = max(0.0, min(self.config.travel_x_mm, grip_mx))
-                grip_my = max(self.config.servo_safe_y_mm, min(self.config.travel_y_mm, grip_my))
+                grip_my = max(0.0, min(self.config.travel_y_mm, grip_my))
                 servo_angle = self.kinematics.servo_angle_for_plate_angle(block.angle_deg)
                 pick_record.gripper_motor_x = round(grip_mx, 2)
                 pick_record.gripper_motor_y = round(grip_my, 2)
@@ -1164,19 +1190,32 @@ class GantryStateMachine:
                         f"Topology [PICKING]: Block #{block.id} rests on raised aluminum platform -> picking at Z_down={pick_z_down:.2f} mm."
                     )
 
-                if self.serial.pose.z_mm > weigh_z + 0.1:
-                    self.serial.move_to(z_mm=weigh_z, feedrate_mm_s=self.config.feedrate_z_mm_s)
+                dip_z = round(max(weigh_z + 10.0, pick_z_down - 22.0), 2)
+                open_z = round(max(weigh_z, pick_z_down - 24.0), 2)
+                # 1. Move horizontally at stack-safe transit height with wrist at weigh_servo_angle (0 deg)
                 self.serial.move_to(
                     x_mm=grip_mx,
                     y_mm=grip_my,
-                    z_mm=weigh_z,
-                    angle_deg=servo_angle,
+                    z_mm=transit_hover_z,
+                    angle_deg=self.config.weigh_servo_angle_deg,
                     feedrate_mm_s=self.config.feedrate_fine_mm_s,
                 )
+                # 2. Conditioning dip (jaws CLOSED, solenoid OFF) to 2 mm above cube top then pull UP to
+                #    weigh_z (<=15 mm) so TARE matches the exact upward Z backlash/cable loop as WEIGH.
+                self.serial.move_to(z_mm=dip_z, feedrate_mm_s=self.config.feedrate_z_mm_s)
+                self.serial.move_to(z_mm=weigh_z, feedrate_mm_s=self.config.feedrate_z_mm_s)
 
-                # Settle after wrist servo rotation and auto-tare HX711 before opening jaws
+                # 3. Settle and auto-tare HX711 at exact (X, Y, weigh_z, weigh_servo_angle) used by WEIGH
                 pick_record.tare_success = self._auto_tare_scale(f"Pre-pick Block #{block.id}")
 
+                # 4. Rotate wrist at weigh_z, descend closed to open_z, then energize GRIP 0 only for final 24 mm
+                if abs(servo_angle - self.serial.pose.angle_deg) > 0.2:
+                    self.serial.move_to(
+                        angle_deg=servo_angle,
+                        feedrate_mm_s=self.config.feedrate_fine_mm_s,
+                    )
+                if open_z > self.serial.pose.z_mm + 0.5:
+                    self.serial.move_to(z_mm=open_z, feedrate_mm_s=self.config.feedrate_z_mm_s)
                 self.serial.set_gripper(closed=False)  # Energize relay to open NC jaws
                 early_limit_z = pick_z_down - self.config.early_force_z_margin_mm
                 actual_z = self._press_cube_into_surface(
@@ -1234,8 +1273,20 @@ class GantryStateMachine:
                     picked_sb = nearest_sb
                     self.serial.set_simulated_held_mass(nearest_sb.mass_g)
 
-            # Lift ONCE to stack-safe hover height to settle & weigh accurately
-            self.serial.move_to(z_mm=weigh_z, feedrate_mm_s=self.config.feedrate_z_mm_s)
+            # Lift straight UP to weigh_z matching TARE height, direction & wrist angle (0 deg)
+            if grip_my < self.config.servo_safe_y_mm:
+                self.serial.move_to(z_mm=weigh_z, feedrate_mm_s=self.config.feedrate_z_mm_s)
+                if abs(self.serial.pose.angle_deg - self.config.weigh_servo_angle_deg) > 0.2:
+                    self.serial.move_to(
+                        angle_deg=self.config.weigh_servo_angle_deg,
+                        feedrate_mm_s=self.config.feedrate_fine_mm_s,
+                    )
+            else:
+                self.serial.move_to(
+                    z_mm=weigh_z,
+                    angle_deg=self.config.weigh_servo_angle_deg,
+                    feedrate_mm_s=self.config.feedrate_z_mm_s,
+                )
             if not self.mock_hardware and self.config.weigh_settle_s > 0.0:
                 time.sleep(self.config.weigh_settle_s)
 
@@ -1276,19 +1327,6 @@ class GantryStateMachine:
                 drop_plate_y,
                 exclude_block_id=block.id,
             )
-            boom_guard_triggered = False
-            if blocker is None:
-                boom_blocker = self.planner.would_stack_create_boom_hazard(
-                    zone_key=zone_key,
-                    stack_zones_mm=self.config.stack_zones_mm,
-                    exclude_block_id=block.id,
-                    base_plate_z_down_mm=self.config.base_plate_z_down_mm,
-                    course_elevation_mm=self.config.course_elevation_mm,
-                    aluminum_platform_size_mm=self.config.aluminum_platform_size_mm,
-                )
-                if boom_blocker is not None and can_stage:
-                    blocker = boom_blocker
-                    boom_guard_triggered = True
 
             stage_pt = None
             if blocker is not None:
@@ -1304,7 +1342,7 @@ class GantryStateMachine:
                     kinematics=self.kinematics,
                     travel_x_mm=self.config.travel_x_mm,
                     travel_y_mm=self.config.travel_y_mm,
-                    min_safe_y_mm=self.config.servo_safe_y_mm,
+                    min_safe_y_mm=0.0,
                     aluminum_platform_size_mm=self.config.aluminum_platform_size_mm,
                 )
                 if stage_pt is None:
@@ -1316,11 +1354,7 @@ class GantryStateMachine:
                 staged_blocker_id = blocker.id
                 drop_plate_x, drop_plate_y = stage_pt
                 drop_z_down = self.config.surface_pick_z_down_mm(drop_plate_x, drop_plate_y)
-                zone_label = (
-                    f"STAGE_BOOM_GUARD (Yield to #{blocker.id})"
-                    if boom_guard_triggered
-                    else f"STAGE_TEMP (Blocked by #{blocker.id})"
-                )
+                zone_label = f"STAGE_TEMP (Blocked by #{blocker.id})"
             else:
                 zone_label = f"{zone_key.upper()} ({block.mass_class.upper()})"
 
@@ -1332,21 +1366,14 @@ class GantryStateMachine:
             # Convert drop Plate Coordinates to gripper motor coordinates (compensating any observed drift)
             drop_mx, drop_my = self.kinematics.plate_to_drop_gripper_motor(drop_plate_x, drop_plate_y)
             drop_mx = max(0.0, min(self.config.travel_x_mm, drop_mx))
-            drop_my = max(self.config.servo_safe_y_mm, min(self.config.travel_y_mm, drop_my))
+            drop_my = max(0.0, min(self.config.travel_y_mm, drop_my))
             if staged_blocker_id is not None:
-                if boom_guard_triggered:
-                    self.log_event(
-                        f"Phase 6 [BOOM GUARD]: Deferring stack on {zone_key.upper()} to preserve Y-boom clearance for Block #{blocker.id}; "
-                        f"staging Block #{block.id} at ({drop_plate_x:.1f}, {drop_plate_y:.1f}) mm "
-                        f"-> motor ({drop_mx:.1f}, {drop_my:.1f}, Z_down={drop_z_down:.1f}) mm..."
-                    )
-                else:
-                    self.log_event(
-                        f"Phase 6 [STAGING]: Destination {zone_key.upper()} blocked by Block #{blocker.id} "
-                        f"({blocker.color.upper()} at {blocker.x_mm:.1f}, {blocker.y_mm:.1f}); "
-                        f"staging Block #{block.id} at intermediate ({drop_plate_x:.1f}, {drop_plate_y:.1f}) mm "
-                        f"-> motor ({drop_mx:.1f}, {drop_my:.1f}, Z_down={drop_z_down:.1f}) mm..."
-                    )
+                self.log_event(
+                    f"Phase 6 [STAGING]: Destination {zone_key.upper()} blocked by Block #{blocker.id} "
+                    f"({blocker.color.upper()} at {blocker.x_mm:.1f}, {blocker.y_mm:.1f}); "
+                    f"staging Block #{block.id} at intermediate ({drop_plate_x:.1f}, {drop_plate_y:.1f}) mm "
+                    f"-> motor ({drop_mx:.1f}, {drop_my:.1f}, Z_down={drop_z_down:.1f}) mm..."
+                )
             else:
                 self.log_event(
                     f"Phase 6 [STACKING]: Routing Block #{block.id} to {zone_label} "
@@ -1354,7 +1381,7 @@ class GantryStateMachine:
                 )
 
             # Smoothly blend horizontal travel & any pre-drop Z adjust into ONE coordinated MOVE
-            pre_drop_z_down = round(min(transit_z, max(4.0, drop_z_down - 10.0)), 2)
+            pre_drop_z_down = round(min(transit_z, max(2.0, drop_z_down - 12.0)), 2)
             if self.serial.pose.z_mm > transit_z + 0.5:
                 self.serial.move_to(z_mm=transit_z, feedrate_mm_s=self.config.feedrate_z_mm_s)
             self.serial.move_to(
@@ -1368,7 +1395,7 @@ class GantryStateMachine:
             # Guarded laydown with up to 3 retries if an unexpected object triggers an early force spike
             max_drop_retries = max(0, int(self.config.max_drop_collision_retries))
             held_mass_g = max(0.0, float(block.mass_g or 0.0))
-            drop_early_limit_z = drop_z_down - self.config.early_force_z_margin_mm
+            drop_early_limit_z = drop_z_down - self.config.drop_early_force_z_margin_mm
             for drop_retry in range(0, max_drop_retries + 1):
                 actual_drop_z = self._press_cube_into_surface(
                     surface_z_mm=drop_z_down,
@@ -1392,14 +1419,15 @@ class GantryStateMachine:
                         f"for Block #{block.id} at Z_down={actual_drop_z:.2f} mm (expected >= {drop_early_limit_z:.2f} mm) "
                         f"[attempt {drop_retry + 1}/{max_drop_retries + 1}]."
                     )
-                    # Keep gripper CLOSED while retracting and retrying
-                    self.serial.move_to(z_mm=pre_drop_z_down, feedrate_mm_s=self.config.feedrate_z_mm_s)
                     if drop_retry >= max_drop_retries:
                         pick_record.drop_retries = max_drop_retries
-                        raise RuntimeError(
-                            f"Laydown aborted after {max_drop_retries} retries due to unexpected obstacle in "
-                            f"{zone_label} for Block #{block.id}: last contact at Z_down={actual_drop_z:.2f} mm (< {drop_early_limit_z:.2f} mm)."
+                        self.log_event(
+                            f"Warning [STACKING]: Max drop retries ({max_drop_retries}) reached in {zone_label} "
+                            f"for Block #{block.id} at Z_down={actual_drop_z:.2f} mm (< {drop_early_limit_z:.2f} mm); releasing block to continue."
                         )
+                        break
+                    # Keep gripper CLOSED while retracting and retrying
+                    self.serial.move_to(z_mm=pre_drop_z_down, feedrate_mm_s=self.config.feedrate_z_mm_s)
                     pick_record.drop_retries = drop_retry + 1
                     if not self.mock_hardware:
                         time.sleep(0.35)
@@ -1418,7 +1446,7 @@ class GantryStateMachine:
                 block.z_mm = round(self.config.surface_z_up_mm_at(drop_plate_x, drop_plate_y), 2)
 
             # Retract straight UP high enough to clear the newly heightened stack BEFORE any X/Y move
-            post_drop_z_down = round(min(self._safe_transit_z_down(), max(4.0, drop_z_down - 10.0)), 2)
+            post_drop_z_down = round(min(self._safe_transit_z_down(), max(2.0, drop_z_down - 12.0)), 2)
             self.serial.move_to(z_mm=post_drop_z_down, feedrate_mm_s=self.config.feedrate_z_mm_s)
             self.serial.set_gripper(closed=True)   # Return NC solenoid to de-energized rest state
             self._set_mass_reading(0.00, None)
