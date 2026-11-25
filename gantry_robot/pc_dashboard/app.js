@@ -46,8 +46,8 @@ const EE_HOMED_Z = 97.6;
 const CAM_HOMED_X = 33.2;
 const CAM_HOMED_Y = 48.0;
 const CAM_HOMED_Z = 135.4;
-const EE_OFFSET_X = -1.5;
-const EE_OFFSET_Y = -41.6;
+const EE_OFFSET_X = -3.38;
+const EE_OFFSET_Y = -44.36;
 
 // Aluminum drop-off pedestal
 const DROPOFF_X = 224.6;
@@ -173,6 +173,7 @@ function sendCmd(command, extra = {}) {
     setSyncButtonVisible(false);
     if (command === "START_SCAN" || command === "RESET") {
       clearTrail();
+      clear3DBlockPool();
     }
   }
   if (isOpen()) {
@@ -1267,6 +1268,25 @@ function rebuildFovCone(camZ) {
 // ============================================================================
 //  WORLD BLOCKS SYNCHRONIZATION IN 3D
 // ============================================================================
+function disposeBlockMesh(mesh) {
+  if (!mesh) return;
+  if (mesh.parent) mesh.parent.remove(mesh);
+  if (mesh.geometry) mesh.geometry.dispose();
+  const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+  for (const mat of mats) {
+    if (!mat) continue;
+    if (mat.map) mat.map.dispose();
+    mat.dispose();
+  }
+}
+
+function clear3DBlockPool() {
+  for (const mesh of blockMeshPool.values()) {
+    disposeBlockMesh(mesh);
+  }
+  blockMeshPool.clear();
+}
+
 function sync3DBlocks(data) {
   if (!worldGroup || !eeStageGroup) return;
   const blocks = (data.world_blocks && data.world_blocks.length) ? data.world_blocks : (data.blocks || []);
@@ -1275,6 +1295,11 @@ function sync3DBlocks(data) {
   for (const b of blocks) {
     activeIds.add(b.id);
     let mesh = blockMeshPool.get(b.id);
+    if (mesh && mesh.userData.color !== b.color) {
+      disposeBlockMesh(mesh);
+      blockMeshPool.delete(b.id);
+      mesh = null;
+    }
     if (!mesh) {
       const topTex = createBlockTopTexture(b.id, b.color);
       const sideMat = new THREE.MeshStandardMaterial({
@@ -1291,6 +1316,7 @@ function sync3DBlocks(data) {
         new THREE.BoxGeometry(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE),
         [sideMat, sideMat, topMat, sideMat, sideMat, sideMat]
       );
+      mesh.userData.color = b.color;
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       blockMeshPool.set(b.id, mesh);
@@ -1315,7 +1341,7 @@ function sync3DBlocks(data) {
 
   for (const [id, mesh] of blockMeshPool.entries()) {
     if (!activeIds.has(id)) {
-      if (mesh.parent) mesh.parent.remove(mesh);
+      disposeBlockMesh(mesh);
       blockMeshPool.delete(id);
     }
   }
@@ -2450,6 +2476,7 @@ function startReportReplay(report) {
   replayFrames = frames;
   replayIdx = 0;
   clearTrail();
+  clear3DBlockPool();
 
   $("replayBar").classList.remove("hidden");
   $("replayScrub").max = String(Math.max(0, frames.length - 1));
@@ -2508,6 +2535,7 @@ function exitReplayMode() {
     clearInterval(replayTimer);
     replayTimer = null;
   }
+  clear3DBlockPool();
   $("replayBar").classList.add("hidden");
 }
 

@@ -151,8 +151,8 @@ class GantryConfig:
 
     # Camera is offset from gripper in CAD (calibrated for camera Z-tilt + laydown symmetry):
     # Measured Z-tilt (+0.0207 mm/mmZ X, +0.0387 mm/mmZ Y) + Z=25 staged-block repicks (-1.815 X, -0.770 Y),
-    # plus empirical -2.0 mm X laydown trim from run_20261124_012323 (-4.38 -> -2.38 X).
-    camera_to_gripper_offset_x_mm: float = -2.38
+    # empirical -2.0 mm X laydown trim (-4.38 -> -2.38 X), plus +1.0 mm +X EE trim (-2.38 -> -3.38 X).
+    camera_to_gripper_offset_x_mm: float = -3.38
     camera_to_gripper_offset_y_mm: float = -44.36
     cam_tilt_x_mm_per_mm_z: float = 0.0207
     cam_tilt_y_mm_per_mm_z: float = 0.0387
