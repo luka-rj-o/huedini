@@ -20,7 +20,7 @@ logger = logging.getLogger("gantry.serial")
 
 SERIAL_SLICE_TIMEOUT_S = 0.2
 IDLE_KEEPALIVE_INTERVAL_S = 25.0
-SAFE_WHEN_ESTOPPED = ("ESTOP", "SLEEP", "SETUP", "STATUS", "TARE", "WEIGH", "PING")
+SAFE_WHEN_ESTOPPED = ("ESTOP", "SLEEP", "SETUP", "STATUS", "TARE", "WEIGH", "PING", "VEL_STOP")
 IDEMPOTENT_RETRY_COMMANDS = ("TARE", "WEIGH", "SETUP", "STATUS", "SLEEP")
 IDEMPOTENT_RETRY_PREFIXES = ("GRIP ", "STEPS ")
 
@@ -81,6 +81,12 @@ class ESP32SerialBridge:
         self._drivers_awake: bool = False
         self._simulated_held_mass_g: Optional[float] = None
         self._mock_press_obstacles: list[float] = []
+        self.last_teleop_z_guard: bool = False
+        self.last_teleop_delta_g: float = 0.0
+        self.last_teleop_thermal_pct: int = 0
+        self._mock_vel_last_mono: float = 0.0
+        self._mock_thermal_sec: float = 0.0
+        self._mock_thermal_last_mono: float = time.monotonic()
 
     def _start_event_monitor(self) -> None:
         if self._monitor_thread is not None and self._monitor_thread.is_alive():
@@ -106,6 +112,10 @@ class ESP32SerialBridge:
         if line == "EVENT:CHIME_BTN":
             if self.event_callback:
                 self.event_callback("CHIME_BTN")
+            return True
+        if line == "EVENT:MODE_BTN":
+            if self.event_callback:
+                self.event_callback("TOGGLE_MANUAL_MODE")
             return True
         return False
 
@@ -244,18 +254,18 @@ class ESP32SerialBridge:
         try:
             self._open_and_reset_serial(port)
 
-            # Configure steps/mm and enable TMC2209 drivers
+            # Configure steps/mm and servo offset before SETUP so VM-off boot still applies trim
             self.send_command(
                 f"STEPS X{self.config.steps_per_mm_x:.2f} "
                 f"Y{self.config.steps_per_mm_y:.2f} "
                 f"Z{self.config.steps_per_mm_z:.2f}",
                 timeout_s=5.0,
             )
-            self.send_command("SETUP", timeout_s=5.0)
             self.send_command(
                 f"servo offset {self.config.servo_zero_offset_deg:.1f}",
                 timeout_s=5.0,
             )
+            self.send_command("SETUP", timeout_s=5.0)
             self._start_event_monitor()
         except Exception as exc:
             msg = str(exc)
@@ -313,6 +323,16 @@ class ESP32SerialBridge:
             logger.info("Soft-reopening %s @ %d baud (no ESP32 reset)...", port, self.config.serial_baud)
             self._open_serial_no_reset(port)
             self._send_command_locked("PING", timeout_s=1.0)
+            steps_cmd = (
+                f"STEPS X{self.config.steps_per_mm_x:.2f} "
+                f"Y{self.config.steps_per_mm_y:.2f} "
+                f"Z{self.config.steps_per_mm_z:.2f}"
+            )
+            self._send_command_locked(steps_cmd, timeout_s=3.0)
+            self._send_command_locked(
+                f"servo offset {self.config.servo_zero_offset_deg:.1f}",
+                timeout_s=3.0,
+            )
             self._start_event_monitor()
             logger.info("ESP32SerialBridge soft-reconnected on %s (stepper position preserved).", port)
             return True
@@ -532,8 +552,12 @@ class ESP32SerialBridge:
 
             lines.append(line)
 
-            # Explicit crash detection from firmware [ALERT] or ERR:STALL
-            if "stall detected" in line.lower() or line.startswith("ERR:STALL") or line.startswith("[ALERT]"):
+            # Explicit crash detection from firmware [ALERT] or ERR:STALL (solenoid thermal warnings are non-fatal)
+            if (
+                "stall detected" in line.lower()
+                or line.startswith("ERR:STALL")
+                or (line.startswith("[ALERT]") and "solenoid" not in line.lower())
+            ):
                 raise RuntimeError(f"CRASH_DETECTED: {line}")
 
             if line == "OK":
@@ -586,6 +610,10 @@ class ESP32SerialBridge:
     def home_all(self, timeout_s: float = 120.0) -> None:
         """Commands ESP32 to home Z, X, and Y axes using TMC2209 StallGuard4 with safe timeout."""
         self.ensure_awake()
+        self.send_command(
+            f"servo offset {self.config.servo_zero_offset_deg:.1f}",
+            timeout_s=3.0,
+        )
         self.send_command("HOME", timeout_s=timeout_s)
         self.pose.x_mm = 0.0
         self.pose.y_mm = 0.0
@@ -713,16 +741,85 @@ class ESP32SerialBridge:
         self._notify_pose()
         return self.pose.z_mm
 
-    def set_gripper(self, closed: bool) -> None:
+    def set_gripper(self, closed: bool, nowait: bool = False) -> None:
         """
         Controls the Normally-Closed solenoid gripper via PIN_RELAY.
         closed=True  -> GRIP 1 (grip block)
         closed=False -> GRIP 0 (open/release block)
         """
         val = 1 if closed else 0
-        self.send_command(f"GRIP {val}", timeout_s=3.0)
+        cmd = f"GRIP {val} NOWAIT" if nowait else f"GRIP {val}"
+        self.send_command(cmd, timeout_s=3.0)
         self.pose.grip_closed = closed
         self._notify_pose()
+
+    def _parse_teleop_pos_lines(self, lines: list[str], notify_pose: bool = False) -> dict:
+        info = {
+            "z_guard": self.last_teleop_z_guard,
+            "delta_g": self.last_teleop_delta_g,
+            "thermal_pct": self.last_teleop_thermal_pct,
+        }
+        for line in reversed(lines):
+            if line.startswith("POS "):
+                for tok in line.split()[1:]:
+                    if ":" not in tok:
+                        continue
+                    k, v = tok.split(":", 1)
+                    try:
+                        if k == "X":
+                            self.pose.x_mm = max(0.0, min(self.config.travel_x_mm, float(v)))
+                        elif k == "Y":
+                            self.pose.y_mm = max(0.0, min(self.config.travel_y_mm, float(v)))
+                        elif k == "Z":
+                            self.pose.z_mm = max(0.0, min(self.config.travel_z_max_mm, float(v)))
+                        elif k == "A":
+                            self.pose.angle_deg = max(0.0, min(180.0, float(v)))
+                        elif k in ("G", "GRIP"):
+                            self.pose.grip_closed = int(float(v)) != 0
+                        elif k == "ZG":
+                            self.last_teleop_z_guard = int(float(v)) != 0
+                            info["z_guard"] = self.last_teleop_z_guard
+                        elif k == "DF":
+                            self.last_teleop_delta_g = float(v)
+                            info["delta_g"] = self.last_teleop_delta_g
+                        elif k == "TH":
+                            self.last_teleop_thermal_pct = int(float(v))
+                            info["thermal_pct"] = self.last_teleop_thermal_pct
+                    except ValueError:
+                        pass
+                break
+        if notify_pose:
+            self._notify_pose()
+        return info
+
+    def send_velocity(
+        self,
+        vx_mm_s: float,
+        vy_mm_s: float,
+        vz_mm_s: float,
+        va_deg_s: float,
+        z_max_mm: Optional[float] = None,
+        z_guard_enabled: bool = True,
+        z_guard_force_g: float = 150.0,
+        notify_pose: bool = False,
+    ) -> dict:
+        """Streams non-blocking continuous axis velocities to ESP32 teleop engine."""
+        zm = self.config.travel_z_bottom_mm if z_max_mm is None else float(z_max_mm)
+        zm = max(5.0, min(self.config.travel_z_max_mm, zm))
+        zg = 1 if z_guard_enabled else 0
+        zf = max(40.0, min(350.0, float(z_guard_force_g)))
+        cmd = (
+            f"VEL X{vx_mm_s:.2f} Y{vy_mm_s:.2f} Z{vz_mm_s:.2f} A{va_deg_s:.1f} "
+            f"ZMAX{zm:.2f} ZG{zg} ZF{zf:.1f}"
+        )
+        lines = self.send_command(cmd, timeout_s=0.6)
+        return self._parse_teleop_pos_lines(lines, notify_pose=notify_pose)
+
+    def stop_velocity(self) -> dict:
+        """Smoothly decelerates teleop velocity engine to zero and syncs position."""
+        self._mock_vel_last_mono = 0.0
+        lines = self.send_command("VEL_STOP", timeout_s=3.0)
+        return self._parse_teleop_pos_lines(lines, notify_pose=True)
 
     def tare_scale(self) -> None:
         """Zeroes the HX711 load cell offset before picking a block."""
@@ -837,11 +934,86 @@ class ESP32SerialBridge:
             return [f"PRESSED Z:{sim_z:.2f} DF:-58.00 HIT:1 GUARD:0"]
 
         if upper.startswith("GRIP"):
-            time.sleep(0.12)
+            if "NOWAIT" not in upper:
+                time.sleep(0.12)
             parts = upper.split()
             if len(parts) > 1 and parts[1] in ("0", "1"):
                 self.pose.grip_closed = parts[1] == "1"
             return []
+
+        if upper == "VEL" or upper.startswith("VEL "):
+            now = time.monotonic()
+            dt = 0.05 if self._mock_vel_last_mono <= 0.0 else min(0.12, max(0.01, now - self._mock_vel_last_mono))
+            self._mock_vel_last_mono = now
+
+            vx = vy = vz = va = 0.0
+            z_max = self.config.travel_z_bottom_mm
+            z_guard = True
+            for tok in upper.split()[1:]:
+                try:
+                    if tok.startswith("ZMAX"):
+                        z_max = max(5.0, min(self.config.travel_z_max_mm, float(tok[4:])))
+                    elif tok.startswith("ZG"):
+                        z_guard = float(tok[2:]) >= 0.5
+                    elif tok.startswith("ZF"):
+                        pass
+                    elif tok.startswith("X"):
+                        vx = float(tok[1:])
+                    elif tok.startswith("Y"):
+                        vy = float(tok[1:])
+                    elif tok.startswith("Z"):
+                        vz = float(tok[1:])
+                    elif tok.startswith("A"):
+                        va = float(tok[1:])
+                except ValueError:
+                    pass
+
+            self.pose.x_mm = max(0.0, min(self.config.travel_x_mm, self.pose.x_mm + vx * dt))
+            self.pose.y_mm = max(0.0, min(self.config.travel_y_mm, self.pose.y_mm + vy * dt))
+            next_z = max(0.0, min(z_max, self.pose.z_mm + vz * dt))
+            if self.pose.y_mm >= self.config.servo_safe_y_mm:
+                self.pose.angle_deg = max(0.0, min(180.0, self.pose.angle_deg + va * dt))
+
+            # Mock HX711 Z-crash guard against floor & raised aluminum pedestal
+            z_delta_g = 0.0
+            if vz < -0.5:
+                self.last_teleop_z_guard = False
+            elif z_guard and vz > 0.0:
+                plate_x = self.config.nominal_cam_origin_x_mm + self.pose.x_mm + self.config.camera_to_gripper_offset_x_mm
+                plate_y = self.config.nominal_cam_origin_y_mm + self.pose.y_mm + self.config.camera_to_gripper_offset_y_mm
+                pedestal_z = self.config.surface_pick_z_down_mm(plate_x, plate_y)
+                limit_z = min(z_max, pedestal_z)
+                if next_z >= limit_z - 0.1:
+                    next_z = limit_z
+                    self.last_teleop_z_guard = True
+                    z_delta_g = -165.0
+            self.pose.z_mm = next_z
+
+            th_dt = min(1.0, max(0.0, now - self._mock_thermal_last_mono))
+            self._mock_thermal_last_mono = now
+            if not self.pose.grip_closed:
+                self._mock_thermal_sec = min(10.0, self._mock_thermal_sec + th_dt)
+                if self._mock_thermal_sec >= 10.0:
+                    self.pose.grip_closed = True
+            else:
+                self._mock_thermal_sec = max(0.0, self._mock_thermal_sec - th_dt * 0.6)
+            th_pct = int(round((self._mock_thermal_sec / 10.0) * 100.0))
+
+            return [
+                f"POS X:{self.pose.x_mm:.2f} Y:{self.pose.y_mm:.2f} Z:{self.pose.z_mm:.2f} "
+                f"A:{self.pose.angle_deg:.1f} G:{1 if self.pose.grip_closed else 0} "
+                f"ZG:{1 if self.last_teleop_z_guard else 0} DF:{z_delta_g:.1f} TH:{th_pct}"
+            ]
+
+        if upper == "VEL_STOP":
+            self._mock_vel_last_mono = 0.0
+            self.last_teleop_z_guard = False
+            th_pct = int(round((self._mock_thermal_sec / 10.0) * 100.0))
+            return [
+                f"POS X:{self.pose.x_mm:.2f} Y:{self.pose.y_mm:.2f} Z:{self.pose.z_mm:.2f} "
+                f"A:{self.pose.angle_deg:.1f} G:{1 if self.pose.grip_closed else 0} "
+                f"ZG:0 DF:0.0 TH:{th_pct}"
+            ]
 
         if upper == "TARE":
             time.sleep(0.1)
@@ -857,7 +1029,10 @@ class ESP32SerialBridge:
 
         if upper == "CHIME" or upper.startswith("CHIME "):
             tune = upper.split(maxsplit=1)[1] if " " in upper else "TADA"
-            time.sleep(1.5 if tune in ("WIN95", "95") else 0.75)
+            if tune in ("MANUAL_ON", "MANUAL_OFF"):
+                time.sleep(0.25)
+            else:
+                time.sleep(1.5 if tune in ("WIN95", "95") else 0.75)
             return [f"CHIME:{tune}"]
 
         time.sleep(0.05)

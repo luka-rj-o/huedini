@@ -334,6 +334,7 @@ class EyeInHandKinematics:
             cam_in_plate_deg = self.cam_skew_deg
 
         cam_in_motor_deg = cam_in_plate_deg
+        has_step_skew = False
         if step_observation is not None:
             u1, v1, mx1, my1, u2, v2, mx2, my2 = step_observation
             if math.hypot(mx2 - mx1, my2 - my1) >= 5.0 and math.hypot(u2 - u1, v2 - v1) >= 5.0:
@@ -342,6 +343,7 @@ class EyeInHandKinematics:
                 motor_ang = math.degrees(math.atan2(my2 - my1, mx2 - mx1))
                 sensor_ang = math.degrees(math.atan2(-dv_p, -du_p))
                 cam_in_motor_deg = self._wrap_deg(motor_ang - sensor_ang)
+                has_step_skew = True
 
         P_arr = np.array([self.corner_fiducials[mid] for mid in ordered_ids], dtype=float)
         A = np.eye(2, dtype=float)
@@ -372,6 +374,8 @@ class EyeInHandKinematics:
 
             # P = A @ C + t maps Motor -> Plate, so plate rotation wrt motor is -atan2(A[1,0], A[0,0])
             plate_yaw_deg = -math.degrees(math.atan2(float(A[1, 0]), float(A[0, 0])))
+            if has_step_skew:
+                break
             cam_in_motor_deg = self._wrap_deg(plate_yaw_deg + cam_in_plate_deg)
 
         # Finalize residuals with converged cam_in_motor_deg
@@ -408,11 +412,15 @@ class EyeInHandKinematics:
         self._plate_A_inv = A_inv
         self._plate_t_inv = t_inv
 
+        final_plate_yaw_deg = -math.degrees(math.atan2(float(A[1, 0]), float(A[0, 0])))
         self.cam_origin_x_mm = round(float(t[0]), 2)
         self.cam_origin_y_mm = round(float(t[1]), 2)
-        self.cam_skew_deg = round(float(cam_in_plate_deg), 2)
+        self.cam_skew_deg = round(
+            float(self._wrap_deg(cam_in_motor_deg - final_plate_yaw_deg) if has_step_skew else cam_in_plate_deg),
+            2,
+        )
         self.cam_motor_skew_deg = round(float(cam_in_motor_deg), 2)
-        self.plate_yaw_deg = round(-math.degrees(math.atan2(float(A[1, 0]), float(A[0, 0]))), 3)
+        self.plate_yaw_deg = round(final_plate_yaw_deg, 3)
         self.plate_scale_x = round(float(math.hypot(float(A[0, 0]), float(A[1, 0]))), 4)
         self.plate_scale_y = round(float(math.hypot(float(A[0, 1]), float(A[1, 1]))), 4)
         self.calibration_mode = mode

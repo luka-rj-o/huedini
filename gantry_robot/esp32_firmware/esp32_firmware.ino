@@ -148,6 +148,16 @@ const unsigned long RELAY_MAX_ON_MS = 15000UL;
 bool relayOutputHigh = false;
 unsigned long relayOnSinceMs = 0;
 
+// Leaky-bucket thermal duty-cycle budget for the 12V NC solenoid in manual mode.
+// Accumulates 1.0 s/s while energized, cools at 0.6 s/s while off, locks out at 10 s until cooled to 7.5 s.
+const float RELAY_THERMAL_MAX_SEC    = 10.0f;
+const float RELAY_THERMAL_RESUME_SEC = 7.5f;
+const float RELAY_THERMAL_COOL_RATE  = 0.6f;
+float relayThermalSec                = 0.0f;
+unsigned long relayThermalLastMs     = 0;
+bool relayThermalLocked              = false;
+bool relayThermalAlertPrinted        = false;
+
 const unsigned long HOMING_RAMP_MS     = 250;    // Smooth linear acceleration ramp (250ms)
 const unsigned long HOMING_BLANKING_MS = 350;    // Ignore DIAG during ramp & initial settle (350ms)
 const unsigned long HOMING_TIMEOUT_MS  = 30000;  // minimum homing timeout; the real per-axis timeout scales with
@@ -185,8 +195,8 @@ const unsigned long STALL_CONFIRM_WINDOW_MS = 15;
 const unsigned long DRIVER_ENABLE_SETTLE_MS = 200;
 
 // Wrist servo mechanical zero trim (degrees added to logical 0..180 commands)
-// Tuned for MG90S replacement (+1 deg CW trim from prior 9.0f trim)
-float servoZeroOffsetDeg = 10.0f;
+// Calibrated 6.0 deg neutral trim matching config.py / servo_trim.json
+float servoZeroOffsetDeg = 6.0f;
 
 // ============================================================
 //  OBJECTS & STATE
@@ -279,6 +289,47 @@ Axis axes[NUM_AXES] = {
 // Set when an ESTOP line or hardware E-STOP switch triggers
 bool estopLatched = false;
 String pendingSerialCommand = "";
+String rxLineBuf = "";
+
+// Continuous non-blocking velocity teleoperation state (Xbox Manual Mode)
+const unsigned long TELEOP_WATCHDOG_MS             = 350UL;
+const unsigned long TELEOP_TICK_US                 = 5000UL; // 200 Hz slew-rate loop
+const float TELEOP_MAX_VX_MM_S                     = 60.0f;
+const float TELEOP_MAX_VY_MM_S                     = 100.0f;
+const float TELEOP_MAX_VZ_UP_MM_S                  = 35.0f;
+const float TELEOP_MAX_VZ_DOWN_GUARDED_MM_S        = 22.0f;  // ~14.3 mm/s at 65% default, tunable up to 22 mm/s
+const float TELEOP_MAX_VZ_DOWN_RAW_MM_S            = 30.0f;
+const float TELEOP_MAX_VA_DEG_S                    = 95.0f;
+const float TELEOP_DEFAULT_Z_BOTTOM_MM             = 70.36f;
+const float TELEOP_SERVO_SAFE_Y_MM                 = 10.0f;
+const unsigned long TELEOP_SERVO_UPDATE_MS         = 40UL;   // 25 Hz max LEDC servo write rate
+const unsigned long TELEOP_SERVO_SETTLE_MS         = 120UL;  // Brief settle tail after servo input
+const float TELEOP_SERVO_CAP_XY_MM_S               = 12.0f;  // Cap XY speed while servo draws 5V peak current
+const float TELEOP_SERVO_CAP_Z_MM_S                = 8.0f;   // Cap Z speed while servo is rotating
+
+struct TeleopVelState {
+  bool          active = false;
+  float         targetVelMmS[3] = { 0.0f, 0.0f, 0.0f };
+  float         curVelMmS[3]    = { 0.0f, 0.0f, 0.0f };
+  int           axisDir[3]      = { 1, 1, 1 };
+  float         targetServoRateDegS = 0.0f;
+  float         servoAccumDeg       = 0.0f;
+  unsigned long lastServoWriteMs    = 0;
+  unsigned long servoActiveUntilMs  = 0;
+  int           lastWrittenServoDeg = -1;
+  float         maxZDownMm          = TELEOP_DEFAULT_Z_BOTTOM_MM;
+  bool          zGuardEnabled       = true;
+  float         zGuardThreshG       = 150.0f;
+  bool          zGuardTripped       = false;
+  bool          hasZBase            = false;
+  long          zBaseRaw            = 0;
+  unsigned long zNotDownSinceMs     = 0;
+  float         lastZDeltaG         = 0.0f;
+  unsigned long lastCmdMs           = 0;
+  unsigned long lastTickUs          = 0;
+};
+
+TeleopVelState teleop;
 
 // Non-blocking millis()-based debounced switch state (active-LOW via INPUT_PULLUP)
 struct DebouncedSwitch {
@@ -378,6 +429,14 @@ void handleRelayCommand(String param);
 void handleLoadCellCommand();
 void setRelayOutput(bool high, const char* reason = nullptr);
 void checkRelayWatchdog();
+void updateRelayThermalBudget();
+int getRelayThermalPct();
+bool pollSerialLine(String& outLine);
+void emitTeleopPosLine();
+void stopTeleopVelocity(bool immediate = false);
+void tickTeleopVelocity();
+void handleVelGcode(String params);
+void handleVelStopGcode();
 void setCurrent(Axis& axis, int mA);
 void setMicrosteps(Axis& axis, int microsteps);
 void setSensitivity(Axis& axis, int sensitivity);
@@ -439,18 +498,43 @@ void setup() {
   Serial.println("READY");
 }
 
+bool pollSerialLine(String& outLine) {
+  while (Serial.available() > 0) {
+    int ch = Serial.read();
+    if (ch < 0) break;
+    char c = (char)ch;
+    if (c == '\r') continue;
+    if (c == '\n') {
+      rxLineBuf.trim();
+      if (rxLineBuf.length() > 0) {
+        outLine = rxLineBuf;
+        rxLineBuf = "";
+        return true;
+      }
+      rxLineBuf = "";
+      continue;
+    }
+    if (rxLineBuf.length() < 160) {
+      rxLineBuf += c;
+    }
+  }
+  return false;
+}
+
 void loop() {
   checkRelayWatchdog();
   pollPanelSwitches();
+  if (teleop.active) {
+    tickTeleopVelocity();
+  }
 
   if (pendingSerialCommand.length() > 0) {
     String cmd = pendingSerialCommand;
     pendingSerialCommand = "";
     handleCommand(cmd);
-  } else if (Serial.available() > 0) {
-    String command = Serial.readStringUntil('\n');
-    command.trim();
-    if (command.length() > 0) {
+  } else {
+    String command;
+    if (pollSerialLine(command)) {
       handleCommand(command);
     }
   }
@@ -532,13 +616,13 @@ void pollPanelSwitches() {
     }
   }
 
-  // Priority 3: Switch 3 -> Chime (suppress protocol OK/ERR so it never desyncs Pi serial)
+  // Priority 3: Switch 3 -> Repurposed as Auto/Manual Mode Toggle switch.
+  // Emits EVENT:MODE_BTN so Pi/state-machine coordinates homing, velocity stop, and switching chimes.
   if (pollSwitchPressedEdge(swChime)) {
     if (swEstop.stablePressed) {
-      Serial.println("[WARN] Chime switch ignored while E-STOP switch is active.");
+      Serial.println("[WARN] Mode switch ignored while E-STOP switch is active.");
     } else {
-      Serial.println("EVENT:CHIME_BTN");
-      handleChimeGcode("TADA", false);
+      Serial.println("EVENT:MODE_BTN");
     }
   }
 }
@@ -574,9 +658,24 @@ void handleCommand(String rawCommand) {
   String upper = rawCommand;
   upper.toUpperCase();
 
+  bool isTeleopSafeCmd = (upper == "PING" || upper == "STATUS" || upper == "VEL" ||
+                          upper.startsWith("VEL ") || upper == "VEL_STOP" ||
+                          (upper.startsWith("GRIP ") && upper.indexOf("NOWAIT") >= 0));
+  if (teleop.active && !isTeleopSafeCmd) {
+    stopTeleopVelocity(upper == "ESTOP" || upper == "SLEEP");
+  }
+
   // --- Tier 2 (Raspberry Pi Zero W) Deterministic Protocol Commands ---
   if (upper == "PING") {
     Serial.println("OK");
+    return;
+  }
+  if (upper == "VEL" || upper.startsWith("VEL ")) {
+    handleVelGcode(upper.length() > 3 ? upper.substring(4) : "");
+    return;
+  }
+  if (upper == "VEL_STOP") {
+    handleVelStopGcode();
     return;
   }
   if (upper == "HOME") {
@@ -1087,6 +1186,350 @@ void handleMoveGcode(String params) {
   Serial.println("OK");
 }
 
+// ============================================================
+//  CONTINUOUS VELOCITY TELEOP ENGINE (Xbox Manual Mode)
+// ============================================================
+static bool parseNamedFloatToken(const String& params, const char* prefix, float& outVal) {
+  int pLen = (int)strlen(prefix);
+  int pos = 0;
+  int n = (int)params.length();
+  while (pos < n) {
+    while (pos < n && isSpace(params.charAt(pos))) pos++;
+    if (pos >= n) break;
+    int end = pos;
+    while (end < n && !isSpace(params.charAt(end))) end++;
+    String tok = params.substring(pos, end);
+    if (tok.startsWith(prefix) && (int)tok.length() > pLen) {
+      outVal = tok.substring(pLen).toFloat();
+      return true;
+    }
+    pos = end;
+  }
+  return false;
+}
+
+void emitTeleopPosLine() {
+  long posSteps[NUM_AXES];
+  if (teleop.active) {
+    portENTER_CRITICAL(&stepMux);
+    for (int i = 0; i < NUM_AXES; i++) posSteps[i] = isrAxes[i].curPos;
+    portEXIT_CRITICAL(&stepMux);
+  } else {
+    for (int i = 0; i < NUM_AXES; i++) posSteps[i] = axes[i].stepper->currentPosition();
+  }
+  float xMm = (float)posSteps[0] / axes[0].stepsPerMm;
+  float yMm = (float)posSteps[1] / axes[1].stepsPerMm;
+  float zMm = (float)posSteps[2] / axes[2].stepsPerMm;
+
+  char buf[112];
+  snprintf(buf, sizeof(buf),
+           "POS X:%.2f Y:%.2f Z:%.2f A:%.1f G:%d ZG:%d DF:%.1f TH:%d",
+           xMm, yMm, zMm, currentAngleDeg, currentGripState,
+           teleop.zGuardTripped ? 1 : 0, teleop.lastZDeltaG, getRelayThermalPct());
+  Serial.println(buf);
+}
+
+void stopTeleopVelocity(bool immediate) {
+  if (!teleop.active) return;
+
+  teleop.targetVelMmS[0] = 0.0f;
+  teleop.targetVelMmS[1] = 0.0f;
+  teleop.targetVelMmS[2] = 0.0f;
+  teleop.targetServoRateDegS = 0.0f;
+
+  if (!immediate) {
+    unsigned long decelStart = millis();
+    teleop.lastCmdMs = decelStart;
+    while (teleop.active && (millis() - decelStart) < 1500UL) {
+      checkRelayWatchdog();
+      if (checkHardwareEstop()) break;
+      tickTeleopVelocity();
+      if (fabsf(teleop.curVelMmS[0]) < 0.25f &&
+          fabsf(teleop.curVelMmS[1]) < 0.25f &&
+          fabsf(teleop.curVelMmS[2]) < 0.25f) {
+        break;
+      }
+      delayMicroseconds(500);
+    }
+  }
+
+  if (stepTimer != nullptr) {
+    timerStop(stepTimer);
+  }
+  long finalPos[NUM_AXES];
+  portENTER_CRITICAL(&stepMux);
+  for (int i = 0; i < NUM_AXES; i++) {
+    finalPos[i] = isrAxes[i].curPos;
+    isrAxes[i].active = false;
+  }
+  portEXIT_CRITICAL(&stepMux);
+
+  for (int i = 0; i < NUM_AXES; i++) {
+    syncAxisPosition(axes[i], finalPos[i]);
+    teleop.curVelMmS[i] = 0.0f;
+    teleop.targetVelMmS[i] = 0.0f;
+  }
+  teleop.targetServoRateDegS = 0.0f;
+  teleop.servoActiveUntilMs = 0;
+  teleop.zGuardTripped = false;
+  teleop.active = false;
+}
+
+void tickTeleopVelocity() {
+  if (!teleop.active) return;
+
+  if (checkHardwareEstop()) {
+    stopTeleopVelocity(true);
+    sleepAll();
+    setRelayOutput(false, "hardware estop");
+    return;
+  }
+
+  unsigned long nowMs = millis();
+  if ((unsigned long)(nowMs - teleop.lastCmdMs) >= TELEOP_WATCHDOG_MS) {
+    teleop.targetVelMmS[0] = 0.0f;
+    teleop.targetVelMmS[1] = 0.0f;
+    teleop.targetVelMmS[2] = 0.0f;
+    teleop.targetServoRateDegS = 0.0f;
+    if (relayOutputHigh) {
+      setRelayOutput(false, "teleop deadman");
+    }
+    if (fabsf(teleop.curVelMmS[0]) < 0.25f &&
+        fabsf(teleop.curVelMmS[1]) < 0.25f &&
+        fabsf(teleop.curVelMmS[2]) < 0.25f) {
+      stopTeleopVelocity(true);
+      return;
+    }
+  }
+
+  unsigned long nowUs = micros();
+  unsigned long elapsedUs = (unsigned long)(nowUs - teleop.lastTickUs);
+  if (elapsedUs < TELEOP_TICK_US) return;
+  teleop.lastTickUs = nowUs;
+  float dt = constrain((float)elapsedUs * 1e-6f, 0.001f, 0.05f);
+
+  // Instant clear on upward Z lift command
+  if (teleop.targetVelMmS[2] < -0.5f) {
+    teleop.zGuardTripped = false;
+  }
+
+  // Non-blocking 10 Hz HX711 Z-crash guard
+  if (scale.is_ready()) {
+    long raw = scale.read();
+    if (teleop.curVelMmS[2] <= 0.05f && teleop.targetVelMmS[2] <= 0.05f) {
+      if ((unsigned long)(nowMs - teleop.zNotDownSinceMs) >= 150UL) {
+        teleop.zBaseRaw = raw;
+        teleop.hasZBase = true;
+        teleop.lastZDeltaG = 0.0f;
+      }
+    } else {
+      teleop.zNotDownSinceMs = nowMs;
+      if (teleop.zGuardEnabled && teleop.hasZBase && fabsf(hx711ScaleFactor) > 1e-3f) {
+        teleop.lastZDeltaG = (float)(raw - teleop.zBaseRaw) / hx711ScaleFactor;
+        if (teleop.lastZDeltaG <= -teleop.zGuardThreshG && teleop.targetVelMmS[2] >= 0.0f) {
+          teleop.zGuardTripped = true;
+          portENTER_CRITICAL(&stepMux);
+          isrAxes[2].active = false;
+          portEXIT_CRITICAL(&stepMux);
+          teleop.curVelMmS[2] = 0.0f;
+          if (teleop.targetVelMmS[2] > 0.0f) teleop.targetVelMmS[2] = 0.0f;
+        }
+      }
+    }
+  }
+
+  // Check whether wrist servo is actively moving (Y >= 10 mm) so we cap stepper speed & power draw
+  long yStepsNow = 0;
+  portENTER_CRITICAL(&stepMux);
+  yStepsNow = isrAxes[1].curPos;
+  portEXIT_CRITICAL(&stepMux);
+  float curYMm = (float)yStepsNow / axes[1].stepsPerMm;
+  bool servoCmdActive = (fabsf(teleop.targetServoRateDegS) > 0.5f && curYMm >= TELEOP_SERVO_SAFE_Y_MM);
+  if (servoCmdActive) {
+    teleop.servoActiveUntilMs = nowMs + TELEOP_SERVO_SETTLE_MS;
+  }
+  bool capForServo = servoCmdActive ||
+      (teleop.servoActiveUntilMs != 0 && (long)(teleop.servoActiveUntilMs - nowMs) > 0);
+
+  for (int i = 0; i < NUM_AXES; i++) {
+    long curSteps = 0;
+    portENTER_CRITICAL(&stepMux);
+    curSteps = isrAxes[i].curPos;
+    portEXIT_CRITICAL(&stepMux);
+
+    float curMm = (float)curSteps / axes[i].stepsPerMm;
+    float maxMm = (i == 2) ? teleop.maxZDownMm : axes[i].maxTravelMm;
+    float aMaxMmS2 = max(10.0f, axes[i].acceleration / axes[i].stepsPerMm);
+    float vReq = teleop.targetVelMmS[i];
+
+    if (i == 2 && teleop.zGuardTripped && vReq > 0.0f) {
+      vReq = 0.0f;
+    }
+    if (capForServo) {
+      float cap = (i == 2) ? TELEOP_SERVO_CAP_Z_MM_S : TELEOP_SERVO_CAP_XY_MM_S;
+      vReq = constrain(vReq, -cap, cap);
+    }
+
+    // Soft-limit braking envelope: v <= sqrt(2 * a * dist_to_limit)
+    float vMaxHi = sqrtf(2.0f * aMaxMmS2 * max(0.0f, maxMm - curMm));
+    float vMaxLo = sqrtf(2.0f * aMaxMmS2 * max(0.0f, curMm));
+    vReq = constrain(vReq, -vMaxLo, vMaxHi);
+
+    float vCur = teleop.curVelMmS[i];
+    float dvMax = aMaxMmS2 * dt;
+    float diff = vReq - vCur;
+    float vNext = (fabsf(diff) <= dvMax) ? vReq : (vCur + ((diff > 0.0f) ? dvMax : -dvMax));
+
+    // Pause cleanly at 0 when reversing sign so dirPin flips at rest
+    if ((vCur > 0.0f && vNext < 0.0f) || (vCur < 0.0f && vNext > 0.0f)) {
+      vNext = 0.0f;
+    }
+    teleop.curVelMmS[i] = vNext;
+
+    if (fabsf(vNext) < 0.25f && fabsf(vReq) < 0.25f) {
+      teleop.curVelMmS[i] = 0.0f;
+      portENTER_CRITICAL(&stepMux);
+      isrAxes[i].active = false;
+      portEXIT_CRITICAL(&stepMux);
+      continue;
+    }
+
+    int newDir = (vNext >= 0.0f) ? 1 : -1;
+    long limSteps = (newDir > 0) ? lroundf(maxMm * axes[i].stepsPerMm) : 0L;
+    if ((newDir > 0 && curSteps >= limSteps) || (newDir < 0 && curSteps <= 0L)) {
+      teleop.curVelMmS[i] = 0.0f;
+      portENTER_CRITICAL(&stepMux);
+      isrAxes[i].active = false;
+      portEXIT_CRITICAL(&stepMux);
+      continue;
+    }
+
+    if (newDir != teleop.axisDir[i]) {
+      portENTER_CRITICAL(&stepMux);
+      isrAxes[i].active = false;
+      portEXIT_CRITICAL(&stepMux);
+      digitalWrite(axes[i].dirPin, (newDir > 0) ? HIGH : LOW);
+      delayMicroseconds(2);
+      teleop.axisDir[i] = newDir;
+    }
+
+    float stepsPerSec = max(5.0f, min(axes[i].maxFeedSpeed, fabsf(vNext) * axes[i].stepsPerMm));
+    uint32_t inc = speedToDdsInc(stepsPerSec);
+    portENTER_CRITICAL(&stepMux);
+    isrAxes[i].stepPin = axes[i].stepPin;
+    isrAxes[i].dir = newDir;
+    isrAxes[i].targetPos = limSteps;
+    isrAxes[i].ddsInc = inc;
+    isrAxes[i].active = true;
+    portEXIT_CRITICAL(&stepMux);
+  }
+
+  // Wrist servo continuous rate with Y >= 10.0 mm clearance guard and 25 Hz PWM rate limit
+  if (servoCmdActive) {
+    teleop.servoAccumDeg = constrain(
+        teleop.servoAccumDeg + teleop.targetServoRateDegS * dt, 0.0f, 180.0f);
+    int nextDeg = (int)lroundf(teleop.servoAccumDeg);
+    if (nextDeg != teleop.lastWrittenServoDeg &&
+        (unsigned long)(nowMs - teleop.lastServoWriteMs) >= TELEOP_SERVO_UPDATE_MS) {
+      writeServoLogicalAngle((float)nextDeg);
+      teleop.lastServoWriteMs = nowMs;
+      teleop.lastWrittenServoDeg = nextDeg;
+    }
+  }
+}
+
+void handleVelGcode(String params) {
+  if (checkHardwareEstop()) {
+    stopTeleopVelocity(true);
+    sleepAll();
+    setRelayOutput(false, "hardware estop");
+    Serial.println("ERR:ESTOP");
+    return;
+  }
+  if (!ensureDriversReady()) {
+    Serial.println("ERR:TMC_NOT_READY");
+    return;
+  }
+
+  float vx = 0.0f, vy = 0.0f, vz = 0.0f, va = 0.0f;
+  parseNamedFloatToken(params, "X", vx);
+  parseNamedFloatToken(params, "Y", vy);
+  parseNamedFloatToken(params, "Z", vz);
+  parseNamedFloatToken(params, "A", va);
+
+  float zMax = teleop.maxZDownMm;
+  if (parseNamedFloatToken(params, "ZMAX", zMax)) {
+    teleop.maxZDownMm = constrain(zMax, 5.0f, TRAVEL_Z_MM);
+  }
+  float zgVal = teleop.zGuardEnabled ? 1.0f : 0.0f;
+  if (parseNamedFloatToken(params, "ZG", zgVal)) {
+    teleop.zGuardEnabled = (zgVal >= 0.5f);
+    if (!teleop.zGuardEnabled) teleop.zGuardTripped = false;
+  }
+  float zfVal = teleop.zGuardThreshG;
+  if (parseNamedFloatToken(params, "ZF", zfVal)) {
+    teleop.zGuardThreshG = constrain(zfVal, 40.0f, 400.0f);
+  }
+
+  float maxVzDown = teleop.zGuardEnabled ? TELEOP_MAX_VZ_DOWN_GUARDED_MM_S : TELEOP_MAX_VZ_DOWN_RAW_MM_S;
+  vx = constrain(vx, -TELEOP_MAX_VX_MM_S, TELEOP_MAX_VX_MM_S);
+  vy = constrain(vy, -TELEOP_MAX_VY_MM_S, TELEOP_MAX_VY_MM_S);
+  vz = constrain(vz, -TELEOP_MAX_VZ_UP_MM_S, maxVzDown);
+  va = constrain(va, -TELEOP_MAX_VA_DEG_S, TELEOP_MAX_VA_DEG_S);
+
+  if (!teleop.active) {
+    initStepTimer();
+    if (stepTimer != nullptr) timerStop(stepTimer);
+    portENTER_CRITICAL(&stepMux);
+    for (int i = 0; i < NUM_AXES; i++) {
+      long cur = axes[i].stepper->currentPosition();
+      isrAxes[i].stepPin = axes[i].stepPin;
+      isrAxes[i].curPos = cur;
+      isrAxes[i].targetPos = cur;
+      isrAxes[i].ddsPhase = 0xFFFFFFFFUL;
+      isrAxes[i].ddsInc = 0;
+      isrAxes[i].active = false;
+      teleop.curVelMmS[i] = 0.0f;
+      teleop.axisDir[i] = 1;
+      digitalWrite(axes[i].dirPin, HIGH);
+    }
+    portEXIT_CRITICAL(&stepMux);
+    teleop.servoAccumDeg = currentAngleDeg;
+    teleop.lastServoWriteMs = 0;
+    teleop.servoActiveUntilMs = 0;
+    teleop.lastWrittenServoDeg = (int)lroundf(currentAngleDeg);
+    teleop.zGuardTripped = false;
+    teleop.zNotDownSinceMs = millis();
+    teleop.lastZDeltaG = 0.0f;
+    teleop.hasZBase = false;
+    if (scale.is_ready()) {
+      teleop.zBaseRaw = scale.read();
+      teleop.hasZBase = true;
+    }
+    teleop.lastTickUs = micros();
+    teleop.active = true;
+    if (stepTimer != nullptr) {
+      timerRestart(stepTimer);
+      timerStart(stepTimer);
+    }
+  }
+
+  teleop.targetVelMmS[0] = vx;
+  teleop.targetVelMmS[1] = vy;
+  teleop.targetVelMmS[2] = vz;
+  teleop.targetServoRateDegS = va;
+  teleop.lastCmdMs = millis();
+
+  emitTeleopPosLine();
+  Serial.println("OK");
+}
+
+void handleVelStopGcode() {
+  stopTeleopVelocity(false);
+  emitTeleopPosLine();
+  Serial.println("OK");
+}
+
 // Flushes stale/in-motion HX711 samples, polls N fresh samples with E-stop & WDT checks,
 // and computes a trimmed mean (outlier rejection) + spread in grams.
 bool sampleLoadCellFilteredRaw(long& outRaw, float& outSpreadG, int numSamples, int flushCount, bool* outEstop) {
@@ -1332,6 +1775,7 @@ void handleGripGcode(String params) {
     return;
   }
 
+  bool noWait = (params.indexOf("NOWAIT") >= 0);
   int state = params.toInt(); // 1 = close/grip, 0 = open/release
   currentGripState = (state != 0) ? 1 : 0;
 
@@ -1341,7 +1785,9 @@ void handleGripGcode(String params) {
   //   GRIP 1 (close) -> Relay LOW  (de-energize solenoid so spring/NC closes on block)
   bool relayHigh = (currentGripState == 0) ? gripOpenRelayHigh : !gripOpenRelayHigh;
   setRelayOutput(relayHigh);
-  delay(150); // Allow mechanical jaw settling
+  if (!noWait) {
+    delay(150); // Allow mechanical jaw settling
+  }
   Serial.println("OK");
 }
 
@@ -1961,7 +2407,51 @@ bool setupAxis(Axis& axis) {
   return true;
 }
 
+int getRelayThermalPct() {
+  return constrain((int)lroundf((relayThermalSec / RELAY_THERMAL_MAX_SEC) * 100.0f), 0, 100);
+}
+
+void updateRelayThermalBudget() {
+  unsigned long nowMs = millis();
+  if (relayThermalLastMs == 0) {
+    relayThermalLastMs = nowMs;
+    return;
+  }
+  unsigned long elapsedMs = nowMs - relayThermalLastMs;
+  if (elapsedMs == 0) return;
+  relayThermalLastMs = nowMs;
+  float dt = min(2.0f, (float)elapsedMs * 1e-3f);
+
+  if (relayOutputHigh) {
+    relayThermalSec = min(RELAY_THERMAL_MAX_SEC, relayThermalSec + dt);
+    if (relayThermalSec >= RELAY_THERMAL_MAX_SEC) {
+      relayThermalLocked = true;
+      setRelayOutput(false, "thermal duty budget");
+    }
+  } else {
+    relayThermalSec = max(0.0f, relayThermalSec - dt * RELAY_THERMAL_COOL_RATE);
+    if (relayThermalLocked && relayThermalSec <= RELAY_THERMAL_RESUME_SEC) {
+      relayThermalLocked = false;
+      relayThermalAlertPrinted = false;
+    }
+  }
+}
+
 void setRelayOutput(bool high, const char* reason) {
+  updateRelayThermalBudget();
+  if (high && relayThermalLocked) {
+    digitalWrite(PIN_RELAY, LOW);
+    relayOutputHigh = false;
+    relayOnSinceMs = 0;
+    if (gripOpenRelayHigh) {
+      currentGripState = 1;
+    }
+    if (!relayThermalAlertPrinted) {
+      relayThermalAlertPrinted = true;
+      Serial.println("[WARN] Solenoid open blocked: thermal cooldown active.");
+    }
+    return;
+  }
   if (high) {
     if (!relayOutputHigh) {
       unsigned long nowMs = millis();
@@ -1978,7 +2468,7 @@ void setRelayOutput(bool high, const char* reason) {
       currentGripState = 1; // NC solenoid returns to closed/safe state when de-energized
     }
     if (wasHigh && reason != nullptr) {
-      Serial.print("[ALERT] Solenoid relay forced OFF (");
+      Serial.print("[WARN] Solenoid relay forced OFF (");
       Serial.print(reason);
       Serial.println(").");
     }
@@ -1986,6 +2476,7 @@ void setRelayOutput(bool high, const char* reason) {
 }
 
 void checkRelayWatchdog() {
+  updateRelayThermalBudget();
   if (relayOutputHigh && relayOnSinceMs != 0) {
     if (millis() - relayOnSinceMs >= RELAY_MAX_ON_MS) {
       setRelayOutput(false, "15s thermal watchdog");
@@ -1994,6 +2485,7 @@ void checkRelayWatchdog() {
 }
 
 void sleepAll() {
+  stopTeleopVelocity(true);
   if (stepTimer != nullptr) {
     timerStop(stepTimer);
   }
@@ -2986,11 +3478,30 @@ void handleChimeGcode(String params, bool emitProtocolReply) {
     { 1018.50f, 254.50f, 340.30f,  850UL, 0, 0, 0 }, // C6 echo ping 4 + C4 + F4 (longer final ring)
   };
 
-  const bool isWin95 = (params == "WIN95" || params == "95");
-  const ChimeSegment* seq = isWin95 ? win95 : tada;
-  const unsigned int count = isWin95
-      ? (sizeof(win95) / sizeof(win95[0]))
-      : (sizeof(tada) / sizeof(tada[0]));
+  // Short 3-voice mode-switch audio cues (~350 ms)
+  const ChimeSegment manualOn[] = {
+    { 523.25f, 261.63f,   0.00f,  95UL, 0, 0, 0 }, // C5 + C4
+    { 659.25f, 329.63f,   0.00f,  95UL, 0, 0, 0 }, // E5 + E4
+    { 783.99f, 392.00f, 261.63f, 160UL, 0, 0, 0 }, // G5 + G4 + C4 (entered MANUAL)
+  };
+  const ChimeSegment manualOff[] = {
+    { 783.99f, 392.00f,   0.00f,  95UL, 0, 0, 0 }, // G5 + G4
+    { 659.25f, 329.63f,   0.00f,  95UL, 0, 0, 0 }, // E5 + E4
+    { 523.25f, 261.63f, 196.00f, 160UL, 0, 0, 0 }, // C5 + C4 + G3 (exited MANUAL)
+  };
+
+  const ChimeSegment* seq = tada;
+  unsigned int count = sizeof(tada) / sizeof(tada[0]);
+  if (params == "WIN95" || params == "95") {
+    seq = win95;
+    count = sizeof(win95) / sizeof(win95[0]);
+  } else if (params == "MANUAL_ON") {
+    seq = manualOn;
+    count = sizeof(manualOn) / sizeof(manualOn[0]);
+  } else if (params == "MANUAL_OFF") {
+    seq = manualOff;
+    count = sizeof(manualOff) / sizeof(manualOff[0]);
+  }
 
   bool usedMask[NUM_AXES] = { false, false, false };
   for (unsigned int i = 0; i < count; i++) {

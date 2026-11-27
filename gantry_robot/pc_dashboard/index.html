@@ -7,7 +7,7 @@
   <link rel="icon" type="image/png" href="favicon.png?v=2" />
   <link rel="shortcut icon" type="image/png" href="favicon.png?v=2" />
   <link rel="apple-touch-icon" href="favicon.png?v=2" />
-  <link rel="stylesheet" href="styles.css?v=8" />
+  <link rel="stylesheet" href="styles.css?v=11" />
 </head>
 <body>
   <!-- ======================================================================
@@ -54,6 +54,9 @@
         <div class="panel-body run-controls">
           <button class="btn btn-primary btn-block btn-lg" onclick="sendCmd('START_SCAN')">
             <span class="ico">&#9654;</span> Start Scan
+          </button>
+          <button id="manualModeBtn" class="btn btn-secondary btn-block" onclick="toggleManualMode()" title="Switch between Autonomous CV and Xbox Series X Manual Control">
+            <span class="ico">&#127918;</span> <span class="lbl">Xbox Manual Mode</span>
           </button>
           <div class="btn-grid-2">
             <button id="pauseResumeBtn" class="btn btn-secondary" onclick="togglePauseResume()">
@@ -263,11 +266,16 @@
       <section class="panel drawer">
         <div class="tabs" role="tablist">
           <button class="tab active" data-tab="console" onclick="selectTab('console')">Console</button>
+          <button class="tab" data-tab="manual" onclick="selectTab('manual')">Xbox Manual <span class="tab-badge" id="gamepadTabBadge">OFF</span></button>
           <button class="tab" data-tab="reports" onclick="selectTab('reports')">Run Reports <span class="tab-badge" id="reportStatusBadge">—</span></button>
           <button class="tab" data-tab="calibration" onclick="selectTab('calibration')">Calibration</button>
           <div class="tabs-spacer"></div>
           <div class="tab-actions" data-for="console">
             <button class="btn btn-ghost btn-xs" onclick="clearLogs()">Clear</button>
+          </div>
+          <div class="tab-actions hidden" data-for="manual">
+            <button class="btn btn-primary btn-xs" onclick="openControllerModal()">&#9881; Configure Controller…</button>
+            <button class="btn btn-ghost btn-xs" onclick="resetGamepadMapping()">Reset Defaults</button>
           </div>
           <div class="tab-actions hidden" data-for="reports">
             <button class="btn btn-ghost btn-xs" onclick="fetchRecentReports()">&#8635; Refresh</button>
@@ -284,6 +292,76 @@
             <input id="rawSerialInput" type="text" spellcheck="false"
               placeholder="Raw CLI (IDLE only) — e.g. setup · s1 500 · home s1 · servo 90 · relay 2 · l" />
             <button class="btn btn-secondary btn-xs" onclick="sendRawSerial()">Send</button>
+          </div>
+        </div>
+
+        <div class="tab-pane" data-pane="manual">
+          <div class="manual-status-bar">
+            <div class="manual-chip">
+              <span class="k">Controller</span>
+              <span id="gpConnPill" class="pill pill-dim">Disconnected</span>
+              <button id="btReconnectBtn" class="btn btn-ghost btn-xs" onclick="btReconnectXbox()" title="Reconnect saved Xbox controller over Pi Bluetooth">Reconnect</button>
+              <button id="btPairBtn" class="btn btn-secondary btn-xs" onclick="btPairXbox()" title="Scan and pair/re-pair Xbox controller (hold top Pair button 3s)">Pair / Re-Pair</button>
+            </div>
+            <div class="manual-chip">
+              <span class="k">Z-Crash Guard</span>
+              <span id="zGuardPill" class="pill pill-success">Active</span>
+            </div>
+            <div class="manual-chip manual-thermal-wrap">
+              <span class="k">Solenoid Heat</span>
+              <div class="thermal-meter"><div class="thermal-fill" id="solenoidThermalBar"></div></div>
+              <span class="v" id="solenoidThermalText">0%</span>
+            </div>
+            <div class="manual-chip">
+              <span class="k">Manual Telemetry</span>
+              <div class="segmented" role="group" aria-label="Manual telemetry mode">
+                <button class="seg active" id="telModeSuspendedBtn" onclick="setManualTelemetryMode('suspended')" title="Pause periodic WS pose updates in MANUAL for cleanest Pi Bluetooth">Suspended</button>
+                <button class="seg" id="telModeLowRateBtn" onclick="setManualTelemetryMode('low_rate')" title="Stream lightweight 5 Hz pose updates to animate the 3D twin">5 Hz Twin</button>
+              </div>
+            </div>
+          </div>
+          <div id="btPairStatusBanner" class="bt-pair-banner hidden"></div>
+
+          <div class="manual-drawer-grid">
+            <!-- Challenge Stopwatch Card -->
+            <div class="manual-card">
+              <div class="manual-card-head">
+                <span>Manual Challenge Timer</span>
+                <span class="muted" id="autoBaselineText">Auto baseline: —</span>
+              </div>
+              <div class="challenge-timer-row">
+                <div class="challenge-clock" id="manualStopwatch">00:00.0</div>
+                <div class="challenge-kpis">
+                  <div><span class="k">Blocks</span><b id="manualBlocksCount">0</b></div>
+                  <div><span class="k">Best Human</span><b id="manualBestTime">—</b></div>
+                </div>
+              </div>
+              <div class="challenge-btns">
+                <button id="manualTimerToggleBtn" class="btn btn-secondary btn-xs" onclick="sendManualTimerAction('toggle')">&#9654; Start</button>
+                <button class="btn btn-ghost btn-xs" onclick="sendManualTimerAction('add_block')">+1 Block</button>
+                <button class="btn btn-ghost btn-xs" onclick="sendManualTimerAction('record_run')">Save Run</button>
+                <button class="btn btn-ghost btn-xs" onclick="sendManualTimerAction('reset')">Reset</button>
+              </div>
+            </div>
+
+            <!-- Drive Speed & Controller Quick Summary -->
+            <div class="manual-card">
+              <div class="manual-card-head">
+                <span>Drive Speed &amp; Controls</span>
+                <label class="inline-check"><input type="checkbox" id="drawerZGuard" checked onchange="setDrawerZGuard(this.checked)" /> HX711 Z-Guard</label>
+              </div>
+              <label class="drawer-speed-row">
+                <span class="k">Master Speed</span>
+                <input id="drawerSpeedScale" type="range" min="0.10" max="1.00" step="0.05" value="0.65"
+                  oninput="onDrawerSpeedInput(this.value)" onchange="setMasterSpeedScale(this.value, true)" />
+                <b id="drawerSpeedScaleVal">65%</b>
+              </label>
+              <div class="drawer-speed-sub" id="drawerSpeedReadout">X 39 · Y 65 · Z&darr; 14 mm/s · &theta; 60&deg;/s</div>
+              <div class="drawer-map-footer">
+                <div class="drawer-map-summary" id="drawerMappingSummary">LS: XY · RS: Z · LB/RB: &theta; · A: Grip</div>
+                <button class="btn btn-primary btn-xs" onclick="openControllerModal()">&#127918; Remap Controls…</button>
+              </div>
+            </div>
           </div>
         </div>
 
@@ -463,6 +541,228 @@
     </div>
   </div>
 
+  <!-- Xbox Controller Visual Remapping & Tuning Modal -->
+  <div id="controllerConfigModal" class="modal" style="display:none" onclick="if (event.target === this) closeControllerModal()">
+    <div class="modal-content ctrl-modal-content">
+      <div class="modal-head">
+        <h3>&#127918; Xbox Series X|S Controller Configuration</h3>
+        <div class="ctrl-preset-bar">
+          <span class="muted">Presets:</span>
+          <button class="btn btn-ghost btn-xs preset-pill-btn" data-preset="bumper_servo" onclick="applyControllerPreset('bumper_servo')">Bumper Servo</button>
+          <button class="btn btn-ghost btn-xs preset-pill-btn" data-preset="sticks" onclick="applyControllerPreset('sticks')">Classic Sticks</button>
+          <button class="btn btn-ghost btn-xs preset-pill-btn" data-preset="triggers_bumpers" onclick="applyControllerPreset('triggers_bumpers')">Triggers Z + Bumpers &theta;</button>
+          <button class="modal-close" onclick="closeControllerModal()" aria-label="Close">&times;</button>
+        </div>
+      </div>
+      <div class="modal-body ctrl-modal-body">
+        <div class="ctrl-modal-layout">
+          <!-- Left: Interactive Xbox Series X|S SVG Diagram + Live Legend -->
+          <div class="ctrl-diagram-col">
+            <div class="ctrl-diagram-wrap">
+              <svg id="xboxSvgDiagram" class="xbox-svg" viewBox="0 0 460 305" role="img" aria-label="Xbox Series X|S Controller Diagram">
+                <!-- Triggers (LT / RT) -->
+                <g class="ctrl-part" data-ctrl="LT" onclick="onSvgPartClick('LT')">
+                  <rect x="66" y="10" width="76" height="22" rx="7" class="ctrl-shape" />
+                  <text x="104" y="25" class="ctrl-lbl">LT</text>
+                </g>
+                <g class="ctrl-part" data-ctrl="RT" onclick="onSvgPartClick('RT')">
+                  <rect x="318" y="10" width="76" height="22" rx="7" class="ctrl-shape" />
+                  <text x="356" y="25" class="ctrl-lbl">RT</text>
+                </g>
+
+                <!-- Bumpers (LB / RB) -->
+                <g class="ctrl-part" data-ctrl="LB" onclick="onSvgPartClick('LB')">
+                  <path d="M56 54 C58 38, 78 35, 142 36 L146 56 Z" class="ctrl-shape" />
+                  <text x="102" y="50" class="ctrl-lbl">LB</text>
+                </g>
+                <g class="ctrl-part" data-ctrl="RB" onclick="onSvgPartClick('RB')">
+                  <path d="M314 56 L318 36 C382 35, 402 38, 404 54 Z" class="ctrl-shape" />
+                  <text x="358" y="50" class="ctrl-lbl">RB</text>
+                </g>
+
+                <!-- Main Ergonomic Shell -->
+                <path class="xbox-shell" d="M84 56 C125 50, 178 58, 230 58 C282 58, 335 50, 376 56 C410 62, 426 105, 434 178 C442 246, 424 286, 392 288 C366 290, 344 256, 316 232 C292 214, 260 212, 230 212 C200 212, 168 214, 144 232 C116 256, 94 290, 68 288 C36 286, 18 246, 26 178 C34 105, 50 62, 84 56 Z" />
+
+                <!-- Xbox Nexus Emblem -->
+                <circle cx="230" cy="96" r="15" class="xbox-nexus" />
+                <path d="M222 89 L238 103 M238 89 L222 103" class="xbox-nexus-x" />
+
+                <!-- View & Menu -->
+                <g class="ctrl-part" data-ctrl="VIEW" onclick="onSvgPartClick('VIEW')">
+                  <circle cx="192" cy="134" r="11" class="ctrl-shape" />
+                  <text x="192" y="137" class="ctrl-lbl-sm">VW</text>
+                </g>
+                <g class="ctrl-part" data-ctrl="MENU" onclick="onSvgPartClick('MENU')">
+                  <circle cx="268" cy="134" r="11" class="ctrl-shape" />
+                  <text x="268" y="138" class="ctrl-lbl-sm">&equiv;</text>
+                </g>
+
+                <!-- Left Thumbstick (LS / L3) -->
+                <g class="ctrl-part" data-ctrl="LS" onclick="onSvgPartClick('LS')">
+                  <circle cx="122" cy="128" r="30" class="ctrl-well" />
+                  <circle cx="122" cy="128" r="21" class="ctrl-shape" />
+                  <text x="122" y="132" class="ctrl-lbl">LS</text>
+                </g>
+
+                <!-- D-Pad -->
+                <g class="ctrl-part" data-ctrl="DPAD" onclick="onSvgPartClick('DPAD')">
+                  <circle cx="176" cy="188" r="27" class="ctrl-well" />
+                  <path d="M168 166 H184 V180 H198 V196 H184 V210 H168 V196 H154 V180 H168 Z" class="ctrl-shape" />
+                  <text x="176" y="191" class="ctrl-lbl-xs">DPAD</text>
+                </g>
+
+                <!-- Right Thumbstick (RS / R3) -->
+                <g class="ctrl-part" data-ctrl="RS" onclick="onSvgPartClick('RS')">
+                  <circle cx="284" cy="188" r="30" class="ctrl-well" />
+                  <circle cx="284" cy="188" r="21" class="ctrl-shape" />
+                  <text x="284" y="192" class="ctrl-lbl">RS</text>
+                </g>
+
+                <!-- Face Buttons (Y, X, B, A) -->
+                <g class="ctrl-part ctrl-btn-y" data-ctrl="Y" onclick="onSvgPartClick('Y')">
+                  <circle cx="338" cy="100" r="14" class="ctrl-shape" />
+                  <text x="338" y="104" class="ctrl-lbl">Y</text>
+                </g>
+                <g class="ctrl-part ctrl-btn-x" data-ctrl="X" onclick="onSvgPartClick('X')">
+                  <circle cx="310" cy="128" r="14" class="ctrl-shape" />
+                  <text x="310" y="132" class="ctrl-lbl">X</text>
+                </g>
+                <g class="ctrl-part ctrl-btn-b" data-ctrl="B" onclick="onSvgPartClick('B')">
+                  <circle cx="366" cy="128" r="14" class="ctrl-shape" />
+                  <text x="366" y="132" class="ctrl-lbl">B</text>
+                </g>
+                <g class="ctrl-part ctrl-btn-a" data-ctrl="A" onclick="onSvgPartClick('A')">
+                  <circle cx="338" cy="156" r="14" class="ctrl-shape" />
+                  <text x="338" y="160" class="ctrl-lbl">A</text>
+                </g>
+              </svg>
+              <div class="ctrl-diagram-hint" id="ctrlDiagramHint">Hover any row on the right to highlight its control, or click a control on the diagram during Bind…</div>
+            </div>
+            <div class="ctrl-legend-grid" id="ctrlDiagramLegend"></div>
+          </div>
+
+          <!-- Right: Full Axes, Buttons & Speed / Feel Controls -->
+          <div class="ctrl-config-col">
+            <div class="ctrl-section">
+              <div class="ctrl-section-head">
+                <span>Motion Axes (4-DOF)</span>
+                <span class="muted">Map any stick, bumpers, triggers, or D-pad</span>
+              </div>
+              <div class="axis-remap-list">
+                <div class="axis-remap-row" onmouseenter="highlightAxisRow('x')" onmouseleave="highlightControllerParts([])">
+                  <span class="axis-tag">X <small>Left/Right</small></span>
+                  <select id="axis_x" onfocus="highlightAxisRow('x')" onblur="highlightControllerParts([])"></select>
+                  <label class="inline-check"><input type="checkbox" id="mapInvX" /> Invert</label>
+                </div>
+                <div class="axis-remap-row" onmouseenter="highlightAxisRow('y')" onmouseleave="highlightControllerParts([])">
+                  <span class="axis-tag">Y <small>Fwd/Back</small></span>
+                  <select id="axis_y" onfocus="highlightAxisRow('y')" onblur="highlightControllerParts([])"></select>
+                  <label class="inline-check"><input type="checkbox" id="mapInvY" /> Invert</label>
+                </div>
+                <div class="axis-remap-row" onmouseenter="highlightAxisRow('z')" onmouseleave="highlightControllerParts([])">
+                  <span class="axis-tag">Z <small>Up/Down</small></span>
+                  <select id="axis_z" onfocus="highlightAxisRow('z')" onblur="highlightControllerParts([])"></select>
+                  <label class="inline-check"><input type="checkbox" id="mapInvZ" /> Invert</label>
+                </div>
+                <div class="axis-remap-row" onmouseenter="highlightAxisRow('a')" onmouseleave="highlightControllerParts([])">
+                  <span class="axis-tag">&theta; <small>Wrist Servo</small></span>
+                  <select id="axis_a" onfocus="highlightAxisRow('a')" onblur="highlightControllerParts([])"></select>
+                  <label class="inline-check"><input type="checkbox" id="mapInvA" /> Invert</label>
+                </div>
+              </div>
+            </div>
+
+            <div class="ctrl-section">
+              <div class="ctrl-section-head">
+                <span>Action Buttons</span>
+                <span class="muted" id="bindHintText">Select or click Bind…</span>
+              </div>
+              <div class="modal-remap-list" id="remapList">
+                <div class="modal-remap-row" onmouseenter="highlightButtonRow('grip_open')" onmouseleave="highlightControllerParts([])">
+                  <span>Gripper Open</span>
+                  <select id="bind_grip_open"></select>
+                  <button class="btn btn-ghost btn-xs bind-btn" data-action="grip_open" onclick="startButtonBindCapture('grip_open')">Bind…</button>
+                </div>
+                <div class="modal-remap-row" onmouseenter="highlightButtonRow('precision_hold')" onmouseleave="highlightControllerParts([])">
+                  <span>Precision Hold</span>
+                  <select id="bind_precision_hold"></select>
+                  <button class="btn btn-ghost btn-xs bind-btn" data-action="precision_hold" onclick="startButtonBindCapture('precision_hold')">Bind…</button>
+                </div>
+                <div class="modal-remap-row" onmouseenter="highlightButtonRow('weigh')" onmouseleave="highlightControllerParts([])">
+                  <span>Weigh Block</span>
+                  <select id="bind_weigh"></select>
+                  <button class="btn btn-ghost btn-xs bind-btn" data-action="weigh" onclick="startButtonBindCapture('weigh')">Bind…</button>
+                </div>
+                <div class="modal-remap-row" onmouseenter="highlightButtonRow('home_all')" onmouseleave="highlightControllerParts([])">
+                  <span>Home All</span>
+                  <select id="bind_home_all"></select>
+                  <button class="btn btn-ghost btn-xs bind-btn" data-action="home_all" onclick="startButtonBindCapture('home_all')">Bind…</button>
+                </div>
+                <div class="modal-remap-row" onmouseenter="highlightButtonRow('soft_estop')" onmouseleave="highlightControllerParts([])">
+                  <span>Soft Halt</span>
+                  <select id="bind_soft_estop"></select>
+                  <button class="btn btn-ghost btn-xs bind-btn" data-action="soft_estop" onclick="startButtonBindCapture('soft_estop')">Bind…</button>
+                </div>
+                <div class="modal-remap-row" onmouseenter="highlightButtonRow('toggle_mode')" onmouseleave="highlightControllerParts([])">
+                  <span>Toggle Mode</span>
+                  <select id="bind_toggle_mode"></select>
+                  <button class="btn btn-ghost btn-xs bind-btn" data-action="toggle_mode" onclick="startButtonBindCapture('toggle_mode')">Bind…</button>
+                </div>
+              </div>
+              <div class="ctrl-inline-opt">
+                <span>Gripper Behavior</span>
+                <select id="mapGripperMode">
+                  <option value="hold">Hold to Open (Thermally Safe)</option>
+                  <option value="toggle">Toggle Open / Closed</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="ctrl-section">
+              <div class="ctrl-section-head">
+                <span>Master Speed Scale &amp; Feel</span>
+                <span class="pill pill-accent" id="mapSpeedPreview">X 39 · Y 65 · Z&darr; 14 · &theta; 60</span>
+              </div>
+              <div class="ctrl-sliders">
+                <label class="ctrl-slider-row">
+                  <span>Master Speed</span>
+                  <input id="mapSpeedScale" type="range" min="0.10" max="1.00" step="0.05" value="0.65" oninput="onManualSliderPreview()" />
+                  <b id="mapSpeedScaleVal">65%</b>
+                </label>
+                <label class="ctrl-slider-row">
+                  <span>Precision Scale</span>
+                  <input id="mapPrecisionScale" type="range" min="0.10" max="0.60" step="0.05" value="0.25" oninput="onManualSliderPreview()" />
+                  <b id="mapPrecisionScaleVal">25%</b>
+                </label>
+                <label class="ctrl-slider-row">
+                  <span>Stick Deadzone</span>
+                  <input id="mapDeadzone" type="range" min="0.04" max="0.30" step="0.01" value="0.12" oninput="onManualSliderPreview()" />
+                  <b id="mapDeadzoneVal">12%</b>
+                </label>
+                <label class="ctrl-slider-row">
+                  <span>Stick Curve</span>
+                  <input id="mapCurveExp" type="range" min="1.0" max="3.0" step="0.1" value="2.2" oninput="onManualSliderPreview()" />
+                  <b id="mapCurveExpVal">2.2</b>
+                </label>
+                <div class="ctrl-zguard-row">
+                  <label class="inline-check"><input type="checkbox" id="mapZGuard" checked /> HX711 Z-Guard Force</label>
+                  <input id="mapZGuardForce" type="range" min="60" max="260" step="10" value="150" oninput="onManualSliderPreview()" />
+                  <b id="mapZGuardForceVal">150g</b>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <span id="ctrlConflictNote" class="ctrl-conflict-note"></span>
+        <button class="btn btn-ghost" onclick="resetGamepadMapping()">Reset Defaults</button>
+        <button class="btn btn-secondary" onclick="closeControllerModal()">Cancel</button>
+        <button class="btn btn-primary" onclick="saveGamepadMapping(true)">Save to Pi</button>
+      </div>
+    </div>
+  </div>
+
   <div id="camBackdrop" class="cam-backdrop" onclick="toggleCamExpand(false)"></div>
 
   <!-- Local Vendor Three.js (Zero Internet Dependency on Pi LAN) -->
@@ -472,6 +772,6 @@
   <script src="assets/vendor/STLLoader.js"></script>
   <script src="assets/vendor/GLTFLoader.js"></script>
   <script src="assets/vendor/3MFLoader.js"></script>
-  <script src="app.js?v=17"></script>
+  <script src="app.js?v=21"></script>
 </body>
 </html>

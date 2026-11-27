@@ -140,6 +140,21 @@ class GantryConfig:
     servo_safe_y_mm: float = 10.0
     servo_zero_offset_deg: float = 6.0   # Mechanical neutral trim calibrated in UI (matches servo_trim.json)
 
+    # --- Xbox Series X|S Manual Teleoperation Parameters ---
+    teleop_hz: float = 20.0
+    teleop_max_vx_mm_s: float = 60.0
+    teleop_max_vy_mm_s: float = 100.0
+    teleop_max_vz_up_mm_s: float = 35.0
+    teleop_max_vz_down_mm_s: float = 22.0
+    teleop_max_va_deg_s: float = 92.0
+    teleop_precision_scale: float = 0.25
+    teleop_deadzone: float = 0.12
+    teleop_curve_exp: float = 2.2
+    teleop_z_guard_enabled: bool = True
+    teleop_z_guard_force_g: float = 150.0
+    teleop_telemetry_mode: str = "suspended"  # "suspended" | "low_rate"
+    teleop_low_rate_hz: float = 5.0
+
     # --- Eye-in-Hand Camera & Offset Parameters ---
     camera_index: int = 0
     frame_width: int = 640
@@ -151,8 +166,9 @@ class GantryConfig:
 
     # Camera is offset from gripper in CAD (calibrated for camera Z-tilt + laydown symmetry):
     # Measured Z-tilt (+0.0207 mm/mmZ X, +0.0387 mm/mmZ Y) + Z=25 staged-block repicks (-1.815 X, -0.770 Y),
-    # empirical -2.0 mm X laydown trim (-4.38 -> -2.38 X), plus +1.0 mm +X EE trim (-2.38 -> -3.38 X).
-    camera_to_gripper_offset_x_mm: float = -3.38
+    # empirical -2.0 mm X laydown trim (-4.38 -> -2.38 X), +1.0 mm +X trim (-2.38 -> -3.38 X),
+    # plus final +1.0 mm +X EE trim (-3.38 -> -4.38 X).
+    camera_to_gripper_offset_x_mm: float = -4.38
     camera_to_gripper_offset_y_mm: float = -44.36
     cam_tilt_x_mm_per_mm_z: float = 0.0207
     cam_tilt_y_mm_per_mm_z: float = 0.0387
@@ -225,12 +241,6 @@ class GantryConfig:
     # --- Classical Computer Vision HSV Color Ranges ---
     hsv_ranges: Dict[str, HSVRange] = field(
         default_factory=lambda: {
-            "white": HSVRange(
-                name="white",
-                lower1=(0, 0, 175),
-                upper1=(179, 50, 255),
-                display_hex="#f8fafc",
-            ),
             "red": HSVRange(
                 name="red",
                 lower1=(0, 110, 80),

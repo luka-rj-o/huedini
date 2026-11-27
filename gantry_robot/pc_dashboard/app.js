@@ -46,7 +46,7 @@ const EE_HOMED_Z = 97.6;
 const CAM_HOMED_X = 33.2;
 const CAM_HOMED_Y = 48.0;
 const CAM_HOMED_Z = 135.4;
-const EE_OFFSET_X = -3.38;
+const EE_OFFSET_X = -4.38;
 const EE_OFFSET_Y = -44.36;
 
 // Aluminum drop-off pedestal
@@ -166,7 +166,7 @@ function isOpen() {
 }
 
 function sendCmd(command, extra = {}) {
-  const clearsPreview = ["START_SCAN", "RESET", "HOME_ALL", "JOG_AXIS", "FREE_MOTORS", "WAKE_MOTORS", "EMERGENCY_STOP"];
+  const clearsPreview = ["START_SCAN", "RESET", "HOME_ALL", "JOG_AXIS", "FREE_MOTORS", "WAKE_MOTORS", "EMERGENCY_STOP", "TOGGLE_MANUAL_MODE", "SET_MODE"];
   if (clearsPreview.includes(command)) {
     exitReplayMode();
     sandboxPreviewActive = false;
@@ -179,6 +179,10 @@ function sendCmd(command, extra = {}) {
   if (isOpen()) {
     socket.send(JSON.stringify({ command, ...extra }));
   }
+}
+
+function toggleManualMode() {
+  sendCmd("TOGGLE_MANUAL_MODE", { source: "dashboard" });
 }
 
 // ============================================================================
@@ -484,6 +488,8 @@ function selectTab(name) {
   document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === name));
   document.querySelectorAll(".tab-pane").forEach((p) => p.classList.toggle("active", p.dataset.pane === name));
   document.querySelectorAll(".tab-actions").forEach((a) => a.classList.toggle("hidden", a.dataset.for !== name));
+  document.querySelector(".drawer")?.classList.toggle("is-manual-tab", name === "manual");
+  if (typeof resizeAll === "function") requestAnimationFrame(resizeAll);
   if (name === "reports") fetchRecentReports();
 }
 
@@ -731,6 +737,8 @@ function updateUI(data, prevState) {
       if (pinned) logEl.scrollTop = logEl.scrollHeight;
     }
   }
+
+  updateManualModeUI(data);
 }
 
 function renderBlocksTable(blocks) {
@@ -2646,12 +2654,620 @@ document.addEventListener("keydown", (e) => {
     toggleCamExpand(false);
     closeReportModal();
     closeCadImportModal();
+    closeControllerModal();
   }
 });
 
 // ============================================================================
+//  XBOX SERIES X|S MANUAL MODE, VISUAL REMAPPER, SPEED SCALE & GAMEPAD API
+// ============================================================================
+const CANONICAL_GAMEPAD_BUTTONS = ["A", "B", "X", "Y", "LB", "RB", "LT", "RT", "VIEW", "MENU", "L3", "R3", "NONE"];
+const ACTION_BIND_KEYS = ["grip_open", "precision_hold", "weigh", "home_all", "soft_estop", "toggle_mode"];
+const AXIS_BIND_KEYS = ["x", "y", "z", "a"];
+
+const AXIS_SOURCE_OPTIONS = [
+  ["ls_x", "Left Stick L/R"],
+  ["ls_y", "Left Stick Up/Down"],
+  ["rs_x", "Right Stick L/R"],
+  ["rs_y", "Right Stick Up/Down"],
+  ["bumpers", "Bumpers (LB / RB)"],
+  ["triggers", "Triggers (LT / RT)"],
+  ["dpad_x", "D-Pad Left / Right"],
+  ["dpad_y", "D-Pad Up / Down"],
+  ["none", "Disabled"],
+];
+
+const AXIS_SOURCE_SHORT = {
+  ls_x: "LS L/R",
+  ls_y: "LS U/D",
+  rs_x: "RS L/R",
+  rs_y: "RS U/D",
+  bumpers: "LB/RB",
+  triggers: "LT/RT",
+  dpad_x: "D-Pad L/R",
+  dpad_y: "D-Pad U/D",
+  none: "Off",
+};
+
+const AXIS_SOURCE_TO_SVG = {
+  ls_x: ["LS"],
+  ls_y: ["LS"],
+  rs_x: ["RS"],
+  rs_y: ["RS"],
+  bumpers: ["LB", "RB"],
+  triggers: ["LT", "RT"],
+  dpad_x: ["DPAD"],
+  dpad_y: ["DPAD"],
+  none: [],
+};
+
+const BUTTON_TO_SVG = {
+  A: ["A"], B: ["B"], X: ["X"], Y: ["Y"],
+  LB: ["LB"], RB: ["RB"], LT: ["LT"], RT: ["RT"],
+  VIEW: ["VIEW"], MENU: ["MENU"], L3: ["LS"], R3: ["RS"], NONE: [],
+};
+
+const CONTROLLER_PRESETS = {
+  bumper_servo: { x: "ls_x", y: "ls_y", z: "rs_y", a: "bumpers" },
+  sticks: { x: "ls_x", y: "ls_y", z: "rs_y", a: "rs_x" },
+  triggers_bumpers: { x: "ls_x", y: "ls_y", z: "triggers", a: "bumpers" },
+};
+
+let manualMappingDirty = false;
+let manualBindCaptureAction = null;
+let lastPiBindSeq = 0;
+let lastRumbleSeq = 0;
+let manualTimerSnapshot = { running: false, elapsed_s: 0.0, synced_at_ms: performance.now() };
+let browserPrevButtons = {};
+
+function formatStopwatch(sec) {
+  const s = Math.max(0, Number(sec) || 0);
+  const mins = Math.floor(s / 60);
+  const rem = s - mins * 60;
+  return `${String(mins).padStart(2, "0")}:${rem.toFixed(1).padStart(4, "0")}`;
+}
+
+function initManualModeControls() {
+  const axisHtml = AXIS_SOURCE_OPTIONS.map(([val, lbl]) => `<option value="${val}">${lbl}</option>`).join("");
+  for (const ax of AXIS_BIND_KEYS) {
+    const sel = $(`axis_${ax}`);
+    if (!sel) continue;
+    sel.innerHTML = axisHtml;
+    sel.addEventListener("change", () => {
+      manualMappingDirty = true;
+      refreshControllerDiagramAndConflicts();
+    });
+  }
+  const btnHtml = CANONICAL_GAMEPAD_BUTTONS.map((b) => `<option value="${b}">${b === "NONE" ? "Disabled" : b}</option>`).join("");
+  for (const act of ACTION_BIND_KEYS) {
+    const sel = $(`bind_${act}`);
+    if (!sel) continue;
+    sel.innerHTML = btnHtml;
+    sel.addEventListener("change", () => {
+      manualMappingDirty = true;
+      refreshControllerDiagramAndConflicts();
+    });
+  }
+  for (const id of ["mapGripperMode", "mapInvX", "mapInvY", "mapInvZ", "mapInvA", "mapZGuard", "mapSpeedScale", "mapPrecisionScale", "mapDeadzone", "mapCurveExp", "mapZGuardForce"]) {
+    const el = $(id);
+    if (el) el.addEventListener("change", () => { manualMappingDirty = true; refreshControllerDiagramAndConflicts(); });
+  }
+  setInterval(tickManualStopwatchDisplay, 100);
+  setInterval(pollBrowserGamepad, 50);
+}
+
+function openControllerModal() {
+  const modal = $("controllerConfigModal");
+  if (!modal) return;
+  manualMappingDirty = false;
+  hydrateManualMappingForm(latestState.manual_mode?.mapping);
+  modal.style.display = "flex";
+  refreshControllerDiagramAndConflicts();
+}
+
+function closeControllerModal() {
+  const modal = $("controllerConfigModal");
+  if (modal) modal.style.display = "none";
+  startButtonBindCapture(null);
+  highlightControllerParts([]);
+  manualMappingDirty = false;
+}
+
+function formatEffectiveSpeedText(scale, base = null) {
+  const s = clamp(Number(scale ?? 0.65), 0.1, 1.0);
+  const vx = Math.round((base?.max_vx ?? 60) * s);
+  const vy = Math.round((base?.max_vy ?? 100) * s);
+  const vz = Math.round((base?.max_vz_down ?? 22) * s);
+  const va = Math.round((base?.max_va ?? 92) * s);
+  return `X ${vx} · Y ${vy} · Z↓ ${vz} mm/s · θ ${va}°/s`;
+}
+
+function onDrawerSpeedInput(val) {
+  const s = clamp(Number(val || 1.0), 0.1, 1.0);
+  setText("drawerSpeedScaleVal", `${Math.round(s * 100)}%`);
+  setText("drawerSpeedReadout", formatEffectiveSpeedText(s, latestState.manual_mode?.mapping));
+}
+
+function setMasterSpeedScale(val, commitNow = true) {
+  const s = Math.round(clamp(Number(val || 1.0), 0.1, 1.0) * 100) / 100;
+  onDrawerSpeedInput(s);
+  if ($("mapSpeedScale")) $("mapSpeedScale").value = String(s);
+  setText("mapSpeedScaleVal", `${Math.round(s * 100)}%`);
+  setText("mapSpeedPreview", formatEffectiveSpeedText(s, latestState.manual_mode?.mapping));
+  if (commitNow) {
+    sendCmd("SET_GAMEPAD_MAPPING", { mapping: { speed_scale: s } });
+  }
+}
+
+function setDrawerZGuard(checked) {
+  if ($("mapZGuard")) $("mapZGuard").checked = !!checked;
+  sendCmd("SET_GAMEPAD_MAPPING", { mapping: { z_guard_enabled: !!checked } });
+}
+
+function onManualSliderPreview() {
+  manualMappingDirty = true;
+  const spd = clamp(Number($("mapSpeedScale")?.value || 1.0), 0.1, 1.0);
+  const dz = Number($("mapDeadzone")?.value || 0.12);
+  const ps = Number($("mapPrecisionScale")?.value || 0.25);
+  const ce = Number($("mapCurveExp")?.value || 2.2);
+  const zf = Number($("mapZGuardForce")?.value || 150);
+  setText("mapSpeedScaleVal", `${Math.round(spd * 100)}%`);
+  setText("mapSpeedPreview", formatEffectiveSpeedText(spd, latestState.manual_mode?.mapping));
+  setText("mapDeadzoneVal", `${Math.round(dz * 100)}%`);
+  setText("mapPrecisionScaleVal", `${Math.round(ps * 100)}%`);
+  setText("mapCurveExpVal", ce.toFixed(1));
+  setText("mapZGuardForceVal", `${Math.round(zf)}g`);
+  refreshControllerDiagramAndConflicts();
+}
+
+function applyControllerPreset(presetKey) {
+  const p = CONTROLLER_PRESETS[presetKey];
+  if (!p) return;
+  manualMappingDirty = true;
+  for (const ax of AXIS_BIND_KEYS) {
+    const sel = $(`axis_${ax}`);
+    if (sel) sel.value = p[ax];
+  }
+  refreshControllerDiagramAndConflicts();
+}
+
+function highlightControllerParts(partIds) {
+  const want = new Set(partIds || []);
+  document.querySelectorAll("#xboxSvgDiagram .ctrl-part").forEach((el) => {
+    el.classList.toggle("is-highlight", want.has(el.dataset.ctrl));
+  });
+}
+
+function highlightAxisRow(axKey) {
+  const src = $(`axis_${axKey}`)?.value || "none";
+  highlightControllerParts(AXIS_SOURCE_TO_SVG[src] || []);
+}
+
+function highlightButtonRow(actionKey) {
+  const btn = $(`bind_${actionKey}`)?.value || "NONE";
+  highlightControllerParts(BUTTON_TO_SVG[btn] || []);
+}
+
+function onSvgPartClick(partId) {
+  if (manualBindCaptureAction) {
+    const mappedBtn = partId === "LS" ? "L3" : (partId === "RS" ? "R3" : partId);
+    if (CANONICAL_GAMEPAD_BUTTONS.includes(mappedBtn)) {
+      applyCapturedButton(mappedBtn);
+      return;
+    }
+  }
+  highlightControllerParts([partId]);
+  const msgMap = {
+    LB: "Bumpers (LB/RB) — assign to Wrist θ or X/Y/Z in Motion Axes, or bind individually as buttons.",
+    RB: "Bumpers (LB/RB) — assign to Wrist θ or X/Y/Z in Motion Axes, or bind individually as buttons.",
+    LT: "Left Trigger (LT) — Hold for Precision Mode, or use LT/RT pair in Motion Axes.",
+    RT: "Right Trigger (RT) — Use LT/RT pair in Motion Axes or bind as a button.",
+    LS: "Left Stick (LS) — X/Y translation by default; click = L3.",
+    RS: "Right Stick (RS) — Z Up/Down by default; click = R3.",
+    DPAD: "D-Pad — assign D-Pad L/R or D-Pad Up/Down to any axis.",
+  };
+  setText("ctrlDiagramHint", msgMap[partId] || `${partId} button — click Bind… on any action to reassign.`);
+}
+
+function refreshControllerDiagramAndConflicts() {
+  const axesCfg = {};
+  for (const ax of AXIS_BIND_KEYS) {
+    axesCfg[ax] = $(`axis_${ax}`)?.value || "none";
+  }
+  const btnsCfg = {};
+  for (const act of ACTION_BIND_KEYS) {
+    btnsCfg[act] = $(`bind_${act}`)?.value || "NONE";
+  }
+
+  // Highlight active preset pill if axes match one
+  let matchedPreset = "custom";
+  for (const [pName, pAxes] of Object.entries(CONTROLLER_PRESETS)) {
+    if (AXIS_BIND_KEYS.every((k) => axesCfg[k] === pAxes[k])) {
+      matchedPreset = pName;
+      break;
+    }
+  }
+  document.querySelectorAll(".preset-pill-btn").forEach((b) => {
+    b.classList.toggle("active", b.dataset.preset === matchedPreset);
+  });
+
+  // Build legend pills summarizing every control on the diagram
+  const legendEl = $("ctrlDiagramLegend");
+  if (legendEl) {
+    const items = [
+      ["X Axis", AXIS_SOURCE_SHORT[axesCfg.x] || axesCfg.x],
+      ["Y Axis", AXIS_SOURCE_SHORT[axesCfg.y] || axesCfg.y],
+      ["Z Axis", AXIS_SOURCE_SHORT[axesCfg.z] || axesCfg.z],
+      ["Wrist θ", AXIS_SOURCE_SHORT[axesCfg.a] || axesCfg.a],
+      ["Grip", btnsCfg.grip_open],
+      ["Precision", btnsCfg.precision_hold],
+      ["Weigh / Home", `${btnsCfg.weigh} / ${btnsCfg.home_all}`],
+      ["Halt / Mode", `${btnsCfg.soft_estop} / ${btnsCfg.toggle_mode}`],
+    ];
+    legendEl.innerHTML = items.map(([k, v]) => `<div class="ctrl-legend-pill"><span>${k}</span><b>${v}</b></div>`).join("");
+  }
+
+  // Check duplicate physical input conflicts
+  const used = new Map();
+  const conflicts = [];
+  const addUse = (phys, label) => {
+    if (!phys || phys === "none" || phys === "NONE") return;
+    if (used.has(phys)) conflicts.push(`${phys} (${used.get(phys)} & ${label})`);
+    else used.set(phys, label);
+  };
+  for (const ax of AXIS_BIND_KEYS) {
+    const src = axesCfg[ax];
+    if (src === "bumpers") { addUse("LB", `${ax.toUpperCase()}-`); addUse("RB", `${ax.toUpperCase()}+`); }
+    else if (src === "triggers") { addUse("LT", `${ax.toUpperCase()}-`); addUse("RT", `${ax.toUpperCase()}+`); }
+    else addUse(src, ax.toUpperCase());
+  }
+  const actNames = { grip_open: "Grip", precision_hold: "Precision", weigh: "Weigh", home_all: "Home", soft_estop: "Halt", toggle_mode: "Mode" };
+  for (const act of ACTION_BIND_KEYS) addUse(btnsCfg[act], actNames[act]);
+  setText("ctrlConflictNote", conflicts.length ? `Shared input: ${conflicts.slice(0, 2).join(", ")}` : "");
+}
+
+function hydrateManualMappingForm(m) {
+  if (!m) return;
+  const spd = clamp(Number(m.speed_scale ?? 1.0), 0.1, 1.0);
+  if ($("drawerSpeedScale")) $("drawerSpeedScale").value = String(spd);
+  onDrawerSpeedInput(spd);
+  if ($("drawerZGuard")) $("drawerZGuard").checked = m.z_guard_enabled !== false;
+
+  const axes = m.axes || CONTROLLER_PRESETS.bumper_servo;
+  const btns = m.buttons || {};
+  setText(
+    "drawerMappingSummary",
+    `X:${AXIS_SOURCE_SHORT[axes.x] || axes.x} · Y:${AXIS_SOURCE_SHORT[axes.y] || axes.y} · Z:${AXIS_SOURCE_SHORT[axes.z] || axes.z} · θ:${AXIS_SOURCE_SHORT[axes.a] || axes.a} · Grip:${btns.grip_open || "A"}`
+  );
+
+  if (manualMappingDirty) return;
+
+  for (const ax of AXIS_BIND_KEYS) {
+    const sel = $(`axis_${ax}`);
+    if (sel && axes[ax]) sel.value = axes[ax];
+  }
+  if ($("mapGripperMode")) $("mapGripperMode").value = m.gripper_mode || "hold";
+  if ($("mapInvX")) $("mapInvX").checked = !!m.invert_x;
+  if ($("mapInvY")) $("mapInvY").checked = !!m.invert_y;
+  if ($("mapInvZ")) $("mapInvZ").checked = !!m.invert_z;
+  if ($("mapInvA")) $("mapInvA").checked = !!m.invert_a;
+  if ($("mapZGuard")) $("mapZGuard").checked = m.z_guard_enabled !== false;
+
+  const dz = Number(m.deadzone ?? 0.12);
+  const ps = Number(m.precision_scale ?? 0.25);
+  const ce = Number(m.curve_exp ?? 2.2);
+  const zf = Number(m.z_guard_force_g ?? 150);
+  if ($("mapSpeedScale")) $("mapSpeedScale").value = String(spd);
+  if ($("mapDeadzone")) $("mapDeadzone").value = String(dz);
+  if ($("mapPrecisionScale")) $("mapPrecisionScale").value = String(ps);
+  if ($("mapCurveExp")) $("mapCurveExp").value = String(ce);
+  if ($("mapZGuardForce")) $("mapZGuardForce").value = String(zf);
+  setText("mapSpeedScaleVal", `${Math.round(spd * 100)}%`);
+  setText("mapSpeedPreview", formatEffectiveSpeedText(spd, m));
+  setText("mapDeadzoneVal", `${Math.round(dz * 100)}%`);
+  setText("mapPrecisionScaleVal", `${Math.round(ps * 100)}%`);
+  setText("mapCurveExpVal", ce.toFixed(1));
+  setText("mapZGuardForceVal", `${Math.round(zf)}g`);
+
+  for (const act of ACTION_BIND_KEYS) {
+    const sel = $(`bind_${act}`);
+    if (sel && btns[act]) sel.value = btns[act];
+  }
+  refreshControllerDiagramAndConflicts();
+}
+
+function saveGamepadMapping(closeAfter = false) {
+  const axes = {};
+  for (const ax of AXIS_BIND_KEYS) {
+    const sel = $(`axis_${ax}`);
+    if (sel) axes[ax] = sel.value;
+  }
+  const buttons = {};
+  for (const act of ACTION_BIND_KEYS) {
+    const sel = $(`bind_${act}`);
+    if (sel) buttons[act] = sel.value;
+  }
+  const mapping = {
+    axes,
+    gripper_mode: $("mapGripperMode")?.value || "hold",
+    invert_x: !!$("mapInvX")?.checked,
+    invert_y: !!$("mapInvY")?.checked,
+    invert_z: !!$("mapInvZ")?.checked,
+    invert_a: !!$("mapInvA")?.checked,
+    z_guard_enabled: !!$("mapZGuard")?.checked,
+    speed_scale: Number($("mapSpeedScale")?.value || 1.0),
+    deadzone: Number($("mapDeadzone")?.value || 0.12),
+    precision_scale: Number($("mapPrecisionScale")?.value || 0.25),
+    curve_exp: Number($("mapCurveExp")?.value || 2.2),
+    z_guard_force_g: Number($("mapZGuardForce")?.value || 150),
+    buttons,
+  };
+  manualMappingDirty = false;
+  sendCmd("SET_GAMEPAD_MAPPING", { mapping });
+  if (closeAfter) closeControllerModal();
+}
+
+function resetGamepadMapping() {
+  manualMappingDirty = false;
+  sendCmd("RESET_GAMEPAD_MAPPING");
+}
+
+function setManualTelemetryMode(mode) {
+  sendCmd("SET_GAMEPAD_MAPPING", { mapping: { telemetry_mode: mode } });
+}
+
+function sendManualTimerAction(action) {
+  sendCmd("MANUAL_TIMER_ACTION", { action });
+}
+
+function btReconnectXbox() {
+  sendCmd("BT_RECONNECT");
+}
+
+function btPairXbox() {
+  sendCmd("BT_PAIR_XBOX");
+}
+
+function startButtonBindCapture(actionKey) {
+  manualBindCaptureAction = manualBindCaptureAction === actionKey ? null : actionKey;
+  document.querySelectorAll(".bind-btn").forEach((b) => {
+    const active = b.dataset.action === manualBindCaptureAction;
+    b.classList.toggle("bind-listening", active);
+    b.textContent = active ? "Press…" : "Bind…";
+  });
+  setText(
+    "bindHintText",
+    manualBindCaptureAction ? `Press Xbox button (or click diagram) for [${manualBindCaptureAction}]` : "Select or click Bind…"
+  );
+}
+
+function applyCapturedButton(btnName) {
+  if (!manualBindCaptureAction || !CANONICAL_GAMEPAD_BUTTONS.includes(btnName)) return;
+  const sel = $(`bind_${manualBindCaptureAction}`);
+  if (sel) {
+    sel.value = btnName;
+    manualMappingDirty = true;
+  }
+  startButtonBindCapture(null);
+  refreshControllerDiagramAndConflicts();
+}
+
+function tickManualStopwatchDisplay() {
+  let elapsed = manualTimerSnapshot.elapsed_s || 0.0;
+  if (manualTimerSnapshot.running) {
+    elapsed += (performance.now() - manualTimerSnapshot.synced_at_ms) / 1000.0;
+  }
+  setText("manualStopwatch", formatStopwatch(elapsed));
+}
+
+function updateManualModeUI(data) {
+  const isManual = data.state === "MANUAL";
+  const modeBtn = $("manualModeBtn");
+  if (modeBtn) {
+    modeBtn.classList.toggle("is-manual-active", isManual);
+    const lbl = modeBtn.querySelector(".lbl");
+    if (lbl) lbl.textContent = isManual ? "Exit Xbox Manual" : "Xbox Manual Mode";
+  }
+
+  const tabBadge = $("gamepadTabBadge");
+  if (tabBadge) {
+    tabBadge.textContent = isManual ? "LIVE" : "OFF";
+    tabBadge.className = `tab-badge ${isManual ? "manual-on" : ""}`;
+  }
+
+  const mm = data.manual_mode;
+  if (!mm) return;
+
+  const ctrl = mm.controller || {};
+  const gpPill = $("gpConnPill");
+  if (gpPill) {
+    if (ctrl.connected) {
+      const tag = ctrl.transport === "bluetooth" ? "Pi BT" : (ctrl.transport === "browser" ? "Browser" : "Pi USB");
+      gpPill.textContent = `${tag}: ${ctrl.device_name || "Xbox"}`;
+      gpPill.className = "pill pill-success";
+    } else {
+      gpPill.textContent = "Disconnected";
+      gpPill.className = "pill pill-dim";
+    }
+  }
+
+  if (ctrl.last_button_seq && ctrl.last_button_seq !== lastPiBindSeq) {
+    lastPiBindSeq = ctrl.last_button_seq;
+    if (manualBindCaptureAction && ctrl.last_button) {
+      applyCapturedButton(ctrl.last_button);
+    }
+  }
+
+  const bt = mm.bt_pairing || {};
+  const btState = bt.state || "idle";
+  const btBusy = btState === "scanning" || btState === "pairing" || btState === "reconnecting";
+  const banner = $("btPairStatusBanner");
+  if (banner) {
+    if (btState !== "idle" && bt.message) {
+      banner.textContent = bt.message;
+      banner.className = `bt-pair-banner ${btState === "connected" ? "is-ok" : (btState === "error" ? "is-err" : "is-busy")}`;
+    } else {
+      banner.className = "bt-pair-banner hidden";
+    }
+  }
+  if ($("btReconnectBtn")) $("btReconnectBtn").disabled = btBusy;
+  if ($("btPairBtn")) {
+    $("btPairBtn").disabled = btBusy;
+    $("btPairBtn").textContent = btBusy ? (btState === "scanning" ? "Scanning…" : "Connecting…") : "Pair / Re-Pair";
+  }
+
+  const zGuardOn = mm.mapping?.z_guard_enabled !== false;
+  const zgPill = $("zGuardPill");
+  if (zgPill) {
+    if (!zGuardOn) {
+      zgPill.textContent = "OFF (Raw Z)";
+      zgPill.className = "pill pill-warning";
+    } else if (mm.z_guard_tripped) {
+      zgPill.textContent = `CONTACT HALT (${mm.z_delta_g ?? 0}g)`;
+      zgPill.className = "pill pill-danger";
+    } else {
+      zgPill.textContent = "Active";
+      zgPill.className = "pill pill-success";
+    }
+  }
+
+  const thPct = clamp(Number(mm.solenoid_thermal_pct || 0), 0, 100);
+  const thBar = $("solenoidThermalBar");
+  if (thBar) {
+    thBar.style.width = `${thPct}%`;
+    thBar.classList.toggle("warn", thPct >= 65 && thPct < 92);
+    thBar.classList.toggle("hot", thPct >= 92);
+  }
+  setText("solenoidThermalText", `${thPct}%`);
+
+  const tMode = mm.telemetry_mode || "suspended";
+  if ($("telModeSuspendedBtn")) $("telModeSuspendedBtn").classList.toggle("active", tMode === "suspended");
+  if ($("telModeLowRateBtn")) $("telModeLowRateBtn").classList.toggle("active", tMode === "low_rate");
+
+  const t = mm.timer || {};
+  manualTimerSnapshot = {
+    running: !!t.running,
+    elapsed_s: Number(t.elapsed_s || 0),
+    synced_at_ms: performance.now(),
+  };
+  tickManualStopwatchDisplay();
+  setText("manualBlocksCount", String(t.blocks_placed ?? 0));
+  setText("manualBestTime", t.best_run_s != null ? formatStopwatch(t.best_run_s) : "—");
+  const toggleBtn = $("manualTimerToggleBtn");
+  if (toggleBtn) toggleBtn.innerHTML = t.running ? "&#10074;&#10074; Pause" : "&#9654; Start";
+
+  if (mm.last_auto_cycle_s != null) {
+    setText("autoBaselineText", `Auto: ${formatStopwatch(mm.last_auto_cycle_s)} (${mm.last_auto_blocks || 0} blk)`);
+  }
+
+  hydrateManualMappingForm(mm.mapping);
+
+  if (mm.rumble_seq && mm.rumble_seq !== lastRumbleSeq) {
+    lastRumbleSeq = mm.rumble_seq;
+    triggerBrowserGamepadRumble(mm.rumble);
+  }
+}
+
+function getActiveBrowserGamepad() {
+  if (!navigator.getGamepads) return null;
+  const pads = navigator.getGamepads();
+  for (const gp of pads) {
+    if (gp && gp.connected) return gp;
+  }
+  return null;
+}
+
+function triggerBrowserGamepadRumble(rumble) {
+  const gp = getActiveBrowserGamepad();
+  if (!gp || !gp.vibrationActuator || typeof gp.vibrationActuator.playEffect !== "function") return;
+  try {
+    gp.vibrationActuator.playEffect("dual-rumble", {
+      startDelay: 0,
+      duration: Number(rumble?.duration_ms || 180),
+      weakMagnitude: Number(rumble?.weak ?? 0.4),
+      strongMagnitude: Number(rumble?.strong ?? 0.8),
+    });
+  } catch (_) {}
+}
+
+function pollBrowserGamepad() {
+  const gp = getActiveBrowserGamepad();
+  if (!gp) {
+    document.querySelectorAll("#xboxSvgDiagram .ctrl-part.is-pressed").forEach((el) => el.classList.remove("is-pressed"));
+    return;
+  }
+
+  const idxMap = [
+    [0, "A"], [1, "B"], [2, "X"], [3, "Y"],
+    [4, "LB"], [5, "RB"], [6, "LT"], [7, "RT"],
+    [8, "VIEW"], [9, "MENU"], [10, "L3"], [11, "R3"],
+  ];
+  const buttons = {};
+  let newPress = null;
+  for (const [idx, name] of idxMap) {
+    const b = gp.buttons[idx];
+    const down = !!(b && (b.pressed || b.value >= 0.5));
+    buttons[name] = down;
+    if (down && !browserPrevButtons[name]) {
+      newPress = name;
+    }
+  }
+  browserPrevButtons = buttons;
+
+  const dUp = !!(gp.buttons[12]?.pressed || gp.buttons[12]?.value >= 0.5);
+  const dDown = !!(gp.buttons[13]?.pressed || gp.buttons[13]?.value >= 0.5);
+  const dLeft = !!(gp.buttons[14]?.pressed || gp.buttons[14]?.value >= 0.5);
+  const dRight = !!(gp.buttons[15]?.pressed || gp.buttons[15]?.value >= 0.5);
+  const dpad_x = (dRight ? 1 : 0) - (dLeft ? 1 : 0);
+  const dpad_y = (dDown ? 1 : 0) - (dUp ? 1 : 0);
+
+  const modalOpen = $("controllerConfigModal")?.style.display === "flex";
+  if (modalOpen) {
+    const pressedParts = new Set();
+    for (const [bName, isDown] of Object.entries(buttons)) {
+      if (isDown) (BUTTON_TO_SVG[bName] || []).forEach((p) => pressedParts.add(p));
+    }
+    if (Math.abs(Number(gp.axes[0] || 0)) > 0.25 || Math.abs(Number(gp.axes[1] || 0)) > 0.25) pressedParts.add("LS");
+    if (Math.abs(Number(gp.axes[2] || 0)) > 0.25 || Math.abs(Number(gp.axes[3] || 0)) > 0.25) pressedParts.add("RS");
+    if (dpad_x !== 0 || dpad_y !== 0) pressedParts.add("DPAD");
+    document.querySelectorAll("#xboxSvgDiagram .ctrl-part").forEach((el) => {
+      el.classList.toggle("is-pressed", pressedParts.has(el.dataset.ctrl));
+    });
+  }
+
+  if (manualBindCaptureAction && newPress) {
+    applyCapturedButton(newPress);
+  }
+
+  if (!isOpen()) return;
+
+  const toggleBtnName = latestState.manual_mode?.mapping?.buttons?.toggle_mode || "MENU";
+  const shouldStream =
+    latestState.state === "MANUAL" ||
+    newPress === toggleBtnName ||
+    !!manualBindCaptureAction;
+
+  if (!shouldStream) return;
+
+  socket.send(JSON.stringify({
+    command: "TELEOP_BROWSER_INPUT",
+    device_name: gp.id || "Browser Gamepad",
+    lx: Number(gp.axes[0] || 0),
+    ly: Number(gp.axes[1] || 0),
+    rx: Number(gp.axes[2] || 0),
+    ry: Number(gp.axes[3] || 0),
+    lt: Number(gp.buttons[6]?.value || 0),
+    rt: Number(gp.buttons[7]?.value || 0),
+    dpad_x,
+    dpad_y,
+    buttons,
+  }));
+}
+
+// ============================================================================
 //  BOOT
 // ============================================================================
+initManualModeControls();
 init3DScene();
 computeLayout();
 syncSlidersFromState();

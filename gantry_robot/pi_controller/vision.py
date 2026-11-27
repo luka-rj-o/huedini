@@ -85,6 +85,11 @@ class VisionPipeline:
             self._aruco_params = cv2.aruco.DetectorParameters()
         else:
             self._aruco_params = cv2.aruco.DetectorParameters_create()
+        if hasattr(cv2.aruco, "CORNER_REFINE_SUBPIX"):
+            self._aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+            self._aruco_params.cornerRefinementWinSize = 5
+            self._aruco_params.cornerRefinementMaxIterations = 30
+            self._aruco_params.cornerRefinementMinAccuracy = 0.01
 
         # Pre-generate 15x15 mm ArUco markers for all configured corner fiducial IDs
         self._synthetic_markers: Dict[int, np.ndarray] = {
@@ -105,7 +110,7 @@ class VisionPipeline:
     def reset_simulated_course(self) -> None:
         """Populates 20x20 mm blocks across the 4 mass classes inside the reachable course."""
         self.simulated_blocks = [
-            SimulatedCourseBlock(1, "white", 80.0, 75.0, 28.0, 21.6),  # Aluminum (~21.6 g)
+            SimulatedCourseBlock(1, "red", 80.0, 75.0, 28.0, 21.6),    # Aluminum (~21.6 g)
             SimulatedCourseBlock(2, "green", 155.0, 82.0, 64.0, 9.75), # High infill (~9.75 g)
             SimulatedCourseBlock(3, "blue", 150.0, 125.0, 15.0, 7.05), # Med infill (~7.05 g)
             SimulatedCourseBlock(4, "red", 88.0, 122.0, 42.0, 2.46),   # Low infill (~2.46 g)
@@ -237,6 +242,23 @@ class VisionPipeline:
         if ok:
             self.last_annotated_jpeg_b64 = base64.b64encode(buf).decode("ascii")
             self.frame_seq += 1
+
+    @staticmethod
+    def _marker_angle_deg(pts: np.ndarray) -> float:
+        """Computes subpixel marker orientation by averaging all 4 orthogonal ArUco edges."""
+        vx = (
+            float(pts[1, 0] - pts[0, 0])
+            + float(pts[2, 1] - pts[1, 1])
+            - float(pts[3, 0] - pts[2, 0])
+            - float(pts[0, 1] - pts[3, 1])
+        )
+        vy = (
+            float(pts[1, 1] - pts[0, 1])
+            - float(pts[2, 0] - pts[1, 0])
+            - float(pts[3, 1] - pts[2, 1])
+            + float(pts[0, 0] - pts[3, 0])
+        )
+        return math.degrees(math.atan2(vy, vx))
 
     def _detect_raw_aruco(
         self, frame: np.ndarray
@@ -376,9 +398,7 @@ class VisionPipeline:
                 pts = marker_corners[0]
                 u_px = float(np.mean(pts[:, 0]))
                 v_px = float(np.mean(pts[:, 1]))
-                dx = float(pts[1, 0] - pts[0, 0])
-                dy = float(pts[1, 1] - pts[0, 1])
-                angle_deg = round(math.degrees(math.atan2(dy, dx)), 1)
+                angle_deg = round(self._marker_angle_deg(pts), 1)
                 detected_fiducials.append({
                     "id": m_id,
                     "u_px": round(u_px, 1),
@@ -458,9 +478,7 @@ class VisionPipeline:
                 pts = marker_corners[0]
                 u_px = float(np.mean(pts[:, 0]))
                 v_px = float(np.mean(pts[:, 1]))
-                dx = float(pts[1, 0] - pts[0, 0])
-                dy = float(pts[1, 1] - pts[0, 1])
-                angle_deg = math.degrees(math.atan2(dy, dx))
+                angle_deg = self._marker_angle_deg(pts)
                 dist_center = (u_px - cx) ** 2 + (v_px - cy) ** 2
                 results.append((dist_center, m_id, u_px, v_px, angle_deg))
                 cv2.circle(annotated, (int(u_px), int(v_px)), 6, (0, 255, 0), -1)

@@ -19,6 +19,16 @@ import time
 from typing import Deque, Optional
 
 from .config import GantryConfig
+from .gamepad import (
+    DEFAULT_GAMEPAD_MAPPING,
+    GamepadSnapshot,
+    TeleopInputMapper,
+    XboxBluetoothManager,
+    XboxGamepadReader,
+    load_gamepad_mapping,
+    normalize_gamepad_mapping,
+    save_gamepad_mapping,
+)
 from .kinematics import BlockRecord, EyeInHandKinematics, WorldCatalogAndPlanner
 from .report_logger import PickActionRecord, RunReportRecorder
 from .serial_bridge import ESP32SerialBridge, GantryPose
@@ -26,6 +36,10 @@ from .telemetry_server import TelemetryServer
 from .vision import VisionPipeline
 
 logger = logging.getLogger("gantry.fsm")
+
+
+class _ManualModeInterrupt(Exception):
+    """Internal control-flow signal to cleanly hand off an active auto cycle to MANUAL mode."""
 
 
 class GantryStateMachine:
@@ -101,6 +115,40 @@ class GantryStateMachine:
         self._worker_thread: Optional[threading.Thread] = None
         self._live_vision_thread: Optional[threading.Thread] = None
 
+        # Xbox Manual Mode & Teleop State
+        self._homed_known = False
+        self._manual_interrupt_requested = False
+        self._manual_lock = threading.Lock()
+        self._teleop_cycle_lock = threading.Lock()
+        self._gamepad_mapping = load_gamepad_mapping(self._gamepad_mapping_path())
+        self._gamepad_reader = XboxGamepadReader(
+            on_connect=self._on_gamepad_connected,
+            on_disconnect=self._on_gamepad_disconnected,
+        )
+        self._bt_manager = XboxBluetoothManager(on_status_change=self._on_bt_status_change)
+        self._teleop_mapper = TeleopInputMapper()
+        self._browser_gp_snapshot: Optional[GamepadSnapshot] = None
+        self._browser_gp_prev_buttons: dict[str, bool] = {}
+        self._browser_gp_device_name: str = ""
+        self._browser_last_button: str = ""
+        self._browser_last_button_seq: int = 0
+        self._rumble_seq: int = 0
+        self._rumble_payload: Optional[dict] = None
+        self._last_auto_cycle_s: Optional[float] = None
+        self._last_auto_blocks: int = 0
+        self._manual_timer = {
+            "running": False,
+            "elapsed_s": 0.0,
+            "started_mono": None,
+            "blocks_placed": 0,
+            "best_run_s": None,
+            "runs": [],
+        }
+        self._teleop_thread: Optional[threading.Thread] = None
+
+    def _gamepad_mapping_path(self) -> Path:
+        return Path(__file__).resolve().parent / "gamepad_mapping.json"
+
     def _servo_trim_path(self) -> Path:
         return Path(__file__).resolve().parent / "servo_trim.json"
 
@@ -164,8 +212,19 @@ class GantryStateMachine:
         self._live_vision_thread = threading.Thread(target=self._live_vision_loop, daemon=True)
         self._live_vision_thread.start()
 
+        self._gamepad_reader.start()
+        self._teleop_thread = threading.Thread(target=self._teleop_loop, name="teleop-loop", daemon=True)
+        self._teleop_thread.start()
+
     def stop(self) -> None:
         self._running = False
+        self._gamepad_reader.stop()
+        if self.state == "MANUAL":
+            try:
+                self.serial.stop_velocity()
+                self.serial.set_gripper(closed=True, nowait=True)
+            except Exception:
+                pass
         self.vision.close_camera()
         self.serial.close()
 
@@ -213,6 +272,7 @@ class GantryStateMachine:
             "live_blocks": list(self._latest_live_blocks),
             "live_cv_enabled": self._live_cv_enabled,
             "logs": list(self._logs),
+            "manual_mode": self._manual_mode_telemetry(),
             "vision_frame_b64": self.vision.last_annotated_jpeg_b64,
             "vision_frame_seq": getattr(self.vision, "frame_seq", 0),
         }
@@ -237,7 +297,10 @@ class GantryStateMachine:
     def _activate_emergency_stop(self, reason: str, notify_esp32: bool) -> None:
         self._estop_active = True
         self._start_requested = False
+        self._manual_interrupt_requested = False
+        self._homed_known = False
         self._held_block_id = None
+        self._stop_manual_timer()
         self.state = "ESTOPPED"
         if notify_esp32:
             self.serial.trigger_emergency_stop()
@@ -255,6 +318,8 @@ class GantryStateMachine:
             )
         elif event_name == "CHIME_BTN":
             self.log_event("Hardware CHIME switch pressed on ESP32.")
+        elif event_name == "TOGGLE_MANUAL_MODE":
+            self._on_user_command("TOGGLE_MANUAL_MODE", {"source": "hardware"})
 
     def _on_user_command(self, cmd: str, data: dict) -> None:
         """
@@ -262,6 +327,32 @@ class GantryStateMachine:
         ESTOP and RESET unblock any waiting commands and drain stale queues immediately;
         all other motion and configuration commands are queued sequentially.
         """
+        if cmd == "TELEOP_BROWSER_INPUT":
+            raw_btns = data.get("buttons") or {}
+            btns = {str(k).upper(): bool(v) for k, v in raw_btns.items()}
+            snap = GamepadSnapshot(
+                lx=max(-1.0, min(1.0, float(data.get("lx", 0.0)))),
+                ly=max(-1.0, min(1.0, float(data.get("ly", 0.0)))),
+                rx=max(-1.0, min(1.0, float(data.get("rx", 0.0)))),
+                ry=max(-1.0, min(1.0, float(data.get("ry", 0.0)))),
+                lt=max(0.0, min(1.0, float(data.get("lt", 0.0)))),
+                rt=max(0.0, min(1.0, float(data.get("rt", 0.0)))),
+                dpad_x=max(-1.0, min(1.0, float(data.get("dpad_x", 0.0)))),
+                dpad_y=max(-1.0, min(1.0, float(data.get("dpad_y", 0.0)))),
+                buttons=btns,
+                timestamp_mono=time.monotonic(),
+                source="browser",
+            )
+            with self._manual_lock:
+                self._browser_gp_snapshot = snap
+                self._browser_gp_device_name = str(data.get("device_name", "Browser Gamepad"))[:48]
+                for b_name, is_down in btns.items():
+                    if is_down and not self._browser_gp_prev_buttons.get(b_name, False):
+                        self._browser_last_button = b_name
+                        self._browser_last_button_seq += 1
+                self._browser_gp_prev_buttons = btns
+            return
+
         if cmd == "EMERGENCY_STOP":
             self._activate_emergency_stop(
                 "EMERGENCY STOP triggered! All steppers disabled.",
@@ -284,7 +375,7 @@ class GantryStateMachine:
                 self.publish_telemetry()
                 return
 
-        if cmd in ("WEIGH_BLOCK", "SAMPLE_MASS", "TARE_SCALE", "HOME_ALL", "START_SCAN"):
+        if cmd in ("WEIGH_BLOCK", "SAMPLE_MASS", "TARE_SCALE", "HOME_ALL", "START_SCAN", "TOGGLE_MANUAL_MODE", "BT_RECONNECT", "BT_PAIR_XBOX"):
             with self._cmd_queue.mutex:
                 if any(queued_cmd == cmd for queued_cmd, _ in self._cmd_queue.queue):
                     return
@@ -360,6 +451,7 @@ class GantryStateMachine:
                     self._auto_tare_scale("HOME_ALL")
                     self.serial.move_to(z_mm=0.0, feedrate_mm_s=self.config.feedrate_z_mm_s)
                     self.serial.move_to(y_mm=0.0, feedrate_mm_s=self.config.feedrate_travel_mm_s)
+                    self._homed_known = True
                     self.state = "IDLE"
                     self.log_event("Gantry successfully homed to (0.0, 0.0, 0.0). Motors ready in IDLE.")
                 except Exception as exc:
@@ -435,7 +527,10 @@ class GantryStateMachine:
                 self.log_event(f"Cannot adjust servo trim while state is {self.state}.")
         elif cmd in ("FREE_MOTORS", "SLEEP_MOTORS"):
             try:
+                if self.state == "MANUAL":
+                    self._exit_manual_mode("sleep")
                 self._estop_active = False
+                self._homed_known = False
                 self.serial.clear_emergency_stop()
                 self.serial.send_command("SLEEP")
                 if self.state == "ESTOPPED":
@@ -507,14 +602,77 @@ class GantryStateMachine:
                     self.log_event(f"Victory chime failed: {exc}")
             else:
                 self.log_event(f"Cannot play chime while state is {self.state}.")
+        elif cmd == "TOGGLE_MANUAL_MODE":
+            source = str(data.get("source", "dashboard"))
+            if self.state == "MANUAL":
+                self._exit_manual_mode(source)
+            elif self.state in ("CALIBRATING", "SCANNING", "PLANNING", "PICKING", "WEIGHING", "STACKING", "PAUSED"):
+                self._manual_interrupt_requested = True
+                self._pause_requested = False
+                self.log_event(f"Mode toggle ({source}) requested — handing off active cycle to MANUAL mode...")
+            else:
+                self._enter_manual_mode(source)
+        elif cmd == "SET_MODE":
+            target = str(data.get("mode", "")).upper().strip()
+            source = str(data.get("source", "dashboard"))
+            if target == "MANUAL" and self.state != "MANUAL":
+                if self.state in ("CALIBRATING", "SCANNING", "PLANNING", "PICKING", "WEIGHING", "STACKING", "PAUSED"):
+                    self._manual_interrupt_requested = True
+                    self._pause_requested = False
+                    self.log_event(f"Mode switch to MANUAL ({source}) requested — handing off active cycle...")
+                else:
+                    self._enter_manual_mode(source)
+            elif target in ("AUTO", "IDLE") and self.state == "MANUAL":
+                self._exit_manual_mode(source)
+        elif cmd == "SET_GAMEPAD_MAPPING":
+            raw_map = data.get("mapping")
+            if isinstance(raw_map, dict):
+                with self._manual_lock:
+                    merged = dict(self._gamepad_mapping)
+                    for k, v in raw_map.items():
+                        if k in ("axes", "buttons") and isinstance(v, dict) and isinstance(merged.get(k), dict):
+                            sub = dict(merged[k])  # type: ignore[arg-type]
+                            sub.update(v)
+                            merged[k] = sub
+                        else:
+                            merged[k] = v
+                    self._gamepad_mapping = save_gamepad_mapping(self._gamepad_mapping_path(), merged)
+                spd_pct = int(round(float(self._gamepad_mapping.get("speed_scale", 1.0)) * 100))
+                self.log_event(
+                    f"Saved Xbox mapping (preset={self._gamepad_mapping['axis_preset']}, "
+                    f"speed={spd_pct}%, "
+                    f"telemetry={self._gamepad_mapping['telemetry_mode']}, "
+                    f"z_guard={'ON' if self._gamepad_mapping['z_guard_enabled'] else 'OFF'})."
+                )
+                self.publish_telemetry()
+        elif cmd == "RESET_GAMEPAD_MAPPING":
+            with self._manual_lock:
+                self._gamepad_mapping = save_gamepad_mapping(
+                    self._gamepad_mapping_path(), dict(DEFAULT_GAMEPAD_MAPPING)
+                )
+            self.log_event("Reset Xbox controller mapping to defaults.")
+            self.publish_telemetry()
+        elif cmd == "MANUAL_TIMER_ACTION":
+            self._handle_manual_timer_action(str(data.get("action", "")).lower().strip())
+            self.publish_telemetry()
+        elif cmd == "BT_RECONNECT":
+            self._bt_manager.reconnect_saved()
+            self.publish_telemetry()
+        elif cmd == "BT_PAIR_XBOX":
+            self._bt_manager.pair_new_xbox()
+            self.publish_telemetry()
 
     def _check_pause_or_abort(self) -> None:
+        if self._manual_interrupt_requested:
+            raise _ManualModeInterrupt()
         if self._pause_requested and not self._estop_active and self._running:
             saved_state = self.state
             self.state = "PAUSED"
             self.publish_telemetry()
-            while self._pause_requested and not self._estop_active and self._running:
+            while self._pause_requested and not self._estop_active and self._running and not self._manual_interrupt_requested:
                 time.sleep(0.15)
+            if self._manual_interrupt_requested:
+                raise _ManualModeInterrupt()
             if not self._estop_active and self._running:
                 self.state = saved_state
                 self.publish_telemetry()
@@ -579,10 +737,19 @@ class GantryStateMachine:
                 continue
 
             self._start_requested = False
+            self._manual_interrupt_requested = False
             try:
                 self.reports.start_new_run(mock_hardware=self.mock_hardware)
+                cycle_t0 = time.monotonic()
                 self._run_full_cycle()
+                self._last_auto_cycle_s = round(time.monotonic() - cycle_t0, 2)
+                self._last_auto_blocks = sum(1 for b in self.planner.blocks if b.status == "STACKED")
                 self.reports.finish_run(status="COMPLETED")
+                self.publish_telemetry()
+            except _ManualModeInterrupt:
+                self._manual_interrupt_requested = False
+                self.reports.finish_run(status="SWITCHED_TO_MANUAL")
+                self._enter_manual_mode(source="cycle_interrupt")
             except Exception as exc:
                 try:
                     if not self.serial.pose.grip_closed:
@@ -640,6 +807,7 @@ class GantryStateMachine:
         self.log_event("Phase 2 [CALIBRATING]: Homing Z, X, Y axes via TMC2209 StallGuard4...")
         self._check_pause_or_abort()
         self.serial.home_all()
+        self._homed_known = True
         # Move clear of Z=0 and Y=0 mechanical stops so bumper preload never corrupts initial auto-tare
         self.serial.move_to(
             y_mm=self.config.servo_safe_y_mm,
@@ -1526,3 +1694,341 @@ class GantryStateMachine:
             self.reports.record_pick_action(pick_record)
         self.publish_telemetry()
         return staged_blocker_id
+
+    # ------------------------------------------------------------------
+    # Xbox Series X|S Manual Teleoperation Mode
+    # ------------------------------------------------------------------
+    def _on_gamepad_connected(self, name: str, transport: str) -> None:
+        self.log_event(f"Xbox controller connected via {transport.upper()}: {name}")
+
+    def _on_bt_status_change(self, bt_status: dict) -> None:
+        msg = bt_status.get("message")
+        if msg:
+            self.log_event(f"Bluetooth: {msg}")
+        else:
+            self.publish_telemetry()
+
+    def _on_gamepad_disconnected(self, name: str) -> None:
+        if self.state == "MANUAL":
+            try:
+                with self._teleop_cycle_lock:
+                    self.serial.stop_velocity()
+                    if not self.serial.pose.grip_closed:
+                        self.serial.set_gripper(closed=True, nowait=True)
+            except Exception:
+                pass
+        self.log_event(f"Xbox controller disconnected ({name}). Velocity halted safely.")
+
+    def _trigger_rumble(self, strong: float, weak: float, duration_ms: int) -> None:
+        self._gamepad_reader.rumble(strong=strong, weak=weak, duration_ms=duration_ms)
+        self._rumble_seq += 1
+        self._rumble_payload = {
+            "strong": round(float(strong), 2),
+            "weak": round(float(weak), 2),
+            "duration_ms": int(duration_ms),
+        }
+
+    def _start_manual_timer(self) -> None:
+        t = self._manual_timer
+        if not t["running"]:
+            t["started_mono"] = time.monotonic()
+            t["running"] = True
+
+    def _stop_manual_timer(self) -> None:
+        t = self._manual_timer
+        if t["running"] and t["started_mono"] is not None:
+            t["elapsed_s"] = round(float(t["elapsed_s"]) + (time.monotonic() - float(t["started_mono"])), 2)
+        t["started_mono"] = None
+        t["running"] = False
+
+    def _handle_manual_timer_action(self, action: str) -> None:
+        t = self._manual_timer
+        if action == "start":
+            self._start_manual_timer()
+        elif action == "stop":
+            self._stop_manual_timer()
+        elif action == "toggle":
+            if t["running"]:
+                self._stop_manual_timer()
+            else:
+                self._start_manual_timer()
+        elif action == "reset":
+            t["running"] = False
+            t["started_mono"] = None
+            t["elapsed_s"] = 0.0
+            t["blocks_placed"] = 0
+        elif action == "add_block":
+            t["blocks_placed"] = int(t["blocks_placed"]) + 1
+        elif action == "record_run":
+            self._stop_manual_timer()
+            elapsed = float(t["elapsed_s"])
+            if elapsed > 0.1:
+                if t["best_run_s"] is None or elapsed < float(t["best_run_s"]):
+                    t["best_run_s"] = round(elapsed, 2)
+                runs = list(t["runs"])
+                runs.append({"elapsed_s": round(elapsed, 2), "blocks": int(t["blocks_placed"])})
+                t["runs"] = runs[-8:]
+
+    def _manual_mode_telemetry(self) -> dict:
+        ev_status = self._gamepad_reader.status_dict()
+        with self._manual_lock:
+            mapping_copy = dict(self._gamepad_mapping)
+            b_snap = self._browser_gp_snapshot
+            b_fresh = b_snap is not None and (time.monotonic() - b_snap.timestamp_mono) < 1.5
+            b_name = self._browser_gp_device_name
+            b_btn = self._browser_last_button
+            b_seq = self._browser_last_button_seq
+
+        if ev_status["connected"]:
+            ctrl = {
+                "connected": True,
+                "device_name": ev_status["device_name"],
+                "transport": ev_status["transport"],
+                "evdev_supported": ev_status["evdev_supported"],
+                "last_button": ev_status["last_button"],
+                "last_button_seq": ev_status["last_button_seq"],
+            }
+        elif b_fresh:
+            ctrl = {
+                "connected": True,
+                "device_name": b_name or "Browser Gamepad",
+                "transport": "browser",
+                "evdev_supported": ev_status["evdev_supported"],
+                "last_button": b_btn,
+                "last_button_seq": b_seq,
+            }
+        else:
+            ctrl = {
+                "connected": False,
+                "device_name": "",
+                "transport": "none",
+                "evdev_supported": ev_status["evdev_supported"],
+                "last_button": "",
+                "last_button_seq": 0,
+            }
+
+        t = self._manual_timer
+        live_elapsed = float(t["elapsed_s"])
+        if t["running"] and t["started_mono"] is not None:
+            live_elapsed += time.monotonic() - float(t["started_mono"])
+
+        return {
+            "active": self.state == "MANUAL",
+            "telemetry_mode": mapping_copy.get("telemetry_mode", "suspended"),
+            "controller": ctrl,
+            "bt_pairing": self._bt_manager.status_dict(),
+            "mapping": mapping_copy,
+            "z_guard_tripped": self.serial.last_teleop_z_guard,
+            "z_delta_g": round(self.serial.last_teleop_delta_g, 1),
+            "solenoid_thermal_pct": self.serial.last_teleop_thermal_pct,
+            "rumble_seq": self._rumble_seq,
+            "rumble": self._rumble_payload,
+            "timer": {
+                "running": bool(t["running"]),
+                "elapsed_s": round(live_elapsed, 2),
+                "blocks_placed": int(t["blocks_placed"]),
+                "best_run_s": t["best_run_s"],
+                "runs": list(t["runs"]),
+            },
+            "last_auto_cycle_s": self._last_auto_cycle_s,
+            "last_auto_blocks": self._last_auto_blocks,
+        }
+
+    def _enter_manual_mode(self, source: str = "dashboard") -> None:
+        if self.state == "MANUAL":
+            return
+        with self._teleop_cycle_lock:
+            self._estop_active = False
+            self._pause_requested = False
+            self._start_requested = False
+            self._manual_interrupt_requested = False
+            self.serial.clear_emergency_stop()
+            try:
+                self.serial.ensure_awake()
+                if not self._homed_known:
+                    self.log_event("MANUAL entry: homing axes first to establish soft limits...")
+                    self.serial.home_all()
+                    self.serial.move_to(
+                        y_mm=self.config.servo_safe_y_mm,
+                        z_mm=10.0,
+                        angle_deg=0.0,
+                        feedrate_mm_s=self.config.feedrate_z_mm_s,
+                    )
+                    self._auto_tare_scale("MANUAL entry")
+                    self._homed_known = True
+                try:
+                    self.serial.play_chime("MANUAL_ON")
+                except Exception as exc:
+                    logger.debug("MANUAL_ON chime skipped: %s", exc)
+                self._teleop_mapper.reset()
+                self.serial.last_teleop_z_guard = False
+                self.state = "MANUAL"
+                self.log_event(
+                    f"Entered MANUAL Xbox mode ({source}). Live vision paused; telemetry={self._gamepad_mapping.get('telemetry_mode')}."
+                )
+            except Exception as exc:
+                self.state = "ERROR"
+                self.log_event(f"Failed to enter MANUAL mode: {exc}")
+        self.publish_telemetry()
+
+    def _exit_manual_mode(self, source: str = "dashboard") -> None:
+        if self.state != "MANUAL":
+            return
+        with self._teleop_cycle_lock:
+            self._stop_manual_timer()
+            self.state = "IDLE"
+            try:
+                self.serial.stop_velocity()
+                if not self.serial.pose.grip_closed:
+                    self.serial.set_gripper(closed=True)
+                self.planner.clear()
+                self._held_block_id = None
+                try:
+                    self.serial.play_chime("MANUAL_OFF")
+                except Exception as exc:
+                    logger.debug("MANUAL_OFF chime skipped: %s", exc)
+            except Exception as exc:
+                logger.warning("Cleanup while exiting MANUAL mode: %s", exc)
+            self.log_event(f"Exited MANUAL Xbox mode ({source}) -> IDLE. Re-scan before next auto run.")
+        self.publish_telemetry()
+
+    def _active_gamepad_snapshot(self) -> tuple[GamepadSnapshot, str]:
+        if self._gamepad_reader.is_connected:
+            snap = self._gamepad_reader.get_snapshot()
+            return snap, snap.source
+        with self._manual_lock:
+            b_snap = self._browser_gp_snapshot
+        if b_snap is not None and (time.monotonic() - b_snap.timestamp_mono) < 0.45:
+            return b_snap, "browser"
+        return GamepadSnapshot(), "none"
+
+    def _teleop_loop(self) -> None:
+        period_s = 1.0 / max(10.0, float(self.config.teleop_hz))
+        last_pub_mono = 0.0
+        last_thermal_rumble_mono = 0.0
+        prev_z_guard = False
+        last_thermal_band = 0
+        last_grip_desired_closed: Optional[bool] = None
+        last_grip_cmd_mono = 0.0
+
+        while self._running:
+            loop_t0 = time.monotonic()
+            snap, src = self._active_gamepad_snapshot()
+
+            if self.state != "MANUAL":
+                last_grip_desired_closed = None
+                prev_z_guard = False
+                if src != "none" and self.state in ("IDLE", "COMPLETE", "PAUSED", "ERROR"):
+                    with self._manual_lock:
+                        mapping_copy = dict(self._gamepad_mapping)
+                    cmd = self._teleop_mapper.map_input(snap, mapping_copy)
+                    if cmd.trigger_toggle_mode:
+                        self._on_user_command("TOGGLE_MANUAL_MODE", {"source": f"controller:{src}"})
+                time.sleep(0.08)
+                continue
+
+            if self._estop_active:
+                time.sleep(0.08)
+                continue
+
+            with self._manual_lock:
+                mapping_copy = dict(self._gamepad_mapping)
+            cmd = self._teleop_mapper.map_input(snap, mapping_copy)
+
+            if cmd.trigger_toggle_mode:
+                self._on_user_command("TOGGLE_MANUAL_MODE", {"source": f"controller:{src}"})
+                time.sleep(0.10)
+                continue
+
+            should_publish = False
+            with self._teleop_cycle_lock:
+                if self.state != "MANUAL" or self._estop_active:
+                    continue
+                try:
+                    if cmd.trigger_soft_estop:
+                        self.serial.stop_velocity()
+                        self.serial.set_gripper(closed=True, nowait=True)
+                        last_grip_desired_closed = True
+                        self.log_event("Manual soft-halt (controller) executed.")
+                        should_publish = True
+                    elif cmd.trigger_weigh and not cmd.any_motion:
+                        self.serial.stop_velocity()
+                        measured = self.serial.weigh_block()
+                        self._set_mass_reading(round(measured, 2), None)
+                        cls = self.config.classify_mass(measured)
+                        self.log_event(f"Manual weigh: {measured:.2f} g -> [{cls.upper()}].")
+                        should_publish = True
+                    elif cmd.trigger_home and not cmd.any_motion:
+                        self.serial.stop_velocity()
+                        self.serial.home_all()
+                        self._homed_known = True
+                        self.log_event("Manual re-home (controller) complete.")
+                        should_publish = True
+                    elif src != "none":
+                        desired_closed = not cmd.grip_open_desired
+                        now_m = time.monotonic()
+                        if last_grip_desired_closed is None:
+                            last_grip_desired_closed = self.serial.pose.grip_closed
+                        if desired_closed != last_grip_desired_closed:
+                            self.serial.set_gripper(closed=desired_closed, nowait=True)
+                            last_grip_desired_closed = desired_closed
+                            last_grip_cmd_mono = now_m
+                            should_publish = True
+
+                        if cmd.any_motion and not self._manual_timer["running"] and self._manual_timer["elapsed_s"] == 0.0:
+                            self._start_manual_timer()
+                            should_publish = True
+
+                        info = self.serial.send_velocity(
+                            vx_mm_s=cmd.vx_mm_s,
+                            vy_mm_s=cmd.vy_mm_s,
+                            vz_mm_s=cmd.vz_mm_s,
+                            va_deg_s=cmd.va_deg_s,
+                            z_max_mm=self.config.travel_z_bottom_mm,
+                            z_guard_enabled=bool(mapping_copy.get("z_guard_enabled", True)),
+                            z_guard_force_g=float(mapping_copy.get("z_guard_force_g", 150.0)),
+                            notify_pose=False,
+                        )
+                        if last_grip_desired_closed is False and self.serial.pose.grip_closed and (now_m - last_grip_cmd_mono) >= 0.20:
+                            self._teleop_mapper.latch_grip_closed_until_next_input()
+                            last_grip_desired_closed = True
+                            self._trigger_rumble(0.5, 0.85, 220)
+                            self.log_event("Solenoid thermal watchdog tripped — gripper toggled OFF until next input.")
+                            should_publish = True
+                        zg_now = bool(info.get("z_guard", False))
+                        th_pct = int(info.get("thermal_pct", 0))
+                        if zg_now and not prev_z_guard:
+                            self._trigger_rumble(0.85, 0.45, 200)
+                            self.log_event(
+                                f"HX711 Z-Crash Guard triggered ({info.get('delta_g', 0.0):.1f} g) — downward Z blocked; lift up to clear."
+                            )
+                            should_publish = True
+                        elif not zg_now and prev_z_guard:
+                            should_publish = True
+                        prev_z_guard = zg_now
+
+                        if th_pct >= 70 and (now_m - last_thermal_rumble_mono) >= 1.5:
+                            self._trigger_rumble(0.35, 0.75, 160)
+                            last_thermal_rumble_mono = now_m
+                        th_band = 2 if th_pct >= 98 else (1 if th_pct >= 70 else 0)
+                        if th_band != last_thermal_band:
+                            last_thermal_band = th_band
+                            should_publish = True
+                except Exception as exc:
+                    self.log_event(f"Manual teleop error: {exc}")
+                    should_publish = True
+
+            t_mode = str(mapping_copy.get("telemetry_mode", "suspended"))
+            now_m = time.monotonic()
+            if t_mode == "low_rate":
+                low_period = 1.0 / max(1.0, float(self.config.teleop_low_rate_hz))
+                if (now_m - last_pub_mono) >= low_period:
+                    should_publish = True
+
+            if should_publish:
+                last_pub_mono = now_m
+                self.publish_telemetry()
+
+            elapsed = time.monotonic() - loop_t0
+            if elapsed < period_s:
+                time.sleep(period_s - elapsed)
